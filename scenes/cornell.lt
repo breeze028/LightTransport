@@ -1,0 +1,9 @@
+# Mesh-based Cornell-ish test scene.
+# If no mesh blocks are listed, the built-in mesh Cornell scene is used.
+camera 0 1.05 -1.25   0 0.85 0   45
+
+material white 0.78 0.78 0.72 lambertian 0.65 0
+material red   0.85 0.18 0.14 lambertian 0.65 0
+material green 0.18 0.70 0.24 lambertian 0.65 0
+material blue  0.22 0.32 0.90 principled 0.35 0
+material light 1.00 0.90 0.72 lambertian 0.50 0

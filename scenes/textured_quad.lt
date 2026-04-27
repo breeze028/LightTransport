@@ -1,0 +1,23 @@
+camera 0 1.0 -2.8   0 0.7 0   45
+
+texture checker checker.ppm
+
+material textured 0.8 0.8 0.8 lambertian 0.5 0 checker
+material lightmat 1.0 1.0 1.0 lambertian 0.5 0
+
+light Light 1.0 0.9 0.75 8.0
+
+mesh Floor textured 0 0 0  0 0 0  2.0 2.0 2.0  4 2
+-0.5 0 0.5
+0.5 0 0.5
+0.5 0 -0.5
+-0.5 0 -0.5
+0 1 2
+0 2 3
+mesh Light lightmat 0 0 0  0 0 0  1.0 1.0 1.0  4 2
+-0.25 1.8 0.25
+-0.25 1.8 -0.25
+0.25 1.8 -0.25
+0.25 1.8 0.25
+0 1 2
+0 2 3

@@ -1,0 +1,72 @@
+# Build outputs
+build/
+build-*/
+out/
+dist/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Visual Studio / MSBuild
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.ipch
+x64/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# Ninja
+.ninja_deps
+.ninja_log
+*.ninja
+
+# Compiler and linker artifacts
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# CUDA artifacts
+*.cubin
+*.fatbin
+*.ptx
+*.nvvp
+*.nsys-rep
+*.qdrep
+
+# Render outputs
+*.ppm
+*.pfm
+*.exr
+*.png
+*.jpg
+*.jpeg
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
