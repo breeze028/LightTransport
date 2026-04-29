@@ -1,11 +1,19 @@
 #include "lt/scene.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <functional>
 #include <numeric>
 #include <sstream>
 #include <memory>
 #include <unordered_map>
+
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#include <urlmon.h>
+#endif
 
 namespace lt {
 namespace {
@@ -54,24 +62,24 @@ float axis_value(Vec3 v, int axis) {
     return axis == 0 ? v.x : axis == 1 ? v.y : v.z;
 }
 
-int build_bvh_recursive(RenderScene& render_scene, int first, int count) {
+int build_bvh_recursive(RenderScene& render_scene, std::vector<int>& indices, std::vector<BvhNode>& nodes, int first, int count) {
     BvhNode node;
     for (int i = first; i < first + count; ++i) {
-        expand(node.bounds, triangle_bounds(render_scene.triangles[static_cast<size_t>(render_scene.triangle_indices[static_cast<size_t>(i)])]));
+        expand(node.bounds, triangle_bounds(render_scene.triangles[static_cast<size_t>(indices[static_cast<size_t>(i)])]));
     }
 
-    const int node_index = static_cast<int>(render_scene.bvh_nodes.size());
-    render_scene.bvh_nodes.push_back(node);
+    const int node_index = static_cast<int>(nodes.size());
+    nodes.push_back(node);
 
     if (count <= 4) {
-        render_scene.bvh_nodes[static_cast<size_t>(node_index)].first = first;
-        render_scene.bvh_nodes[static_cast<size_t>(node_index)].count = count;
+        nodes[static_cast<size_t>(node_index)].first = first;
+        nodes[static_cast<size_t>(node_index)].count = count;
         return node_index;
     }
 
     Aabb centroid_bounds;
     for (int i = first; i < first + count; ++i) {
-        const Triangle& tri = render_scene.triangles[static_cast<size_t>(render_scene.triangle_indices[static_cast<size_t>(i)])];
+        const Triangle& tri = render_scene.triangles[static_cast<size_t>(indices[static_cast<size_t>(i)])];
         expand(centroid_bounds, tri.centroid);
     }
     const Vec3 extent = centroid_bounds.max - centroid_bounds.min;
@@ -84,18 +92,69 @@ int build_bvh_recursive(RenderScene& render_scene, int first, int count) {
 
     const int mid = first + count / 2;
     std::nth_element(
-        render_scene.triangle_indices.begin() + first,
-        render_scene.triangle_indices.begin() + mid,
-        render_scene.triangle_indices.begin() + first + count,
+        indices.begin() + first,
+        indices.begin() + mid,
+        indices.begin() + first + count,
         [&](int a, int b) {
             return axis_value(render_scene.triangles[static_cast<size_t>(a)].centroid, axis) <
                 axis_value(render_scene.triangles[static_cast<size_t>(b)].centroid, axis);
         });
 
-    const int left = build_bvh_recursive(render_scene, first, mid - first);
-    const int right = build_bvh_recursive(render_scene, mid, first + count - mid);
-    render_scene.bvh_nodes[static_cast<size_t>(node_index)].left = left;
-    render_scene.bvh_nodes[static_cast<size_t>(node_index)].right = right;
+    const int left = build_bvh_recursive(render_scene, indices, nodes, first, mid - first);
+    const int right = build_bvh_recursive(render_scene, indices, nodes, mid, first + count - mid);
+    nodes[static_cast<size_t>(node_index)].left = left;
+    nodes[static_cast<size_t>(node_index)].right = right;
+    return node_index;
+}
+
+int build_tlas_recursive(RenderScene& render_scene, int first, int count) {
+    BvhNode node;
+    for (int i = first; i < first + count; ++i) {
+        const int instance_index = render_scene.mesh_instance_indices[static_cast<size_t>(i)];
+        if (instance_index >= 0 && instance_index < static_cast<int>(render_scene.mesh_instances.size())) {
+            expand(node.bounds, render_scene.mesh_instances[static_cast<size_t>(instance_index)].bounds);
+        }
+    }
+
+    const int node_index = static_cast<int>(render_scene.tlas_nodes.size());
+    render_scene.tlas_nodes.push_back(node);
+
+    if (count <= 2) {
+        render_scene.tlas_nodes[static_cast<size_t>(node_index)].first = first;
+        render_scene.tlas_nodes[static_cast<size_t>(node_index)].count = count;
+        return node_index;
+    }
+
+    Aabb centroid_bounds;
+    for (int i = first; i < first + count; ++i) {
+        const int instance_index = render_scene.mesh_instance_indices[static_cast<size_t>(i)];
+        const Aabb& bounds = render_scene.mesh_instances[static_cast<size_t>(instance_index)].bounds;
+        expand(centroid_bounds, (bounds.min + bounds.max) * 0.5f);
+    }
+    const Vec3 extent = centroid_bounds.max - centroid_bounds.min;
+    int axis = 0;
+    if (extent.y > extent.x && extent.y >= extent.z) {
+        axis = 1;
+    } else if (extent.z > extent.x && extent.z >= extent.y) {
+        axis = 2;
+    }
+
+    const int mid = first + count / 2;
+    std::nth_element(
+        render_scene.mesh_instance_indices.begin() + first,
+        render_scene.mesh_instance_indices.begin() + mid,
+        render_scene.mesh_instance_indices.begin() + first + count,
+        [&](int a, int b) {
+            const Aabb& bounds_a = render_scene.mesh_instances[static_cast<size_t>(a)].bounds;
+            const Aabb& bounds_b = render_scene.mesh_instances[static_cast<size_t>(b)].bounds;
+            return axis_value((bounds_a.min + bounds_a.max) * 0.5f, axis) <
+                axis_value((bounds_b.min + bounds_b.max) * 0.5f, axis);
+        });
+
+    const int left = build_tlas_recursive(render_scene, first, mid - first);
+    const int right = build_tlas_recursive(render_scene, mid, first + count - mid);
+    render_scene.tlas_nodes[static_cast<size_t>(node_index)].left = left;
+    render_scene.tlas_nodes[static_cast<size_t>(node_index)].right = right;
     return node_index;
 }
 
@@ -139,6 +198,39 @@ std::string join_path(const std::string& parent, const std::string& child) {
     return parent + ((last == '\\' || last == '/') ? "" : "\\") + child;
 }
 
+std::string lowercase_extension(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    const size_t query = path.find_first_of("?#", dot == std::string::npos ? 0 : dot);
+    std::string ext = dot == std::string::npos ? std::string{} : path.substr(dot, query == std::string::npos ? std::string::npos : query - dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
+bool is_url(const std::string& path) {
+    return path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
+}
+
+SceneLoadResult load_url_scene(const std::string& url) {
+#if defined(_WIN32)
+    char temp_dir[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, temp_dir) == 0) {
+        return {make_default_scene(), "Could not find temporary directory for URL scene cache"};
+    }
+    std::string ext = lowercase_extension(url);
+    if (ext.empty()) {
+        ext = ".glb";
+    }
+    const std::string cached = std::string(temp_dir) + "LightTransport_" + std::to_string(std::hash<std::string>{}(url)) + ext;
+    const HRESULT hr = URLDownloadToFileA(nullptr, url.c_str(), cached.c_str(), 0, nullptr);
+    if (FAILED(hr)) {
+        return {make_default_scene(), "Could not download scene URL: " + url};
+    }
+    return load_scene(cached);
+#else
+    return {make_default_scene(), "URL scene loading is only implemented on Windows builds"};
+#endif
+}
+
 Vec3 rotate_xyz(Vec3 p, Vec3 r) {
     const float cx = std::cos(r.x);
     const float sx = std::sin(r.x);
@@ -174,7 +266,7 @@ void center_mesh_origin(Mesh& mesh) {
 
 } // namespace
 
-Scene::Scene(const Scene& other) : camera(other.camera), meshes(other.meshes) {
+Scene::Scene(const Scene& other) : camera(other.camera), environment(other.environment), meshes(other.meshes) {
     textures = other.textures;
     materials.reserve(other.materials.size());
     for (const std::shared_ptr<Material>& material : other.materials) {
@@ -187,6 +279,7 @@ Scene& Scene::operator=(const Scene& other) {
         return *this;
     }
     camera = other.camera;
+    environment = other.environment;
     meshes = other.meshes;
     textures = other.textures;
     materials.clear();
@@ -297,6 +390,15 @@ std::shared_ptr<Texture> find_texture(const Scene& scene, const std::string& nam
 }
 
 SceneLoadResult load_scene(const std::string& path) {
+    if (is_url(path)) {
+        return load_url_scene(path);
+    }
+
+    const std::string ext = lowercase_extension(path);
+    if (ext == ".glb" || ext == ".gltf") {
+        return load_gltf_scene(path);
+    }
+
     std::ifstream file(path);
     if (!file) {
         return {make_default_scene(), "Could not open scene: " + path};
@@ -308,6 +410,7 @@ SceneLoadResult load_scene(const std::string& path) {
     std::vector<Vec3> legacy_material_emissions;
     std::vector<std::string> material_texture_names;
     std::vector<std::pair<std::string, LightComponent>> pending_lights;
+    std::string environment_texture_name;
     std::string line;
     int line_no = 0;
 
@@ -338,11 +441,26 @@ SceneLoadResult load_scene(const std::string& path) {
             Texture texture;
             std::string error;
             const std::string resolved_texture_path = join_path(scene_dir, texture_path);
-            if (!load_ppm_texture(texture_name, resolved_texture_path, texture, error)) {
+            if (!load_texture_file(texture_name, resolved_texture_path, texture, error)) {
                 return {scene, error};
             }
             texture.path = texture_path;
             scene.textures.push_back(std::make_shared<Texture>(std::move(texture)));
+        } else if (tag == "environment") {
+            std::string texture_name;
+            in >> scene.environment.color.x >> scene.environment.color.y >> scene.environment.color.z >> scene.environment.strength;
+            if (!in) {
+                return {scene, "Invalid environment at line " + std::to_string(line_no)};
+            }
+            if (in >> texture_name) {
+                scene.environment.texture = find_texture(scene, texture_name);
+                scene.environment.constant = false;
+                environment_texture_name = texture_name;
+            } else {
+                scene.environment.texture = nullptr;
+                scene.environment.constant = true;
+                environment_texture_name.clear();
+            }
         } else if (tag == "material") {
             std::string material_name;
             Vec3 albedo;
@@ -369,7 +487,7 @@ SceneLoadResult load_scene(const std::string& path) {
                 parse_float_token(rest[1], roughness);
                 parse_float_token(rest[2], metallic);
             }
-            roughness = std::clamp(roughness, 0.02f, 1.0f);
+            roughness = brdf == BrdfModel::Dielectric ? std::clamp(roughness, 1.0f, 3.0f) : std::clamp(roughness, 0.02f, 1.0f);
             metallic = std::clamp(metallic, 0.0f, 1.0f);
             material_ids[material_name] = static_cast<int>(scene.materials.size());
             std::shared_ptr<Material> material = make_material(material_name, albedo, brdf, roughness, metallic);
@@ -449,6 +567,9 @@ SceneLoadResult load_scene(const std::string& path) {
             scene.materials[i]->albedo_texture = find_texture(scene, material_texture_names[i]);
         }
     }
+    if (!environment_texture_name.empty()) {
+        scene.environment.texture = find_texture(scene, environment_texture_name);
+    }
     return {scene, {}};
 }
 
@@ -473,6 +594,16 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         out << '\n';
     }
 
+    if (scene.environment.constant || scene.environment.texture) {
+        out << "environment "
+            << scene.environment.color.x << ' ' << scene.environment.color.y << ' ' << scene.environment.color.z << ' '
+            << scene.environment.strength;
+        if (scene.environment.texture) {
+            out << ' ' << scene.environment.texture->name;
+        }
+        out << "\n\n";
+    }
+
     for (const std::shared_ptr<Material>& material : scene.materials) {
         if (!material) {
             continue;
@@ -482,6 +613,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         if (const auto* principled = dynamic_cast<const PrincipledMaterial*>(material.get())) {
             roughness = principled->roughness;
             metallic = principled->metallic;
+        } else if (const auto* dielectric = dynamic_cast<const DielectricMaterial*>(material.get())) {
+            roughness = dielectric->ior;
         }
         out << "material " << material->name << ' '
             << material->albedo.x << ' ' << material->albedo.y << ' ' << material->albedo.z << ' '
@@ -523,6 +656,8 @@ RenderScene build_render_scene(const Scene& scene) {
     RenderScene render_scene;
     for (int mesh_index = 0; mesh_index < static_cast<int>(scene.meshes.size()); ++mesh_index) {
         const Mesh& mesh = scene.meshes[static_cast<size_t>(mesh_index)];
+        const int triangle_index_begin = static_cast<int>(render_scene.triangles.size());
+        const int index_begin = static_cast<int>(render_scene.triangle_indices.size());
         for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
             const size_t i0 = static_cast<size_t>(mesh.indices[i]);
             const size_t i1 = static_cast<size_t>(mesh.indices[i + 1]);
@@ -534,20 +669,45 @@ RenderScene build_render_scene(const Scene& scene) {
             if (dot(n, n) <= 0.0f) {
                 continue;
             }
+            Vec3 n0 = n;
+            Vec3 n1 = n;
+            Vec3 n2 = n;
+            if (i0 < mesh.normals.size() && i1 < mesh.normals.size() && i2 < mesh.normals.size()) {
+                n0 = normalize(rotate_xyz(mesh.normals[i0], mesh.rotation));
+                n1 = normalize(rotate_xyz(mesh.normals[i1], mesh.rotation));
+                n2 = normalize(rotate_xyz(mesh.normals[i2], mesh.rotation));
+                if (dot(n0, n0) <= 0.0f || dot(n1, n1) <= 0.0f || dot(n2, n2) <= 0.0f) {
+                    n0 = n1 = n2 = n;
+                }
+            }
             const int triangle_index = static_cast<int>(render_scene.triangles.size());
             const Vec2 uv0 = i0 < mesh.texcoords.size() ? mesh.texcoords[i0] : default_uv(mesh.vertices[i0]);
             const Vec2 uv1 = i1 < mesh.texcoords.size() ? mesh.texcoords[i1] : default_uv(mesh.vertices[i1]);
             const Vec2 uv2 = i2 < mesh.texcoords.size() ? mesh.texcoords[i2] : default_uv(mesh.vertices[i2]);
-            render_scene.triangles.push_back({v0, v1, v2, n, (v0 + v1 + v2) / 3.0f, uv0, uv1, uv2, mesh.material, mesh_index});
+            render_scene.triangles.push_back({v0, v1, v2, n, n0, n1, n2, (v0 + v1 + v2) / 3.0f, uv0, uv1, uv2, mesh.material, mesh_index});
+            render_scene.triangle_indices.push_back(triangle_index);
             if (mesh.light.enabled && mesh.light.intensity > 0.0f) {
                 render_scene.light_triangle_indices.push_back(triangle_index);
             }
         }
+        const int triangle_count = static_cast<int>(render_scene.triangles.size()) - triangle_index_begin;
+        if (triangle_count > 0) {
+            const int root = build_bvh_recursive(render_scene, render_scene.triangle_indices, render_scene.bvh_nodes, index_begin, triangle_count);
+            RenderScene::MeshInstance instance;
+            instance.bounds = render_scene.bvh_nodes[static_cast<size_t>(root)].bounds;
+            instance.bvh_root = root;
+            instance.mesh = mesh_index;
+            render_scene.mesh_instance_indices.push_back(static_cast<int>(render_scene.mesh_instances.size()));
+            render_scene.mesh_instances.push_back(instance);
+        }
     }
-    render_scene.triangle_indices.resize(render_scene.triangles.size());
-    std::iota(render_scene.triangle_indices.begin(), render_scene.triangle_indices.end(), 0);
-    if (!render_scene.triangles.empty()) {
-        build_bvh_recursive(render_scene, 0, static_cast<int>(render_scene.triangles.size()));
+    if (!render_scene.mesh_instance_indices.empty()) {
+        build_tlas_recursive(render_scene, 0, static_cast<int>(render_scene.mesh_instance_indices.size()));
+    }
+    render_scene.flat_triangle_indices.resize(render_scene.triangles.size());
+    std::iota(render_scene.flat_triangle_indices.begin(), render_scene.flat_triangle_indices.end(), 0);
+    if (!render_scene.flat_triangle_indices.empty()) {
+        build_bvh_recursive(render_scene, render_scene.flat_triangle_indices, render_scene.flat_bvh_nodes, 0, static_cast<int>(render_scene.flat_triangle_indices.size()));
     }
     return render_scene;
 }

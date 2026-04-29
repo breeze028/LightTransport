@@ -9,12 +9,51 @@
 
 namespace lt {
 
+enum class MisHeuristic {
+    Balance = 0,
+    Power = 1,
+};
+
+enum class AccelerationStructure {
+    Auto = 0,
+    Flat = 1,
+    TwoLevel = 2,
+};
+
+enum class RenderDirty : uint32_t {
+    None = 0,
+    Render = 1u << 0u,
+    Camera = 1u << 1u,
+    Material = 1u << 2u,
+    Texture = 1u << 3u,
+    Geometry = 1u << 4u,
+    Environment = 1u << 5u,
+    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u),
+};
+
+constexpr RenderDirty operator|(RenderDirty a, RenderDirty b) {
+    return static_cast<RenderDirty>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+
+constexpr RenderDirty operator&(RenderDirty a, RenderDirty b) {
+    return static_cast<RenderDirty>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
+constexpr bool has_dirty(RenderDirty value, RenderDirty flag) {
+    return static_cast<uint32_t>(value & flag) != 0u;
+}
+
 struct RenderSettings {
     int width = 1280;
     int height = 720;
     int samples_per_pixel = 1;
     int max_bounces = 6;
+    bool use_mis = false;
+    MisHeuristic mis_heuristic = MisHeuristic::Power;
+    AccelerationStructure acceleration_structure = AccelerationStructure::Auto;
+    bool use_primary_hit_cache = true;
     uint32_t frame_index = 0;
+    RenderDirty dirty = RenderDirty::All;
 };
 
 struct Framebuffer {
@@ -57,7 +96,7 @@ public:
 
 private:
     RenderScene cached_render_scene_;
-    uint64_t cached_scene_signature_ = 0;
+    bool scene_uploaded_ = false;
 };
 
 class CudaPathTracer final : public IRenderer {
@@ -71,8 +110,32 @@ public:
 private:
     void* device_accumulation_ = nullptr;
     void* device_rgba_ = nullptr;
+    void* device_primary_hits_ = nullptr;
     void* device_scene_ = nullptr;
+    void* device_materials_ = nullptr;
+    void* device_textures_ = nullptr;
+    void* device_triangles_ = nullptr;
+    void* device_triangle_indices_ = nullptr;
+    void* device_light_indices_ = nullptr;
+    void* device_bvh_nodes_ = nullptr;
+    void* device_mesh_instances_ = nullptr;
+    void* device_mesh_instance_indices_ = nullptr;
+    void* device_tlas_nodes_ = nullptr;
+    std::vector<void*> texture_arrays_;
+    std::vector<uint64_t> texture_objects_;
     size_t cached_pixels_ = 0;
+    size_t cached_primary_pixels_ = 0;
+    int cached_materials_ = 0;
+    int cached_textures_ = 0;
+    int cached_triangles_ = 0;
+    int cached_triangle_indices_ = 0;
+    int cached_lights_ = 0;
+    int cached_bvh_nodes_ = 0;
+    int cached_mesh_instances_ = 0;
+    int cached_mesh_instance_indices_ = 0;
+    int cached_tlas_nodes_ = 0;
+    bool scene_uploaded_ = false;
+    bool primary_cache_valid_ = false;
 };
 
 } // namespace lt

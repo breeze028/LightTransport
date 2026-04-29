@@ -41,6 +41,26 @@ int main(int argc, char** argv) {
             prefer_cuda = true;
         } else if (arg == "--cpu") {
             prefer_cuda = false;
+        } else if (arg == "--mis") {
+            settings.use_mis = true;
+        } else if (arg == "--no-mis") {
+            settings.use_mis = false;
+        } else if (arg == "--primary-hit-cache") {
+            settings.use_primary_hit_cache = true;
+        } else if (arg == "--no-primary-hit-cache") {
+            settings.use_primary_hit_cache = false;
+        } else if (arg == "--mis-heuristic" && i + 1 < argc) {
+            const std::string heuristic = argv[++i];
+            settings.mis_heuristic = heuristic == "balance" ? lt::MisHeuristic::Balance : lt::MisHeuristic::Power;
+        } else if (arg == "--accel" && i + 1 < argc) {
+            const std::string accel = argv[++i];
+            if (accel == "two-level" || accel == "twolevel" || accel == "tlas") {
+                settings.acceleration_structure = lt::AccelerationStructure::TwoLevel;
+            } else if (accel == "flat") {
+                settings.acceleration_structure = lt::AccelerationStructure::Flat;
+            } else {
+                settings.acceleration_structure = lt::AccelerationStructure::Auto;
+            }
         } else if (arg == "--spp" && i + 1 < argc) {
             settings.samples_per_pixel = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--frames" && i + 1 < argc) {
@@ -68,6 +88,7 @@ int main(int argc, char** argv) {
     const uint32_t frames = settings.frame_index + 1u;
     for (uint32_t frame = 0; frame < frames; ++frame) {
         settings.frame_index = frame;
+        settings.dirty = frame == 0 ? lt::RenderDirty::All : lt::RenderDirty::None;
         renderer->render(loaded.scene, settings, framebuffer);
         std::cout << "\r" << renderer->name() << " frame " << (frame + 1u) << "/" << frames << std::flush;
     }

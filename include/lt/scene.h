@@ -18,6 +18,7 @@ struct LightComponent {
 struct Mesh {
     std::string name = "Mesh";
     std::vector<Vec3> vertices;
+    std::vector<Vec3> normals;
     std::vector<Vec2> texcoords;
     std::vector<uint32_t> indices;
     int material = 0;
@@ -34,6 +35,13 @@ struct Camera {
     float fov_degrees = 45.0f;
 };
 
+struct Environment {
+    Vec3 color = {1.0f, 1.0f, 1.0f};
+    float strength = 1.0f;
+    std::shared_ptr<Texture> texture;
+    bool constant = false;
+};
+
 struct Scene {
     Scene() = default;
     Scene(const Scene& other);
@@ -42,6 +50,7 @@ struct Scene {
     Scene& operator=(Scene&&) noexcept = default;
 
     Camera camera;
+    Environment environment;
     std::vector<std::shared_ptr<Material>> materials;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<Mesh> meshes;
@@ -52,6 +61,9 @@ struct Triangle {
     Vec3 v1;
     Vec3 v2;
     Vec3 normal;
+    Vec3 n0;
+    Vec3 n1;
+    Vec3 n2;
     Vec3 centroid;
     Vec2 uv0;
     Vec2 uv1;
@@ -74,10 +86,21 @@ struct BvhNode {
 };
 
 struct RenderScene {
+    struct MeshInstance {
+        Aabb bounds;
+        int bvh_root = -1;
+        int mesh = -1;
+    };
+
     std::vector<Triangle> triangles;
     std::vector<int> triangle_indices;
+    std::vector<int> flat_triangle_indices;
     std::vector<int> light_triangle_indices;
     std::vector<BvhNode> bvh_nodes;
+    std::vector<BvhNode> flat_bvh_nodes;
+    std::vector<MeshInstance> mesh_instances;
+    std::vector<int> mesh_instance_indices;
+    std::vector<BvhNode> tlas_nodes;
 };
 
 struct SceneLoadResult {
@@ -87,6 +110,7 @@ struct SceneLoadResult {
 
 Scene make_default_scene();
 SceneLoadResult load_scene(const std::string& path);
+SceneLoadResult load_gltf_scene(const std::string& path);
 bool save_scene(const Scene& scene, const std::string& path, std::string& error);
 int find_material(const Scene& scene, const std::string& name);
 RenderScene build_render_scene(const Scene& scene);

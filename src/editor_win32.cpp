@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -39,6 +40,7 @@ struct Editor {
     lt::CpuPathTracer cpu;
     lt::CudaPathTracer cuda;
     lt::IRenderer* renderer = &cpu;
+    lt::RenderDirty dirty = lt::RenderDirty::All;
     std::string scene_path = "scenes/cornell.lt";
     uint32_t frame_index = 0;
     uint64_t render_generation = 1;
@@ -62,11 +64,13 @@ struct Editor {
     ImVec2 drag_start_axis_b_screen = {};
     float drag_start_depth = 1.0f;
     float drag_start_angle = 0.0f;
+    double last_sample_ms = 0.0;
 };
 
 struct RenderResult {
     uint64_t generation = 0;
     uint32_t completed_frame = 0;
+    double elapsed_ms = 0.0;
     lt::Framebuffer framebuffer;
 };
 
@@ -171,10 +175,20 @@ void cleanup_device() {
     if (g_device) g_device->Release();
 }
 
-void reset_accumulation() {
+void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
+    g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
     ++g_editor.render_generation;
     g_editor.frame_index = 0;
-    std::fill(g_editor.framebuffer.accumulation.begin(), g_editor.framebuffer.accumulation.end(), lt::Vec3{});
+    g_editor.framebuffer.clear();
+    upload_preview_texture();
+}
+
+void set_renderer(bool use_cuda) {
+    lt::IRenderer* next = use_cuda && g_editor.cuda.available() ? static_cast<lt::IRenderer*>(&g_editor.cuda) : static_cast<lt::IRenderer*>(&g_editor.cpu);
+    if (g_editor.renderer != next) {
+        g_editor.renderer = next;
+        reset_accumulation(lt::RenderDirty::All);
+    }
 }
 
 void select_mesh(int index) {
@@ -189,7 +203,7 @@ void set_scene(lt::Scene scene, const std::string& path) {
     g_editor.scene = std::move(scene);
     g_editor.scene_path = path;
     select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::All);
 }
 
 void load_scene_file(const std::string& path) {
@@ -207,7 +221,7 @@ void open_scene_dialog() {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"LightTransport scenes (*.lt)\0*.lt\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Scene files (*.lt;*.glb;*.gltf)\0*.lt;*.glb;*.gltf\0LightTransport scenes (*.lt)\0*.lt\0glTF scenes (*.glb;*.gltf)\0*.glb;*.gltf\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) load_scene_file(narrow(filename));
 }
@@ -223,6 +237,13 @@ std::string texture_name_from_path(const std::string& path) {
     return name.empty() ? "texture" : name;
 }
 
+std::string lowercase_extension(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    std::string ext = dot == std::string::npos ? std::string{} : path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
 void load_texture_dialog(lt::Material& material) {
     wchar_t filename[MAX_PATH] = {};
     OPENFILENAMEW ofn{};
@@ -230,7 +251,7 @@ void load_texture_dialog(lt::Material& material) {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"PPM textures (*.ppm)\0*.ppm\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Image textures (*.ppm;*.png;*.jpg;*.jpeg;*.hdr)\0*.ppm;*.png;*.jpg;*.jpeg;*.hdr\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return;
 
@@ -238,17 +259,47 @@ void load_texture_dialog(lt::Material& material) {
     const std::string name = texture_name_from_path(path);
     lt::Texture texture;
     std::string error;
-    if (!lt::load_ppm_texture(name, path, texture, error)) {
+    if (!lt::load_texture_file(name, path, texture, error)) {
         MessageBoxW(g_hwnd, widen(error).c_str(), L"Texture load failed", MB_OK | MB_ICONERROR);
         return;
     }
     auto shared = std::make_shared<lt::Texture>(std::move(texture));
     g_editor.scene.textures.push_back(shared);
     material.albedo_texture = shared;
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Texture | lt::RenderDirty::Material);
+}
+
+void load_environment_texture_dialog() {
+    wchar_t filename[MAX_PATH] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"HDRI environment (*.hdr)\0*.hdr\0Image textures (*.hdr;*.ppm;*.png;*.jpg;*.jpeg)\0*.hdr;*.ppm;*.png;*.jpg;*.jpeg\0All files (*.*)\0*.*\0";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    const std::string path = narrow(filename);
+    const std::string name = texture_name_from_path(path);
+    lt::Texture texture;
+    std::string error;
+    if (!lt::load_texture_file(name, path, texture, error)) {
+        MessageBoxW(g_hwnd, widen(error).c_str(), L"Environment load failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+    auto shared = std::make_shared<lt::Texture>(std::move(texture));
+    g_editor.scene.textures.push_back(shared);
+    g_editor.scene.environment.texture = shared;
+    g_editor.scene.environment.constant = false;
+    reset_accumulation(lt::RenderDirty::Texture | lt::RenderDirty::Environment);
 }
 
 void save_scene() {
+    if (lowercase_extension(g_editor.scene_path) != ".lt") {
+        MessageBoxW(g_hwnd, L"Imported glTF/GLB scenes can be edited, but saving back to that format is not supported yet. Save is limited to .lt scene files.", L"Save skipped", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     std::string error;
     if (!lt::save_scene(g_editor.scene, g_editor.scene_path, error)) {
         MessageBoxW(g_hwnd, widen(error).c_str(), L"Save failed", MB_OK | MB_ICONERROR);
@@ -261,7 +312,7 @@ void add_mesh() {
     const lt::Vec3 forward = lt::normalize(g_editor.scene.camera.target - g_editor.scene.camera.position);
     g_editor.scene.meshes.push_back(lt::make_cube_mesh("Mesh", material, g_editor.scene.camera.position + forward * 1.5f, 0.35f));
     select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Geometry);
 }
 
 void duplicate_selected() {
@@ -271,14 +322,14 @@ void duplicate_selected() {
     copy.translation.x += std::max({copy.scale.x, copy.scale.y, copy.scale.z}) * 1.2f;
     g_editor.scene.meshes.push_back(copy);
     select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Geometry);
 }
 
 void delete_selected() {
     if (!has_selection()) return;
     g_editor.scene.meshes.erase(g_editor.scene.meshes.begin() + g_editor.selected_mesh);
     select_mesh(g_editor.scene.meshes.empty() ? -1 : std::min(g_editor.selected_mesh, static_cast<int>(g_editor.scene.meshes.size()) - 1));
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Geometry);
 }
 
 void recreate_preview_texture(int width, int height) {
@@ -320,6 +371,7 @@ void poll_render_result() {
     if (result.generation != g_editor.render_generation) return;
     g_editor.framebuffer = std::move(result.framebuffer);
     g_editor.frame_index = result.completed_frame + 1u;
+    g_editor.last_sample_ms = result.elapsed_ms;
     upload_preview_texture();
 }
 
@@ -329,17 +381,16 @@ void launch_render_task() {
     lt::RenderSettings settings = g_editor.settings;
     lt::Framebuffer framebuffer = g_editor.framebuffer;
     const uint64_t generation = g_editor.render_generation;
-    const bool use_cuda = g_editor.renderer == &g_editor.cuda;
+    lt::IRenderer* renderer = g_editor.renderer;
     settings.frame_index = g_editor.frame_index;
-    g_render_future = std::async(std::launch::async, [scene = std::move(scene), settings, framebuffer = std::move(framebuffer), generation, use_cuda]() mutable {
-        if (use_cuda) {
-            lt::CudaPathTracer renderer;
-            renderer.render(scene, settings, framebuffer);
-        } else {
-            lt::CpuPathTracer renderer;
-            renderer.render(scene, settings, framebuffer);
-        }
-        return RenderResult{generation, settings.frame_index, std::move(framebuffer)};
+    settings.dirty = g_editor.dirty;
+    g_editor.dirty = lt::RenderDirty::None;
+    g_render_future = std::async(std::launch::async, [scene = std::move(scene), settings, framebuffer = std::move(framebuffer), generation, renderer]() mutable {
+        const auto begin = std::chrono::steady_clock::now();
+        renderer->render(scene, settings, framebuffer);
+        const auto end = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        return RenderResult{generation, settings.frame_index, elapsed_ms, std::move(framebuffer)};
     });
 }
 
@@ -454,7 +505,7 @@ void move_camera(float right_delta, float up_delta, float forward_delta) {
     const lt::Vec3 delta = view.right * right_delta + view.up * up_delta + view.forward * forward_delta;
     camera.position += delta;
     camera.target += delta;
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Camera);
 }
 
 void rotate_camera(float yaw, float pitch) {
@@ -466,7 +517,7 @@ void rotate_camera(float yaw, float pitch) {
     current_yaw += yaw;
     current_pitch = std::clamp(current_pitch + pitch, -1.45f, 1.45f);
     camera.target = camera.position + lt::Vec3{std::sin(current_yaw) * std::cos(current_pitch), std::sin(current_pitch), std::cos(current_yaw) * std::cos(current_pitch)} * radius;
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Camera);
 }
 
 lt::Vec3 handle_axis(GizmoHandle handle) {
@@ -721,7 +772,7 @@ void handle_gizmo_drag() {
                 const float len = std::sqrt(combined.x * combined.x + combined.y * combined.y);
                 const float amount = len > 1.0f ? (delta.x * combined.x + delta.y * combined.y) / len * world_per_pixel : 0.0f;
                 mesh.translation = g_editor.drag_start_mesh.translation + lt::normalize(a + b) * amount;
-                reset_accumulation();
+                reset_accumulation(lt::RenderDirty::Geometry);
                 return;
             }
             mesh.translation = g_editor.drag_start_mesh.translation + a * amount_a + b * amount_b;
@@ -786,7 +837,7 @@ void handle_gizmo_drag() {
         mesh.scale.y = std::max(0.01f, mesh.scale.y);
         mesh.scale.z = std::max(0.01f, mesh.scale.z);
     }
-    reset_accumulation();
+    reset_accumulation(lt::RenderDirty::Geometry);
 }
 
 void draw_arrow_2d(ImDrawList* draw_list, ImVec2 start, ImVec2 end, ImU32 color) {
@@ -879,6 +930,50 @@ void draw_mesh_outline(ImDrawList* draw_list) {
     }
 }
 
+void draw_mesh_bounds_outline(ImDrawList* draw_list, const lt::Mesh& mesh, ImU32 color, float thickness) {
+    if (mesh.vertices.empty()) return;
+    lt::Vec3 local_min{lt::kInfinity, lt::kInfinity, lt::kInfinity};
+    lt::Vec3 local_max{-lt::kInfinity, -lt::kInfinity, -lt::kInfinity};
+    for (lt::Vec3 v : mesh.vertices) {
+        local_min = lt::min(local_min, v);
+        local_max = lt::max(local_max, v);
+    }
+    const lt::Vec3 corners[8] = {
+        {local_min.x, local_min.y, local_min.z},
+        {local_max.x, local_min.y, local_min.z},
+        {local_max.x, local_max.y, local_min.z},
+        {local_min.x, local_max.y, local_min.z},
+        {local_min.x, local_min.y, local_max.z},
+        {local_max.x, local_min.y, local_max.z},
+        {local_max.x, local_max.y, local_max.z},
+        {local_min.x, local_max.y, local_max.z},
+    };
+    ImVec2 projected[8]{};
+    bool visible[8]{};
+    for (int i = 0; i < 8; ++i) {
+        visible[i] = project_point(transform_mesh_point(mesh, corners[i]), projected[i]);
+    }
+    constexpr int edges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},
+    };
+    for (const auto& edge : edges) {
+        if (visible[edge[0]] && visible[edge[1]]) {
+            draw_list->AddLine(projected[edge[0]], projected[edge[1]], color, thickness);
+        }
+    }
+}
+
+void draw_scene_reference_outlines(ImDrawList* draw_list) {
+    const ImU32 mesh_color = IM_COL32(150, 170, 190, 130);
+    const ImU32 selected_color = IM_COL32(255, 150, 35, 230);
+    for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
+        const bool selected = i == g_editor.selected_mesh;
+        draw_mesh_bounds_outline(draw_list, g_editor.scene.meshes[static_cast<size_t>(i)], selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
+    }
+}
+
 void draw_gizmo_overlay() {
     if (!has_selection()) return;
     lt::Vec3 center3{};
@@ -889,7 +984,7 @@ void draw_gizmo_overlay() {
     const float radius = std::max(18.0f, radius3 * 90.0f);
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (g_editor.tool_mode == ToolMode::Select) {
-        draw_mesh_outline(draw_list);
+        draw_mesh_bounds_outline(draw_list, g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)], IM_COL32(255, 150, 35, 255), 2.0f);
     }
     if (g_editor.tool_mode == ToolMode::Move || g_editor.tool_mode == ToolMode::Scale) {
         ImVec2 px{}, py{}, pz{}, pxy{}, pyz{}, pzx{};
@@ -961,11 +1056,11 @@ void draw_gizmo_overlay() {
     }
 }
 
-bool edit_vec3(const char* label, lt::Vec3& value, float speed = 0.02f) {
+bool edit_vec3(const char* label, lt::Vec3& value, float speed = 0.02f, lt::RenderDirty dirty = lt::RenderDirty::Render) {
     float data[3] = {value.x, value.y, value.z};
     if (ImGui::DragFloat3(label, data, speed, -1000.0f, 1000.0f, "%.3f")) {
         value = {data[0], data[1], data[2]};
-        reset_accumulation();
+        reset_accumulation(dirty);
         return true;
     }
     return false;
@@ -991,7 +1086,7 @@ bool edit_location_world(const char* label, lt::Mesh& mesh) {
     if (ImGui::DragFloat3(label, data, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
         const lt::Vec3 next{data[0], data[1], data[2]};
         mesh.translation += next - location;
-        reset_accumulation();
+        reset_accumulation(lt::RenderDirty::Geometry);
         return true;
     }
     return false;
@@ -1003,17 +1098,17 @@ bool edit_rotation_degrees(const char* label, lt::Vec3& radians) {
     float data[3] = {radians.x * kRadToDeg, radians.y * kRadToDeg, radians.z * kRadToDeg};
     if (ImGui::DragFloat3(label, data, 0.2f, -36000.0f, 36000.0f, "%.2f deg")) {
         radians = {data[0] * kDegToRad, data[1] * kDegToRad, data[2] * kDegToRad};
-        reset_accumulation();
+        reset_accumulation(lt::RenderDirty::Geometry);
         return true;
     }
     return false;
 }
 
-bool color_edit(const char* label, lt::Vec3& value) {
+bool color_edit(const char* label, lt::Vec3& value, lt::RenderDirty dirty = lt::RenderDirty::Render) {
     float data[3] = {value.x, value.y, value.z};
     if (ImGui::ColorEdit3(label, data, ImGuiColorEditFlags_Float)) {
         value = {data[0], data[1], data[2]};
-        reset_accumulation();
+        reset_accumulation(dirty);
         return true;
     }
     return false;
@@ -1096,14 +1191,17 @@ void draw_top_bar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Render")) {
-        if (ImGui::MenuItem("CPU Path Tracer", "1", g_editor.renderer == &g_editor.cpu)) { g_editor.renderer = &g_editor.cpu; reset_accumulation(); }
-        if (ImGui::MenuItem("CUDA Path Tracer", "2", g_editor.renderer == &g_editor.cuda, g_editor.cuda.available())) { g_editor.renderer = &g_editor.cuda; reset_accumulation(); }
         if (ImGui::MenuItem(g_editor.paused ? "Resume" : "Pause", "Space")) g_editor.paused = !g_editor.paused;
         if (ImGui::MenuItem("Reset Accumulation", "Ctrl+R")) reset_accumulation();
         ImGui::EndMenu();
     }
     ImGui::Separator();
-    ImGui::Text("%s | %s | samples %u | %s", tool_mode_name(g_editor.tool_mode), g_editor.renderer->name(), g_editor.frame_index, g_editor.scene_path.c_str());
+    ImGui::Text("%s | %s | samples %u | %.2f ms | %s",
+                tool_mode_name(g_editor.tool_mode),
+                g_editor.renderer->name(),
+                g_editor.frame_index,
+                g_editor.last_sample_ms,
+                g_editor.scene_path.c_str());
     ImGui::EndMainMenuBar();
 }
 
@@ -1123,11 +1221,6 @@ void draw_toolbar() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Move gizmo space");
     }
-    ImGui::Separator();
-    if (ImGui::Button("CPU", ImVec2(48.0f, 28.0f))) { g_editor.renderer = &g_editor.cpu; reset_accumulation(); }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("CPU Path Tracer");
-    if (ImGui::Button("GPU", ImVec2(48.0f, 28.0f)) && g_editor.cuda.available()) { g_editor.renderer = &g_editor.cuda; reset_accumulation(); }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("CUDA Path Tracer");
     ImGui::End();
 }
 
@@ -1153,7 +1246,7 @@ void draw_properties() {
                 if (ImGui::InputText("Name", name, sizeof(name))) mesh.name = name;
                 edit_location_world("Location", mesh);
                 edit_rotation_degrees("Rotation", mesh.rotation);
-                if (edit_vec3("Scale", mesh.scale, 0.01f)) {
+                if (edit_vec3("Scale", mesh.scale, 0.01f, lt::RenderDirty::Geometry)) {
                     mesh.scale.x = std::max(0.01f, mesh.scale.x);
                     mesh.scale.y = std::max(0.01f, mesh.scale.y);
                     mesh.scale.z = std::max(0.01f, mesh.scale.z);
@@ -1162,13 +1255,13 @@ void draw_properties() {
                     const auto* scene = static_cast<const lt::Scene*>(data);
                     *out = scene->materials[static_cast<size_t>(idx)]->name.c_str();
                     return true;
-                }, &g_editor.scene, static_cast<int>(g_editor.scene.materials.size()))) reset_accumulation();
-                if (ImGui::Checkbox("Light", &mesh.light.enabled)) reset_accumulation();
+                }, &g_editor.scene, static_cast<int>(g_editor.scene.materials.size()))) reset_accumulation(lt::RenderDirty::Geometry);
+                if (ImGui::Checkbox("Light", &mesh.light.enabled)) reset_accumulation(lt::RenderDirty::Geometry);
                 if (mesh.light.enabled) {
-                    color_edit("Light Color", mesh.light.color);
+                    color_edit("Light Color", mesh.light.color, lt::RenderDirty::Geometry);
                     if (ImGui::DragFloat("Intensity", &mesh.light.intensity, 0.1f, 0.0f, 1000.0f, "%.2f")) {
                         mesh.light.intensity = std::max(0.0f, mesh.light.intensity);
-                        reset_accumulation();
+                        reset_accumulation(lt::RenderDirty::Geometry);
                     }
                 }
                 ImGui::Text("Vertices: %d", static_cast<int>(mesh.vertices.size()));
@@ -1184,7 +1277,7 @@ void draw_properties() {
                     continue;
                 }
                 if (ImGui::TreeNodeEx(material->name.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
-                    color_edit("Base Color", material->albedo);
+                    color_edit("Base Color", material->albedo, lt::RenderDirty::Material);
                     int texture_index = 0;
                     if (material->albedo_texture) {
                         for (int i = 0; i < static_cast<int>(g_editor.scene.textures.size()); ++i) {
@@ -1209,12 +1302,12 @@ void draw_properties() {
                     };
                     if (ImGui::Combo("Base Texture", &texture_index, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
                         material->albedo_texture = texture_index > 0 ? g_editor.scene.textures[static_cast<size_t>(texture_index - 1)] : nullptr;
-                        reset_accumulation();
+                        reset_accumulation(lt::RenderDirty::Material);
                     }
-                    if (ImGui::Button("Load PPM Texture")) {
+                    if (ImGui::Button("Load Texture")) {
                         load_texture_dialog(*material);
                     }
-                    const char* models[] = {"Lambertian", "Principled"};
+                    const char* models[] = {"Lambertian", "Principled", "Mirror", "Dielectric", "Conductor"};
                     int model = static_cast<int>(material->model());
                     if (ImGui::Combo("BRDF", &model, models, IM_ARRAYSIZE(models))) {
                         const std::string name = material->name;
@@ -1224,18 +1317,32 @@ void draw_properties() {
                         if (const auto* principled = dynamic_cast<const lt::PrincipledMaterial*>(material.get())) {
                             roughness = principled->roughness;
                             metallic = principled->metallic;
+                        } else if (const auto* dielectric = dynamic_cast<const lt::DielectricMaterial*>(material.get())) {
+                            roughness = dielectric->ior;
                         }
-                        material = lt::make_material(name, albedo, model == 1 ? lt::BrdfModel::Principled : lt::BrdfModel::Lambertian, roughness, metallic);
-                        reset_accumulation();
+                        material = lt::make_material(name, albedo, static_cast<lt::BrdfModel>(model), roughness, metallic);
+                        reset_accumulation(lt::RenderDirty::Material);
+                    }
+                    if (material->model() == lt::BrdfModel::Mirror) {
+                        ImGui::TextDisabled("Mirror is an untinted ideal specular reflector.");
+                    }
+                    if (material->model() == lt::BrdfModel::Conductor) {
+                        ImGui::TextDisabled("Conductor uses Base Color as ideal metal reflectance tint.");
                     }
                     if (auto* principled = dynamic_cast<lt::PrincipledMaterial*>(material.get())) {
                         if (ImGui::DragFloat("Roughness", &principled->roughness, 0.01f, 0.02f, 1.0f, "%.2f")) {
                             principled->roughness = std::clamp(principled->roughness, 0.02f, 1.0f);
-                            reset_accumulation();
+                            reset_accumulation(lt::RenderDirty::Material);
                         }
                         if (ImGui::DragFloat("Metallic", &principled->metallic, 0.01f, 0.0f, 1.0f, "%.2f")) {
                             principled->metallic = std::clamp(principled->metallic, 0.0f, 1.0f);
-                            reset_accumulation();
+                            reset_accumulation(lt::RenderDirty::Material);
+                        }
+                    }
+                    if (auto* dielectric = dynamic_cast<lt::DielectricMaterial*>(material.get())) {
+                        if (ImGui::DragFloat("IOR", &dielectric->ior, 0.01f, 1.0f, 3.0f, "%.2f")) {
+                            dielectric->ior = std::clamp(dielectric->ior, 1.0f, 3.0f);
+                            reset_accumulation(lt::RenderDirty::Material);
                         }
                     }
                     ImGui::TreePop();
@@ -1244,15 +1351,40 @@ void draw_properties() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Camera")) {
-            edit_vec3("Position", g_editor.scene.camera.position);
-            edit_vec3("Target", g_editor.scene.camera.target);
+            edit_vec3("Position", g_editor.scene.camera.position, 0.02f, lt::RenderDirty::Camera);
+            edit_vec3("Target", g_editor.scene.camera.target, 0.02f, lt::RenderDirty::Camera);
             if (ImGui::DragFloat("FOV", &g_editor.scene.camera.fov_degrees, 0.2f, 10.0f, 120.0f, "%.1f")) {
                 g_editor.scene.camera.fov_degrees = std::clamp(g_editor.scene.camera.fov_degrees, 10.0f, 120.0f);
-                reset_accumulation();
+                reset_accumulation(lt::RenderDirty::Camera);
             }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Render")) {
+            const bool using_cuda = g_editor.renderer == &g_editor.cuda;
+            const char* renderer_name = using_cuda ? "CUDA Path Tracer" : "CPU Path Tracer";
+            if (ImGui::BeginCombo("Renderer", renderer_name)) {
+                if (ImGui::Selectable("CPU Path Tracer", !using_cuda)) {
+                    set_renderer(false);
+                }
+                const bool cuda_available = g_editor.cuda.available();
+                ImGui::BeginDisabled(!cuda_available);
+                if (ImGui::Selectable("CUDA Path Tracer", using_cuda)) {
+                    set_renderer(true);
+                }
+                ImGui::EndDisabled();
+                ImGui::EndCombo();
+            }
+            if (ImGui::Checkbox("Multiple importance sampling", &g_editor.settings.use_mis)) {
+                reset_accumulation();
+            }
+            ImGui::BeginDisabled(!g_editor.settings.use_mis);
+            const char* heuristics[] = {"Balance", "Power"};
+            int heuristic = static_cast<int>(g_editor.settings.mis_heuristic);
+            if (ImGui::Combo("MIS heuristic", &heuristic, heuristics, IM_ARRAYSIZE(heuristics))) {
+                g_editor.settings.mis_heuristic = heuristic == 0 ? lt::MisHeuristic::Balance : lt::MisHeuristic::Power;
+                reset_accumulation();
+            }
+            ImGui::EndDisabled();
             if (ImGui::DragInt("Samples / frame", &g_editor.settings.samples_per_pixel, 1.0f, 1, 64)) {
                 g_editor.settings.samples_per_pixel = std::clamp(g_editor.settings.samples_per_pixel, 1, 64);
                 reset_accumulation();
@@ -1260,6 +1392,39 @@ void draw_properties() {
             if (ImGui::DragInt("Max bounces", &g_editor.settings.max_bounces, 1.0f, 1, 32)) {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
+            }
+            const char* accel_modes[] = {"Auto (Flat)", "Flat BVH", "Two-level BVH"};
+            int accel_mode = static_cast<int>(g_editor.settings.acceleration_structure);
+            if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
+                g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
+                reset_accumulation(lt::RenderDirty::Geometry);
+            }
+            if (ImGui::Checkbox("Primary hit cache", &g_editor.settings.use_primary_hit_cache)) {
+                reset_accumulation(lt::RenderDirty::Camera);
+            }
+            ImGui::SeparatorText("Environment");
+            color_edit("Environment Color", g_editor.scene.environment.color, lt::RenderDirty::Environment);
+            if (ImGui::DragFloat("Strength", &g_editor.scene.environment.strength, 0.05f, 0.0f, 100.0f, "%.2f")) {
+                g_editor.scene.environment.strength = std::max(0.0f, g_editor.scene.environment.strength);
+                reset_accumulation(lt::RenderDirty::Environment);
+            }
+            bool constant_environment = g_editor.scene.environment.constant && !g_editor.scene.environment.texture;
+            if (ImGui::Checkbox("Constant Environment", &constant_environment)) {
+                g_editor.scene.environment.constant = constant_environment;
+                if (constant_environment) {
+                    g_editor.scene.environment.texture = nullptr;
+                }
+                reset_accumulation(lt::RenderDirty::Environment);
+            }
+            ImGui::Text("HDRI: %s", g_editor.scene.environment.texture ? g_editor.scene.environment.texture->name.c_str() : "None");
+            if (ImGui::Button("Load HDRI")) {
+                load_environment_texture_dialog();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear HDRI")) {
+                g_editor.scene.environment.texture = nullptr;
+                g_editor.scene.environment.constant = false;
+                reset_accumulation(lt::RenderDirty::Environment);
             }
             ImGui::Checkbox("Pause", &g_editor.paused);
             ImGui::EndTabItem();
@@ -1305,6 +1470,9 @@ void draw_viewport() {
         select_mesh(pick_mesh(ImGui::GetIO().MousePos, mesh) ? mesh : -1);
     }
     handle_gizmo_drag();
+    if (g_editor.frame_index == 0) {
+        draw_scene_reference_outlines(ImGui::GetWindowDrawList());
+    }
     draw_gizmo_overlay();
     if (g_editor.viewport_hovered) {
         if (g_editor.tool_mode == ToolMode::Move) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
@@ -1321,7 +1489,18 @@ void draw_status_bar() {
     ImGui::SetNextWindowPos({viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - 26.0f});
     ImGui::SetNextWindowSize({viewport->WorkSize.x, 26.0f});
     ImGui::Begin("Status", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-    ImGui::Text("Meshes: %d | Frame: %u | %dx%d", static_cast<int>(g_editor.scene.meshes.size()), g_editor.frame_index, g_editor.settings.width, g_editor.settings.height);
+    size_t vertex_count = 0;
+    size_t triangle_count = 0;
+    for (const lt::Mesh& mesh : g_editor.scene.meshes) {
+        vertex_count += mesh.vertices.size();
+        triangle_count += mesh.indices.size() / 3;
+    }
+    ImGui::Text("Meshes: %d | Vertices: %zu | Triangles: %zu | %dx%d",
+                static_cast<int>(g_editor.scene.meshes.size()),
+                vertex_count,
+                triangle_count,
+                g_editor.settings.width,
+                g_editor.settings.height);
     ImGui::End();
 }
 
@@ -1334,17 +1513,19 @@ void draw_ui() {
     const float right = 340.0f;
     const ImVec2 work_pos = viewport->WorkPos;
     const ImVec2 work_size = viewport->WorkSize;
-    ImGui::SetNextWindowPos({work_pos.x, work_pos.y + top}, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize({left, work_size.y - top - bottom}, ImGuiCond_FirstUseEver);
+    const float content_height = std::max(64.0f, work_size.y - top - bottom);
+    const float viewport_width = std::max(64.0f, work_size.x - left - right);
+    ImGui::SetNextWindowPos({work_pos.x, work_pos.y + top}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({left, content_height}, ImGuiCond_Always);
     draw_toolbar();
-    ImGui::SetNextWindowPos({work_pos.x + left, work_pos.y + top}, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize({work_size.x - left - right, work_size.y - top - bottom}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos({work_pos.x + left, work_pos.y + top}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({viewport_width, content_height}, ImGuiCond_Always);
     draw_viewport();
-    ImGui::SetNextWindowPos({work_pos.x + work_size.x - right, work_pos.y + top}, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize({right, (work_size.y - top - bottom) * 0.38f}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos({work_pos.x + left + viewport_width, work_pos.y + top}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({right, content_height * 0.38f}, ImGuiCond_Always);
     draw_outliner();
-    ImGui::SetNextWindowPos({work_pos.x + work_size.x - right, work_pos.y + top + (work_size.y - top - bottom) * 0.38f}, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize({right, (work_size.y - top - bottom) * 0.62f}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos({work_pos.x + left + viewport_width, work_pos.y + top + content_height * 0.38f}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({right, content_height * 0.62f}, ImGuiCond_Always);
     draw_properties();
     draw_status_bar();
 }
@@ -1358,8 +1539,6 @@ void handle_global_shortcuts() {
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) delete_selected();
     if (ImGui::IsKeyPressed(ImGuiKey_O)) open_scene_dialog();
     if (ImGui::IsKeyPressed(ImGuiKey_Space)) g_editor.paused = !g_editor.paused;
-    if (ImGui::IsKeyPressed(ImGuiKey_1)) { g_editor.renderer = &g_editor.cpu; reset_accumulation(); }
-    if (ImGui::IsKeyPressed(ImGuiKey_2) && g_editor.cuda.available()) { g_editor.renderer = &g_editor.cuda; reset_accumulation(); }
     if (!io.KeyCtrl) {
         if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A)) add_mesh();
     }
@@ -1468,6 +1647,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
         g_context->ClearRenderTargetView(g_main_rtv, clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_swap_chain->Present(1, 0);
+    }
+
+    if (g_render_future.valid()) {
+        g_render_future.wait();
     }
 
     ImGui_ImplDX11_Shutdown();

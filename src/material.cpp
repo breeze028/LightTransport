@@ -32,6 +32,19 @@ Vec3 reflect(Vec3 v, Vec3 n) {
     return n * (2.0f * dot(v, n)) - v;
 }
 
+Vec3 refract(Vec3 v, Vec3 n, float eta) {
+    const float cos_theta = std::min(dot(v, n), 1.0f);
+    const Vec3 perpendicular = (n * cos_theta - v) * eta;
+    const float parallel_len2 = std::max(0.0f, 1.0f - dot(perpendicular, perpendicular));
+    return normalize(perpendicular - n * std::sqrt(parallel_len2));
+}
+
+float fresnel_dielectric(float cos_theta, float eta) {
+    float r0 = (1.0f - eta) / (1.0f + eta);
+    r0 *= r0;
+    return r0 + (1.0f - r0) * std::pow(std::clamp(1.0f - cos_theta, 0.0f, 1.0f), 5.0f);
+}
+
 Vec3 sample_ggx_half(Vec3 n, float roughness, float u1, float u2) {
     const float a = roughness * roughness;
     const float phi = 2.0f * kPi * u1;
@@ -58,7 +71,7 @@ float LambertianMaterial::pdf(Vec3 n, Vec3, Vec3 wi) const {
     return std::max(0.0f, dot(n, wi)) / kPi;
 }
 
-MaterialSample LambertianMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, Rng& rng) const {
+MaterialSample LambertianMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& rng) const {
     MaterialSample result;
     result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), n));
     result.pdf = pdf(n, wo, result.direction);
@@ -105,7 +118,7 @@ float PrincipledMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi) const {
     return (1.0f - spec_prob) * diffuse_pdf + spec_prob * specular_pdf;
 }
 
-MaterialSample PrincipledMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, Rng& rng) const {
+MaterialSample PrincipledMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& rng) const {
     MaterialSample result;
     const float m = std::clamp(metallic, 0.0f, 1.0f);
     const float spec_prob = principled_specular_probability(m);
@@ -124,15 +137,61 @@ MaterialSample PrincipledMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, Rng& rng) co
     return result;
 }
 
+MaterialSample MirrorMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng&) const {
+    MaterialSample result;
+    result.direction = normalize(reflect(wo, n));
+    (void)uv;
+    result.weight = {1.0f, 1.0f, 1.0f};
+    result.pdf = 1.0f;
+    result.delta = true;
+    return result;
+}
+
+MaterialSample DielectricMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const {
+    MaterialSample result;
+    const float eta = front_face ? 1.0f / std::max(1.0f, ior) : std::max(1.0f, ior);
+    const float cos_theta = std::min(dot(wo, n), 1.0f);
+    const float sin_theta = std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+    const bool cannot_refract = eta * sin_theta > 1.0f;
+    const float reflectance = fresnel_dielectric(cos_theta, eta);
+    result.direction = (cannot_refract || reflectance > rng.next_float()) ? normalize(reflect(wo, n)) : refract(wo, n, eta);
+    result.weight = base_color(uv);
+    result.pdf = 1.0f;
+    result.delta = true;
+    return result;
+}
+
+MaterialSample ConductorMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng&) const {
+    MaterialSample result;
+    result.direction = normalize(reflect(wo, n));
+    result.weight = base_color(uv);
+    result.pdf = 1.0f;
+    result.delta = true;
+    return result;
+}
+
 std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, BrdfModel model, float roughness, float metallic) {
     if (model == BrdfModel::Principled) {
         return std::make_shared<PrincipledMaterial>(name, albedo, std::clamp(roughness, 0.02f, 1.0f), std::clamp(metallic, 0.0f, 1.0f));
+    }
+    if (model == BrdfModel::Mirror) {
+        return std::make_shared<MirrorMaterial>(name, albedo);
+    }
+    if (model == BrdfModel::Dielectric) {
+        return std::make_shared<DielectricMaterial>(name, albedo, std::clamp(roughness, 1.0f, 3.0f));
+    }
+    if (model == BrdfModel::Conductor) {
+        return std::make_shared<ConductorMaterial>(name, albedo);
     }
     return std::make_shared<LambertianMaterial>(name, albedo);
 }
 
 BrdfModel parse_brdf_model(const std::string& name) {
-    return name == "principled" || name == "cook_torrance" || name == "cook-torrance" || name == "ggx" ? BrdfModel::Principled : BrdfModel::Lambertian;
+    if (name == "principled" || name == "cook_torrance" || name == "cook-torrance" || name == "ggx") return BrdfModel::Principled;
+    if (name == "mirror" || name == "specular") return BrdfModel::Mirror;
+    if (name == "dielectric" || name == "glass") return BrdfModel::Dielectric;
+    if (name == "conductor" || name == "metal") return BrdfModel::Conductor;
+    return BrdfModel::Lambertian;
 }
 
 } // namespace lt

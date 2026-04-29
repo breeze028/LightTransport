@@ -13,12 +13,17 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 add_library(lt_core
     src/cpu_path_tracer.cpp
+    src/gltf_loader.cpp
     src/material.cpp
     src/scene.cpp
     src/texture.cpp
 )
 
 target_include_directories(lt_core PUBLIC include)
+
+if(WIN32)
+    target_link_libraries(lt_core PUBLIC windowscodecs ole32 urlmon)
+endif()
 
 if(MSVC)
     target_compile_options(lt_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
