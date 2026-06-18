@@ -17,6 +17,12 @@ enum class BrdfModel {
     Conductor = 4,
 };
 
+enum class AlphaMode {
+    Opaque = 0,
+    Mask = 1,
+    Blend = 2,
+};
+
 struct MaterialSample {
     Vec3 direction;
     Vec3 weight;
@@ -28,7 +34,15 @@ class Material {
 public:
     std::string name = "mat";
     Vec3 albedo = {0.8f, 0.8f, 0.8f};
+    float alpha = 1.0f;
+    float alpha_cutoff = 0.5f;
+    AlphaMode alpha_mode = AlphaMode::Opaque;
+    bool double_sided = false;
     std::shared_ptr<Texture> albedo_texture;
+    std::shared_ptr<Texture> normal_texture;
+    float normal_scale = 1.0f;
+    Vec3 emission = {};
+    std::shared_ptr<Texture> emission_texture;
 
     Material() = default;
     Material(std::string name_, Vec3 albedo_) : name(std::move(name_)), albedo(albedo_) {}
@@ -37,8 +51,10 @@ public:
     virtual BrdfModel model() const = 0;
     virtual const char* model_name() const = 0;
     Vec3 base_color(Vec2 uv) const;
+    float opacity(Vec2 uv) const;
+    Vec3 emitted(Vec2 uv) const;
     virtual Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const = 0;
-    virtual float pdf(Vec3 n, Vec3 wo, Vec3 wi) const = 0;
+    virtual float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const = 0;
     virtual MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const = 0;
     virtual std::shared_ptr<Material> clone() const = 0;
 };
@@ -50,7 +66,7 @@ public:
     BrdfModel model() const override { return BrdfModel::Lambertian; }
     const char* model_name() const override { return "lambertian"; }
     Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
-    float pdf(Vec3 n, Vec3 wo, Vec3 wi) const override;
+    float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<LambertianMaterial>(*this); }
 };
@@ -59,6 +75,15 @@ class PrincipledMaterial final : public Material {
 public:
     float roughness = 0.5f;
     float metallic = 0.0f;
+    std::shared_ptr<Texture> metallic_roughness_texture;
+    Vec3 sheen_color = {};
+    float sheen_roughness = 0.0f;
+    std::shared_ptr<Texture> sheen_color_texture;
+    std::shared_ptr<Texture> sheen_roughness_texture;
+    float clearcoat = 0.0f;
+    float clearcoat_roughness = 0.0f;
+    std::shared_ptr<Texture> clearcoat_texture;
+    std::shared_ptr<Texture> clearcoat_roughness_texture;
 
     PrincipledMaterial() = default;
     PrincipledMaterial(std::string name_, Vec3 albedo_, float roughness_, float metallic_)
@@ -66,8 +91,14 @@ public:
 
     BrdfModel model() const override { return BrdfModel::Principled; }
     const char* model_name() const override { return "principled"; }
+    float roughness_at(Vec2 uv) const;
+    float metallic_at(Vec2 uv) const;
+    Vec3 sheen_color_at(Vec2 uv) const;
+    float sheen_roughness_at(Vec2 uv) const;
+    float clearcoat_at(Vec2 uv) const;
+    float clearcoat_roughness_at(Vec2 uv) const;
     Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
-    float pdf(Vec3 n, Vec3 wo, Vec3 wi) const override;
+    float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<PrincipledMaterial>(*this); }
 };
@@ -79,7 +110,7 @@ public:
     BrdfModel model() const override { return BrdfModel::Mirror; }
     const char* model_name() const override { return "mirror"; }
     Vec3 evaluate(Vec3, Vec3, Vec3, Vec2) const override { return {}; }
-    float pdf(Vec3, Vec3, Vec3) const override { return 0.0f; }
+    float pdf(Vec3, Vec3, Vec3, Vec2) const override { return 0.0f; }
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<MirrorMaterial>(*this); }
 };
@@ -87,6 +118,7 @@ public:
 class DielectricMaterial final : public Material {
 public:
     float ior = 1.5f;
+    Vec3 transmission_tint = {1.0f, 1.0f, 1.0f};
 
     DielectricMaterial() = default;
     DielectricMaterial(std::string name_, Vec3 albedo_, float ior_)
@@ -95,7 +127,7 @@ public:
     BrdfModel model() const override { return BrdfModel::Dielectric; }
     const char* model_name() const override { return "dielectric"; }
     Vec3 evaluate(Vec3, Vec3, Vec3, Vec2) const override { return {}; }
-    float pdf(Vec3, Vec3, Vec3) const override { return 0.0f; }
+    float pdf(Vec3, Vec3, Vec3, Vec2) const override { return 0.0f; }
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<DielectricMaterial>(*this); }
 };
@@ -107,7 +139,7 @@ public:
     BrdfModel model() const override { return BrdfModel::Conductor; }
     const char* model_name() const override { return "conductor"; }
     Vec3 evaluate(Vec3, Vec3, Vec3, Vec2) const override { return {}; }
-    float pdf(Vec3, Vec3, Vec3) const override { return 0.0f; }
+    float pdf(Vec3, Vec3, Vec3, Vec2) const override { return 0.0f; }
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<ConductorMaterial>(*this); }
 };

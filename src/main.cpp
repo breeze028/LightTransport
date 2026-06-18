@@ -45,10 +45,6 @@ int main(int argc, char** argv) {
             settings.use_mis = true;
         } else if (arg == "--no-mis") {
             settings.use_mis = false;
-        } else if (arg == "--primary-hit-cache") {
-            settings.use_primary_hit_cache = true;
-        } else if (arg == "--no-primary-hit-cache") {
-            settings.use_primary_hit_cache = false;
         } else if (arg == "--mis-heuristic" && i + 1 < argc) {
             const std::string heuristic = argv[++i];
             settings.mis_heuristic = heuristic == "balance" ? lt::MisHeuristic::Balance : lt::MisHeuristic::Power;

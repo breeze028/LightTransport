@@ -28,6 +28,16 @@ float smith_ggx_g1(float ndotv, float roughness) {
     return ndotv / std::max(1.0e-6f, ndotv * (1.0f - k) + k);
 }
 
+float charlie_sheen_distribution(float ndoth, float roughness) {
+    const float alpha = std::clamp(roughness, 0.01f, 1.0f);
+    const float sin_theta = std::sqrt(std::max(0.0f, 1.0f - ndoth * ndoth));
+    return (2.0f + 1.0f / alpha) * std::pow(sin_theta, 1.0f / alpha) / (2.0f * kPi);
+}
+
+float sheen_visibility(float ndotv, float ndotl) {
+    return 1.0f / std::max(1.0e-6f, 4.0f * (ndotl + ndotv - ndotl * ndotv));
+}
+
 Vec3 reflect(Vec3 v, Vec3 n) {
     return n * (2.0f * dot(v, n)) - v;
 }
@@ -63,32 +73,75 @@ Vec3 Material::base_color(Vec2 uv) const {
     return albedo_texture ? albedo * albedo_texture->sample(uv) : albedo;
 }
 
-Vec3 LambertianMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
-    return dot(n, wo) > 0.0f && dot(n, wi) > 0.0f ? base_color(uv) / kPi : Vec3{};
+float Material::opacity(Vec2 uv) const {
+    const float texture_alpha = albedo_texture ? albedo_texture->sample_alpha(uv) : 1.0f;
+    return std::clamp(alpha * texture_alpha, 0.0f, 1.0f);
 }
 
-float LambertianMaterial::pdf(Vec3 n, Vec3, Vec3 wi) const {
-    return std::max(0.0f, dot(n, wi)) / kPi;
+Vec3 Material::emitted(Vec2 uv) const {
+    return emission_texture ? emission * emission_texture->sample(uv) : emission;
+}
+
+float PrincipledMaterial::roughness_at(Vec2 uv) const {
+    const float texture_roughness = metallic_roughness_texture ? metallic_roughness_texture->sample(uv).y : 1.0f;
+    return std::clamp(roughness * texture_roughness, 0.02f, 1.0f);
+}
+
+float PrincipledMaterial::metallic_at(Vec2 uv) const {
+    const float texture_metallic = metallic_roughness_texture ? metallic_roughness_texture->sample(uv).z : 1.0f;
+    return std::clamp(metallic * texture_metallic, 0.0f, 1.0f);
+}
+
+Vec3 PrincipledMaterial::sheen_color_at(Vec2 uv) const {
+    return sheen_color_texture ? sheen_color * sheen_color_texture->sample(uv) : sheen_color;
+}
+
+float PrincipledMaterial::sheen_roughness_at(Vec2 uv) const {
+    const float texture_roughness = sheen_roughness_texture ? sheen_roughness_texture->sample_alpha(uv) : 1.0f;
+    return std::clamp(sheen_roughness * texture_roughness, 0.01f, 1.0f);
+}
+
+float PrincipledMaterial::clearcoat_at(Vec2 uv) const {
+    const float texture_clearcoat = clearcoat_texture ? clearcoat_texture->sample(uv).x : 1.0f;
+    return std::clamp(clearcoat * texture_clearcoat, 0.0f, 1.0f);
+}
+
+float PrincipledMaterial::clearcoat_roughness_at(Vec2 uv) const {
+    const float texture_roughness = clearcoat_roughness_texture ? clearcoat_roughness_texture->sample(uv).y : 1.0f;
+    return std::clamp(clearcoat_roughness * texture_roughness, 0.02f, 1.0f);
+}
+
+Vec3 LambertianMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
+    return ndotv > 0.0f && ndotl > 0.0f ? base_color(uv) / kPi : Vec3{};
+}
+
+float LambertianMaterial::pdf(Vec3 n, Vec3, Vec3 wi, Vec2) const {
+    return (double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi))) / kPi;
 }
 
 MaterialSample LambertianMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& rng) const {
     MaterialSample result;
     result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), n));
-    result.pdf = pdf(n, wo, result.direction);
+    result.pdf = pdf(n, wo, result.direction, uv);
     const float ndotl = std::max(0.0f, dot(n, result.direction));
     result.weight = result.pdf > 0.0f ? evaluate(n, wo, result.direction, uv) * (ndotl / result.pdf) : Vec3{};
     return result;
 }
 
 Vec3 PrincipledMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
-    const float ndotv = std::max(0.0f, dot(n, wo));
-    const float ndotl = std::max(0.0f, dot(n, wi));
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
     if (ndotv <= 0.0f || ndotl <= 0.0f) {
         return {};
     }
 
-    const float r = std::clamp(roughness, 0.02f, 1.0f);
-    const float m = std::clamp(metallic, 0.0f, 1.0f);
+    const float r = roughness_at(uv);
+    const float m = metallic_at(uv);
+    const float sheen_r = sheen_roughness_at(uv);
+    const float coat = clearcoat_at(uv);
+    const float coat_r = clearcoat_roughness_at(uv);
     const Vec3 color = base_color(uv);
     const Vec3 h = normalize(wi + wo);
     const float ndoth = std::max(0.0f, dot(n, h));
@@ -99,17 +152,22 @@ Vec3 PrincipledMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
     const float g = smith_ggx_g1(ndotv, r) * smith_ggx_g1(ndotl, r);
     const Vec3 specular = f * (d * g / std::max(1.0e-6f, 4.0f * ndotv * ndotl));
     const Vec3 diffuse = color * (1.0f - m) / kPi;
-    return diffuse + specular;
+    const Vec3 sheen = sheen_color_at(uv) * (charlie_sheen_distribution(ndoth, sheen_r) * sheen_visibility(ndotv, ndotl));
+    const Vec3 coat_f = fresnel_schlick(vdoth, Vec3{0.04f});
+    const float coat_d = ggx_distribution(ndoth, coat_r);
+    const float coat_g = smith_ggx_g1(ndotv, coat_r) * smith_ggx_g1(ndotl, coat_r);
+    const Vec3 clearcoat_lobe = coat_f * (coat * coat_d * coat_g / std::max(1.0e-6f, 4.0f * ndotv * ndotl));
+    return diffuse + specular + sheen + clearcoat_lobe;
 }
 
-float PrincipledMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi) const {
-    const float ndotl = std::max(0.0f, dot(n, wi));
-    const float ndotv = std::max(0.0f, dot(n, wo));
+float PrincipledMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
     if (ndotl <= 0.0f || ndotv <= 0.0f) {
         return 0.0f;
     }
-    const float r = std::clamp(roughness, 0.02f, 1.0f);
-    const float spec_prob = principled_specular_probability(std::clamp(metallic, 0.0f, 1.0f));
+    const float r = roughness_at(uv);
+    const float spec_prob = std::clamp(principled_specular_probability(metallic_at(uv)) + 0.25f * clearcoat_at(uv), 0.25f, 1.0f);
     const Vec3 h = normalize(wi + wo);
     const float ndoth = std::max(0.0f, dot(n, h));
     const float vdoth = std::max(0.0f, dot(wo, h));
@@ -120,10 +178,11 @@ float PrincipledMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi) const {
 
 MaterialSample PrincipledMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& rng) const {
     MaterialSample result;
-    const float m = std::clamp(metallic, 0.0f, 1.0f);
-    const float spec_prob = principled_specular_probability(m);
+    const float r = roughness_at(uv);
+    const float m = metallic_at(uv);
+    const float spec_prob = std::clamp(principled_specular_probability(m) + 0.25f * clearcoat_at(uv), 0.25f, 1.0f);
     if (rng.next_float() < spec_prob) {
-        const Vec3 h = sample_ggx_half(n, std::clamp(roughness, 0.02f, 1.0f), rng.next_float(), rng.next_float());
+        const Vec3 h = sample_ggx_half(n, r, rng.next_float(), rng.next_float());
         result.direction = normalize(reflect(wo, h));
         if (dot(result.direction, n) <= 0.0f) {
             result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), n));
@@ -131,7 +190,7 @@ MaterialSample PrincipledMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& r
     } else {
         result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), n));
     }
-    result.pdf = pdf(n, wo, result.direction);
+    result.pdf = pdf(n, wo, result.direction, uv);
     const float ndotl = std::max(0.0f, dot(n, result.direction));
     result.weight = result.pdf > 0.0f ? evaluate(n, wo, result.direction, uv) * (ndotl / result.pdf) : Vec3{};
     return result;
@@ -155,7 +214,8 @@ MaterialSample DielectricMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_f
     const bool cannot_refract = eta * sin_theta > 1.0f;
     const float reflectance = fresnel_dielectric(cos_theta, eta);
     result.direction = (cannot_refract || reflectance > rng.next_float()) ? normalize(reflect(wo, n)) : refract(wo, n, eta);
-    result.weight = base_color(uv);
+    result.weight = transmission_tint;
+    (void)uv;
     result.pdf = 1.0f;
     result.delta = true;
     return result;

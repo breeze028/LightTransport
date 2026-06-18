@@ -83,9 +83,9 @@ inline Vec3 normalize(Vec3 v) {
 
 inline Vec3 clamp(Vec3 v, float lo = 0.0f, float hi = 1.0f) {
     return {
-        std::clamp(v.x, lo, hi),
-        std::clamp(v.y, lo, hi),
-        std::clamp(v.z, lo, hi),
+        std::isfinite(v.x) ? std::clamp(v.x, lo, hi) : 0.0f,
+        std::isfinite(v.y) ? std::clamp(v.y, lo, hi) : 0.0f,
+        std::isfinite(v.z) ? std::clamp(v.z, lo, hi) : 0.0f,
     };
 }
 

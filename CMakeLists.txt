@@ -12,9 +12,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 add_library(lt_core
-    src/cpu_path_tracer.cpp
+    src/cpu/path_tracer.cpp
+    src/cpu/cuda_stub.cpp
     src/gltf_loader.cpp
     src/material.cpp
+    src/pbrt/pbrt_loader.cpp
     src/scene.cpp
     src/texture.cpp
 )
@@ -36,9 +38,9 @@ if(LT_ENABLE_CUDA)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
         enable_language(CUDA)
-        target_sources(lt_core PRIVATE src/cuda_path_tracer.cu)
+        target_sources(lt_core PRIVATE src/gpu/cuda_path_tracer.cu)
         target_compile_definitions(lt_core PUBLIC LT_HAS_CUDA=1)
-        set_source_files_properties(src/cuda_path_tracer.cu PROPERTIES LANGUAGE CUDA)
+        set_source_files_properties(src/gpu/cuda_path_tracer.cu PROPERTIES LANGUAGE CUDA)
         set_property(TARGET lt_core PROPERTY CUDA_STANDARD 17)
         set_property(TARGET lt_core PROPERTY CUDA_ARCHITECTURES native)
         set_property(TARGET lt_core PROPERTY CUDA_RUNTIME_LIBRARY Shared)

@@ -171,6 +171,7 @@ LightComponent make_light_from_emission(Vec3 emission) {
     LightComponent light;
     light.intensity = std::max({emission.x, emission.y, emission.z});
     light.enabled = light.intensity > 0.0f;
+    light.double_sided = true;
     light.color = light.enabled ? emission / light.intensity : Vec3{1.0f, 1.0f, 1.0f};
     return light;
 }
@@ -266,7 +267,7 @@ void center_mesh_origin(Mesh& mesh) {
 
 } // namespace
 
-Scene::Scene(const Scene& other) : camera(other.camera), environment(other.environment), meshes(other.meshes) {
+Scene::Scene(const Scene& other) : camera(other.camera), environment(other.environment), uses_builtin_default_meshes(other.uses_builtin_default_meshes), meshes(other.meshes) {
     textures = other.textures;
     materials.reserve(other.materials.size());
     for (const std::shared_ptr<Material>& material : other.materials) {
@@ -280,6 +281,7 @@ Scene& Scene::operator=(const Scene& other) {
     }
     camera = other.camera;
     environment = other.environment;
+    uses_builtin_default_meshes = other.uses_builtin_default_meshes;
     meshes = other.meshes;
     textures = other.textures;
     materials.clear();
@@ -351,6 +353,7 @@ Mesh make_uv_sphere_mesh(const std::string& name, int material, Vec3 translation
 
 Scene make_default_scene() {
     Scene scene;
+    scene.uses_builtin_default_meshes = true;
     scene.camera = {{0.0f, 1.05f, -1.25f}, {0.0f, 0.85f, 0.0f}, {0.0f, 1.0f, 0.0f}, 45.0f};
     scene.materials = {
         make_material("white", {0.78f, 0.78f, 0.72f}, BrdfModel::Lambertian, 0.65f, 0.0f),
@@ -365,7 +368,7 @@ Scene make_default_scene() {
     scene.meshes.push_back(make_quad_mesh("Right Wall", 2, {1.4f, 0.0f, -1.5f}, {1.4f, 2.2f, -1.5f}, {1.4f, 2.2f, 1.5f}, {1.4f, 0.0f, 1.5f}));
     scene.meshes.push_back(make_quad_mesh("Back Wall", 0, {-1.4f, 0.0f, 1.5f}, {1.4f, 0.0f, 1.5f}, {1.4f, 2.2f, 1.5f}, {-1.4f, 2.2f, 1.5f}));
     scene.meshes.push_back(make_quad_mesh("Area_Light", 4, {-0.28f, 2.18f, 0.28f}, {-0.28f, 2.18f, -0.28f}, {0.28f, 2.18f, -0.28f}, {0.28f, 2.18f, 0.28f}));
-    scene.meshes.back().light = {true, {1.0f, 0.888889f, 0.666667f}, 9.0f};
+    scene.meshes.back().light = {true, true, {1.0f, 0.888889f, 0.666667f}, 9.0f};
     scene.meshes.push_back(make_uv_sphere_mesh("Blue Mesh", 3, {-0.55f, 0.42f, 0.0f}, 0.42f));
     scene.meshes.push_back(make_cube_mesh("White Block", 0, {0.48f, 0.32f, -0.55f}, 0.62f));
     return scene;
@@ -398,6 +401,9 @@ SceneLoadResult load_scene(const std::string& path) {
     if (ext == ".glb" || ext == ".gltf") {
         return load_gltf_scene(path);
     }
+    if (ext == ".pbrt") {
+        return load_pbrt_scene(path);
+    }
 
     std::ifstream file(path);
     if (!file) {
@@ -413,6 +419,7 @@ SceneLoadResult load_scene(const std::string& path) {
     std::string environment_texture_name;
     std::string line;
     int line_no = 0;
+    bool saw_camera = false;
 
     while (std::getline(file, line)) {
         ++line_no;
@@ -431,6 +438,7 @@ SceneLoadResult load_scene(const std::string& path) {
             in >> scene.camera.position.x >> scene.camera.position.y >> scene.camera.position.z;
             in >> scene.camera.target.x >> scene.camera.target.y >> scene.camera.target.z;
             in >> scene.camera.fov_degrees;
+            saw_camera = true;
         } else if (tag == "texture") {
             std::string texture_name;
             std::string texture_path;
@@ -503,6 +511,10 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!in || light.intensity < 0.0f) {
                 return {scene, "Invalid light at line " + std::to_string(line_no)};
             }
+            int double_sided = light.double_sided ? 1 : 0;
+            if (in >> double_sided) {
+                light.double_sided = double_sided != 0;
+            }
             light.enabled = light.intensity > 0.0f;
             pending_lights.push_back({mesh_name, light});
         } else if (tag == "mesh") {
@@ -526,7 +538,9 @@ SceneLoadResult load_scene(const std::string& path) {
             }
             for (int i = 0; i < vertex_count; ++i) {
                 Vec3 v;
-                file >> v.x >> v.y >> v.z;
+                if (!(file >> v.x >> v.y >> v.z)) {
+                    return {scene, "Invalid mesh vertex data after line " + std::to_string(line_no)};
+                }
                 mesh.vertices.push_back(v);
                 mesh.texcoords.push_back(default_uv(v));
             }
@@ -534,7 +548,12 @@ SceneLoadResult load_scene(const std::string& path) {
                 uint32_t a = 0;
                 uint32_t b = 0;
                 uint32_t c = 0;
-                file >> a >> b >> c;
+                if (!(file >> a >> b >> c)) {
+                    return {scene, "Invalid mesh index data after line " + std::to_string(line_no)};
+                }
+                if (a >= mesh.vertices.size() || b >= mesh.vertices.size() || c >= mesh.vertices.size()) {
+                    return {scene, "Mesh index out of range after line " + std::to_string(line_no)};
+                }
                 mesh.indices.push_back(a);
                 mesh.indices.push_back(b);
                 mesh.indices.push_back(c);
@@ -546,13 +565,22 @@ SceneLoadResult load_scene(const std::string& path) {
                 mesh.light = make_light_from_emission(legacy_material_emissions[static_cast<size_t>(mesh.material)]);
             }
             scene.meshes.push_back(mesh);
+            scene.uses_builtin_default_meshes = false;
         } else {
             return {scene, "Unknown scene token '" + tag + "' at line " + std::to_string(line_no)};
         }
     }
 
-    if (scene.materials.empty() || scene.meshes.empty()) {
-        scene = make_default_scene();
+    if (scene.meshes.empty()) {
+        Scene defaults = make_default_scene();
+        if (!saw_camera) {
+            scene.camera = defaults.camera;
+        }
+        if (scene.materials.empty()) {
+            scene.materials = std::move(defaults.materials);
+        }
+        scene.meshes = std::move(defaults.meshes);
+        scene.uses_builtin_default_meshes = true;
     }
     for (const auto& pending : pending_lights) {
         for (Mesh& mesh : scene.meshes) {
@@ -578,6 +606,11 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
     if (!out) {
         error = "Could not write scene: " + path;
         return false;
+    }
+
+    if (scene.uses_builtin_default_meshes) {
+        out << "# Mesh-based Cornell-ish test scene.\n";
+        out << "# If no mesh blocks are listed, the built-in mesh Cornell scene is used.\n";
     }
 
     out << "camera "
@@ -627,13 +660,15 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
     }
     out << '\n';
 
+    if (scene.uses_builtin_default_meshes) return true;
+
     for (const Mesh& mesh : scene.meshes) {
         if (!mesh.light.enabled || mesh.light.intensity <= 0.0f) {
             continue;
         }
         out << "light " << mesh.name << ' '
             << mesh.light.color.x << ' ' << mesh.light.color.y << ' ' << mesh.light.color.z << ' '
-            << mesh.light.intensity << '\n';
+            << mesh.light.intensity << ' ' << (mesh.light.double_sided ? 1 : 0) << '\n';
     }
     out << '\n';
 
@@ -662,6 +697,9 @@ RenderScene build_render_scene(const Scene& scene) {
             const size_t i0 = static_cast<size_t>(mesh.indices[i]);
             const size_t i1 = static_cast<size_t>(mesh.indices[i + 1]);
             const size_t i2 = static_cast<size_t>(mesh.indices[i + 2]);
+            if (i0 >= mesh.vertices.size() || i1 >= mesh.vertices.size() || i2 >= mesh.vertices.size()) {
+                continue;
+            }
             const Vec3 v0 = mesh.translation + rotate_xyz(mesh.vertices[i0] * mesh.scale, mesh.rotation);
             const Vec3 v1 = mesh.translation + rotate_xyz(mesh.vertices[i1] * mesh.scale, mesh.rotation);
             const Vec3 v2 = mesh.translation + rotate_xyz(mesh.vertices[i2] * mesh.scale, mesh.rotation);
@@ -684,9 +722,30 @@ RenderScene build_render_scene(const Scene& scene) {
             const Vec2 uv0 = i0 < mesh.texcoords.size() ? mesh.texcoords[i0] : default_uv(mesh.vertices[i0]);
             const Vec2 uv1 = i1 < mesh.texcoords.size() ? mesh.texcoords[i1] : default_uv(mesh.vertices[i1]);
             const Vec2 uv2 = i2 < mesh.texcoords.size() ? mesh.texcoords[i2] : default_uv(mesh.vertices[i2]);
-            render_scene.triangles.push_back({v0, v1, v2, n, n0, n1, n2, (v0 + v1 + v2) / 3.0f, uv0, uv1, uv2, mesh.material, mesh_index});
+            Vec3 tangent;
+            Vec3 bitangent;
+            const Vec3 edge1 = v1 - v0;
+            const Vec3 edge2 = v2 - v0;
+            const Vec2 duv1 = uv1 - uv0;
+            const Vec2 duv2 = uv2 - uv0;
+            const float det = duv1.x * duv2.y - duv1.y * duv2.x;
+            if (std::fabs(det) > 1.0e-8f) {
+                const float inv_det = 1.0f / det;
+                tangent = normalize((edge1 * duv2.y - edge2 * duv1.y) * inv_det);
+                bitangent = normalize((edge2 * duv1.x - edge1 * duv2.x) * inv_det);
+            }
+            if (dot(tangent, tangent) <= 0.0f || dot(bitangent, bitangent) <= 0.0f) {
+                const Vec3 up = std::fabs(n.z) < 0.999f ? Vec3{0.0f, 0.0f, 1.0f} : Vec3{1.0f, 0.0f, 0.0f};
+                tangent = normalize(cross(up, n));
+                bitangent = cross(n, tangent);
+            }
+            render_scene.triangles.push_back({v0, v1, v2, n, n0, n1, n2, tangent, bitangent, (v0 + v1 + v2) / 3.0f, uv0, uv1, uv2, mesh.material, mesh_index});
             render_scene.triangle_indices.push_back(triangle_index);
-            if (mesh.light.enabled && mesh.light.intensity > 0.0f) {
+            Vec3 material_emission;
+            if (mesh.material >= 0 && mesh.material < static_cast<int>(scene.materials.size()) && scene.materials[static_cast<size_t>(mesh.material)]) {
+                material_emission = scene.materials[static_cast<size_t>(mesh.material)]->emission;
+            }
+            if ((mesh.light.enabled && mesh.light.intensity > 0.0f) || has_light_emission(material_emission)) {
                 render_scene.light_triangle_indices.push_back(triangle_index);
             }
         }

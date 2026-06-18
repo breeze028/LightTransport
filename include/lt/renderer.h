@@ -51,7 +51,6 @@ struct RenderSettings {
     bool use_mis = false;
     MisHeuristic mis_heuristic = MisHeuristic::Power;
     AccelerationStructure acceleration_structure = AccelerationStructure::Auto;
-    bool use_primary_hit_cache = true;
     uint32_t frame_index = 0;
     RenderDirty dirty = RenderDirty::All;
 };
@@ -110,7 +109,6 @@ public:
 private:
     void* device_accumulation_ = nullptr;
     void* device_rgba_ = nullptr;
-    void* device_primary_hits_ = nullptr;
     void* device_scene_ = nullptr;
     void* device_materials_ = nullptr;
     void* device_textures_ = nullptr;
@@ -124,7 +122,6 @@ private:
     std::vector<void*> texture_arrays_;
     std::vector<uint64_t> texture_objects_;
     size_t cached_pixels_ = 0;
-    size_t cached_primary_pixels_ = 0;
     int cached_materials_ = 0;
     int cached_textures_ = 0;
     int cached_triangles_ = 0;
@@ -135,7 +132,6 @@ private:
     int cached_mesh_instance_indices_ = 0;
     int cached_tlas_nodes_ = 0;
     bool scene_uploaded_ = false;
-    bool primary_cache_valid_ = false;
 };
 
 } // namespace lt

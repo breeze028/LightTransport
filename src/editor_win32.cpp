@@ -13,9 +13,11 @@
 #include <chrono>
 #include <cctype>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
@@ -65,6 +67,10 @@ struct Editor {
     float drag_start_depth = 1.0f;
     float drag_start_angle = 0.0f;
     double last_sample_ms = 0.0;
+    float toolbar_width = 74.0f;
+    float properties_width = 340.0f;
+    float outliner_fraction = 0.38f;
+    bool viewport_fullscreen = false;
 };
 
 struct RenderResult {
@@ -72,6 +78,24 @@ struct RenderResult {
     uint32_t completed_frame = 0;
     double elapsed_ms = 0.0;
     lt::Framebuffer framebuffer;
+};
+
+struct SceneLoadTask {
+    uint64_t generation = 0;
+    std::string path;
+    std::chrono::steady_clock::time_point started;
+    std::future<lt::SceneLoadResult> future;
+};
+
+struct MeshBoundsCache {
+    uint64_t scene_generation = 0;
+    std::vector<lt::Vec3> local_min;
+    std::vector<lt::Vec3> local_max;
+};
+
+struct PickSceneCache {
+    uint64_t scene_generation = 0;
+    lt::RenderScene render_scene;
 };
 
 struct ViewTransform {
@@ -90,6 +114,13 @@ ID3D11DeviceContext* g_context = nullptr;
 IDXGISwapChain* g_swap_chain = nullptr;
 ID3D11RenderTargetView* g_main_rtv = nullptr;
 std::future<RenderResult> g_render_future;
+SceneLoadTask g_load_task;
+MeshBoundsCache g_bounds_cache;
+PickSceneCache g_pick_cache;
+UINT g_swap_chain_width = 0;
+UINT g_swap_chain_height = 0;
+bool g_window_minimized = false;
+bool g_shutting_down = false;
 
 void upload_preview_texture();
 
@@ -140,6 +171,11 @@ void create_render_target() {
     g_swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
     g_device->CreateRenderTargetView(back_buffer, nullptr, &g_main_rtv);
     back_buffer->Release();
+    RECT client{};
+    if (g_hwnd && GetClientRect(g_hwnd, &client)) {
+        g_swap_chain_width = static_cast<UINT>(std::max<LONG>(0, client.right - client.left));
+        g_swap_chain_height = static_cast<UINT>(std::max<LONG>(0, client.bottom - client.top));
+    }
 }
 
 void cleanup_render_target() {
@@ -170,9 +206,40 @@ bool create_device(HWND hwnd) {
 void cleanup_device() {
     release_preview_texture();
     cleanup_render_target();
-    if (g_swap_chain) g_swap_chain->Release();
-    if (g_context) g_context->Release();
-    if (g_device) g_device->Release();
+    if (g_swap_chain) {
+        g_swap_chain->Release();
+        g_swap_chain = nullptr;
+    }
+    if (g_context) {
+        g_context->ClearState();
+        g_context->Flush();
+        g_context->Release();
+        g_context = nullptr;
+    }
+    if (g_device) {
+        g_device->Release();
+        g_device = nullptr;
+    }
+}
+
+void release_editor_memory() {
+    if (g_render_future.valid()) {
+        g_render_future.wait();
+        (void)g_render_future.get();
+    }
+    if (g_load_task.future.valid()) {
+        g_load_task.future.wait();
+        (void)g_load_task.future.get();
+    }
+    g_editor.cuda.reset();
+    g_editor.cpu.reset();
+    g_editor.renderer = &g_editor.cpu;
+    g_editor.scene = {};
+    g_editor.framebuffer = {};
+    g_editor.drag_start_mesh = {};
+    g_bounds_cache = {};
+    g_pick_cache = {};
+    g_load_task = {};
 }
 
 void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
@@ -199,19 +266,73 @@ bool has_selection() {
     return g_editor.selected_mesh >= 0 && g_editor.selected_mesh < static_cast<int>(g_editor.scene.meshes.size());
 }
 
+void invalidate_mesh_bounds_cache() {
+    g_bounds_cache.scene_generation = 0;
+    g_bounds_cache.local_min.clear();
+    g_bounds_cache.local_max.clear();
+    g_pick_cache.scene_generation = 0;
+    g_pick_cache.render_scene = {};
+}
+
 void set_scene(lt::Scene scene, const std::string& path) {
     g_editor.scene = std::move(scene);
     g_editor.scene_path = path;
+    invalidate_mesh_bounds_cache();
     select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
     reset_accumulation(lt::RenderDirty::All);
 }
 
+bool scene_load_in_progress() {
+    return g_load_task.future.valid();
+}
+
 void load_scene_file(const std::string& path) {
-    lt::SceneLoadResult loaded = lt::load_scene(path);
-    if (!loaded.error.empty()) {
-        MessageBoxW(g_hwnd, widen(loaded.error).c_str(), L"Scene load warning", MB_OK | MB_ICONWARNING);
+    if (scene_load_in_progress()) {
+        MessageBoxW(g_hwnd, L"A scene is already loading. Please wait for it to finish.", L"Scene load in progress", MB_OK | MB_ICONINFORMATION);
+        return;
     }
-    set_scene(loaded.scene, path);
+    g_load_task.generation += 1;
+    g_load_task.path = path;
+    g_load_task.started = std::chrono::steady_clock::now();
+    g_load_task.future = std::async(std::launch::async, [path]() {
+        return lt::load_scene(path);
+    });
+}
+
+std::string resolve_startup_scene_path(const std::string& path) {
+    std::filesystem::path scene(path);
+    if (scene.is_absolute() || std::filesystem::exists(scene)) {
+        return scene.string();
+    }
+    char exe_path[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
+        const std::filesystem::path exe_dir = std::filesystem::path(exe_path).parent_path();
+        const std::filesystem::path from_exe = exe_dir / scene;
+        if (std::filesystem::exists(from_exe)) {
+            return from_exe.string();
+        }
+        const std::filesystem::path from_build_config = exe_dir.parent_path().parent_path() / scene;
+        if (std::filesystem::exists(from_build_config)) {
+            return from_build_config.string();
+        }
+    }
+    return path;
+}
+
+void poll_scene_load_result() {
+    if (!g_load_task.future.valid() || g_load_task.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    lt::SceneLoadResult loaded = g_load_task.future.get();
+    const std::string path = g_load_task.path;
+    g_load_task = {};
+    if (!loaded.error.empty()) {
+        if (loaded.scene.meshes.empty()) {
+            MessageBoxW(g_hwnd, widen(loaded.error).c_str(), L"Scene load warning", MB_OK | MB_ICONWARNING);
+        }
+        if (loaded.scene.meshes.empty()) {
+            return;
+        }
+    }
+    set_scene(std::move(loaded.scene), path);
 }
 
 void open_scene_dialog() {
@@ -221,7 +342,7 @@ void open_scene_dialog() {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"Scene files (*.lt;*.glb;*.gltf)\0*.lt;*.glb;*.gltf\0LightTransport scenes (*.lt)\0*.lt\0glTF scenes (*.glb;*.gltf)\0*.glb;*.gltf\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Scene files (*.lt;*.glb;*.gltf;*.pbrt)\0*.lt;*.glb;*.gltf;*.pbrt\0LightTransport scenes (*.lt)\0*.lt\0glTF scenes (*.glb;*.gltf)\0*.glb;*.gltf\0PBRT scenes (*.pbrt)\0*.pbrt\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) load_scene_file(narrow(filename));
 }
@@ -251,7 +372,7 @@ void load_texture_dialog(lt::Material& material) {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"Image textures (*.ppm;*.png;*.jpg;*.jpeg;*.hdr)\0*.ppm;*.png;*.jpg;*.jpeg;*.hdr\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Image textures (*.ppm;*.png;*.jpg;*.jpeg;*.hdr;*.exr)\0*.ppm;*.png;*.jpg;*.jpeg;*.hdr;*.exr\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return;
 
@@ -276,7 +397,7 @@ void load_environment_texture_dialog() {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"HDRI environment (*.hdr)\0*.hdr\0Image textures (*.hdr;*.ppm;*.png;*.jpg;*.jpeg)\0*.hdr;*.ppm;*.png;*.jpg;*.jpeg\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"HDRI environment (*.hdr;*.exr)\0*.hdr;*.exr\0Image textures (*.hdr;*.exr;*.ppm;*.png;*.jpg;*.jpeg)\0*.hdr;*.exr;*.ppm;*.png;*.jpg;*.jpeg\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return;
 
@@ -292,12 +413,20 @@ void load_environment_texture_dialog() {
     g_editor.scene.textures.push_back(shared);
     g_editor.scene.environment.texture = shared;
     g_editor.scene.environment.constant = false;
+    g_editor.scene.environment.mapping = lt::Environment::Mapping::Equirectangular;
+    g_editor.scene.environment.light_from_world_x = {1.0f, 0.0f, 0.0f};
+    g_editor.scene.environment.light_from_world_y = {0.0f, 1.0f, 0.0f};
+    g_editor.scene.environment.light_from_world_z = {0.0f, 0.0f, 1.0f};
     reset_accumulation(lt::RenderDirty::Texture | lt::RenderDirty::Environment);
 }
 
 void save_scene() {
     if (lowercase_extension(g_editor.scene_path) != ".lt") {
         MessageBoxW(g_hwnd, L"Imported glTF/GLB scenes can be edited, but saving back to that format is not supported yet. Save is limited to .lt scene files.", L"Save skipped", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring message = L"Save changes to this scene?\n\n" + widen(g_editor.scene_path);
+    if (MessageBoxW(g_hwnd, message.c_str(), L"Confirm Save", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
     std::string error;
@@ -311,6 +440,8 @@ void add_mesh() {
     if (material < 0) material = 0;
     const lt::Vec3 forward = lt::normalize(g_editor.scene.camera.target - g_editor.scene.camera.position);
     g_editor.scene.meshes.push_back(lt::make_cube_mesh("Mesh", material, g_editor.scene.camera.position + forward * 1.5f, 0.35f));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    invalidate_mesh_bounds_cache();
     select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
     reset_accumulation(lt::RenderDirty::Geometry);
 }
@@ -321,6 +452,8 @@ void duplicate_selected() {
     copy.name += "_copy";
     copy.translation.x += std::max({copy.scale.x, copy.scale.y, copy.scale.z}) * 1.2f;
     g_editor.scene.meshes.push_back(copy);
+    g_editor.scene.uses_builtin_default_meshes = false;
+    invalidate_mesh_bounds_cache();
     select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
     reset_accumulation(lt::RenderDirty::Geometry);
 }
@@ -328,6 +461,8 @@ void duplicate_selected() {
 void delete_selected() {
     if (!has_selection()) return;
     g_editor.scene.meshes.erase(g_editor.scene.meshes.begin() + g_editor.selected_mesh);
+    g_editor.scene.uses_builtin_default_meshes = false;
+    invalidate_mesh_bounds_cache();
     select_mesh(g_editor.scene.meshes.empty() ? -1 : std::min(g_editor.selected_mesh, static_cast<int>(g_editor.scene.meshes.size()) - 1));
     reset_accumulation(lt::RenderDirty::Geometry);
 }
@@ -376,7 +511,7 @@ void poll_render_result() {
 }
 
 void launch_render_task() {
-    if (g_editor.paused || g_render_future.valid()) return;
+    if (g_editor.paused || scene_load_in_progress() || g_render_future.valid()) return;
     lt::Scene scene = g_editor.scene;
     lt::RenderSettings settings = g_editor.settings;
     lt::Framebuffer framebuffer = g_editor.framebuffer;
@@ -408,18 +543,19 @@ void render_preview_if_needed() {
     launch_render_task();
 }
 
-ViewTransform make_view_transform() {
+ViewTransform make_view_transform(bool apply_camera_handedness = true) {
     const float aspect = g_editor.viewport_size.x / std::max(1.0f, g_editor.viewport_size.y);
     const float half_height = std::tan(g_editor.scene.camera.fov_degrees * lt::kPi / 360.0f);
     const float half_width = aspect * half_height;
     const lt::Vec3 forward = lt::normalize(g_editor.scene.camera.target - g_editor.scene.camera.position);
-    const lt::Vec3 right = lt::normalize(lt::cross(forward, g_editor.scene.camera.up));
-    const lt::Vec3 up = lt::cross(right, forward);
+    const float right_sign = apply_camera_handedness && g_editor.scene.camera.right_sign < 0.0f ? -1.0f : 1.0f;
+    const lt::Vec3 right = lt::normalize(lt::cross(forward, g_editor.scene.camera.up)) * right_sign;
+    const lt::Vec3 up = lt::cross(right, forward) * right_sign;
     return {forward, right, up, half_width, half_height};
 }
 
 lt::Ray make_view_ray_from_screen(ImVec2 mouse) {
-    const ViewTransform view = make_view_transform();
+    const ViewTransform view = make_view_transform(true);
     const ImVec2 min = g_editor.viewport_image_min;
     const ImVec2 size = {std::max(1.0f, g_editor.viewport_image_max.x - min.x), std::max(1.0f, g_editor.viewport_image_max.y - min.y)};
     const float u = ((mouse.x - min.x) / size.x * 2.0f - 1.0f) * view.half_width;
@@ -428,7 +564,7 @@ lt::Ray make_view_ray_from_screen(ImVec2 mouse) {
 }
 
 bool project_point(lt::Vec3 point, ImVec2& screen, float* depth = nullptr) {
-    const ViewTransform view = make_view_transform();
+    const ViewTransform view = make_view_transform(true);
     const lt::Vec3 to_point = point - g_editor.scene.camera.position;
     const float z = lt::dot(to_point, view.forward);
     if (z <= 0.001f) return false;
@@ -459,10 +595,13 @@ bool intersect_triangle(const lt::Triangle& tri, const lt::Ray& ray, float& t) {
 
 bool pick_mesh(ImVec2 mouse, int& mesh_index) {
     const lt::Ray ray = make_view_ray_from_screen(mouse);
-    const lt::RenderScene render_scene = lt::build_render_scene(g_editor.scene);
+    if (g_pick_cache.scene_generation != g_editor.render_generation) {
+        g_pick_cache.render_scene = lt::build_render_scene(g_editor.scene);
+        g_pick_cache.scene_generation = g_editor.render_generation;
+    }
     float best_t = lt::kInfinity;
     mesh_index = -1;
-    for (const lt::Triangle& tri : render_scene.triangles) {
+    for (const lt::Triangle& tri : g_pick_cache.render_scene.triangles) {
         float t = 0.0f;
         if (intersect_triangle(tri, ray, t) && t < best_t) {
             best_t = t;
@@ -499,9 +638,35 @@ lt::Vec3 transform_mesh_point(const lt::Mesh& mesh, lt::Vec3 p) {
     return mesh.translation + rotate_xyz_editor(p * mesh.scale, mesh.rotation);
 }
 
+void ensure_mesh_bounds_cache() {
+    if (g_bounds_cache.scene_generation == g_editor.render_generation &&
+        g_bounds_cache.local_min.size() == g_editor.scene.meshes.size() &&
+        g_bounds_cache.local_max.size() == g_editor.scene.meshes.size()) {
+        return;
+    }
+    g_bounds_cache.local_min.resize(g_editor.scene.meshes.size());
+    g_bounds_cache.local_max.resize(g_editor.scene.meshes.size());
+    for (size_t i = 0; i < g_editor.scene.meshes.size(); ++i) {
+        const lt::Mesh& mesh = g_editor.scene.meshes[i];
+        lt::Vec3 local_min{lt::kInfinity, lt::kInfinity, lt::kInfinity};
+        lt::Vec3 local_max{-lt::kInfinity, -lt::kInfinity, -lt::kInfinity};
+        for (lt::Vec3 v : mesh.vertices) {
+            local_min = lt::min(local_min, v);
+            local_max = lt::max(local_max, v);
+        }
+        if (mesh.vertices.empty()) {
+            local_min = {-0.5f, -0.5f, -0.5f};
+            local_max = {0.5f, 0.5f, 0.5f};
+        }
+        g_bounds_cache.local_min[i] = local_min;
+        g_bounds_cache.local_max[i] = local_max;
+    }
+    g_bounds_cache.scene_generation = g_editor.render_generation;
+}
+
 void move_camera(float right_delta, float up_delta, float forward_delta) {
     lt::Camera& camera = g_editor.scene.camera;
-    const ViewTransform view = make_view_transform();
+    const ViewTransform view = make_view_transform(true);
     const lt::Vec3 delta = view.right * right_delta + view.up * up_delta + view.forward * forward_delta;
     camera.position += delta;
     camera.target += delta;
@@ -510,11 +675,12 @@ void move_camera(float right_delta, float up_delta, float forward_delta) {
 
 void rotate_camera(float yaw, float pitch) {
     lt::Camera& camera = g_editor.scene.camera;
+    const float rotate_sign = camera.right_sign < 0.0f ? -1.0f : 1.0f;
     lt::Vec3 dir = lt::normalize(camera.target - camera.position);
     const float radius = lt::length(camera.target - camera.position);
     float current_yaw = std::atan2(dir.x, dir.z);
     float current_pitch = std::asin(std::clamp(dir.y, -0.99f, 0.99f));
-    current_yaw += yaw;
+    current_yaw += yaw * rotate_sign;
     current_pitch = std::clamp(current_pitch + pitch, -1.45f, 1.45f);
     camera.target = camera.position + lt::Vec3{std::sin(current_yaw) * std::cos(current_pitch), std::sin(current_pitch), std::cos(current_yaw) * std::cos(current_pitch)} * radius;
     reset_accumulation(lt::RenderDirty::Camera);
@@ -738,7 +904,7 @@ void handle_gizmo_drag() {
         return;
     }
     const ImVec2 delta{mouse.x - g_editor.drag_start_mouse.x, mouse.y - g_editor.drag_start_mouse.y};
-    const ViewTransform view = make_view_transform();
+    const ViewTransform view = make_view_transform(true);
     const float world_per_pixel = g_editor.drag_start_depth * view.half_height * 2.0f / std::max(1.0f, g_editor.viewport_size.y);
     if (g_editor.tool_mode == ToolMode::Move) {
         if (g_editor.active_gizmo == GizmoHandle::AxisX || g_editor.active_gizmo == GizmoHandle::AxisY || g_editor.active_gizmo == GizmoHandle::AxisZ) {
@@ -930,14 +1096,12 @@ void draw_mesh_outline(ImDrawList* draw_list) {
     }
 }
 
-void draw_mesh_bounds_outline(ImDrawList* draw_list, const lt::Mesh& mesh, ImU32 color, float thickness) {
-    if (mesh.vertices.empty()) return;
-    lt::Vec3 local_min{lt::kInfinity, lt::kInfinity, lt::kInfinity};
-    lt::Vec3 local_max{-lt::kInfinity, -lt::kInfinity, -lt::kInfinity};
-    for (lt::Vec3 v : mesh.vertices) {
-        local_min = lt::min(local_min, v);
-        local_max = lt::max(local_max, v);
-    }
+void draw_mesh_bounds_outline(ImDrawList* draw_list, int mesh_index, ImU32 color, float thickness) {
+    if (mesh_index < 0 || mesh_index >= static_cast<int>(g_editor.scene.meshes.size())) return;
+    ensure_mesh_bounds_cache();
+    const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(mesh_index)];
+    const lt::Vec3 local_min = g_bounds_cache.local_min[static_cast<size_t>(mesh_index)];
+    const lt::Vec3 local_max = g_bounds_cache.local_max[static_cast<size_t>(mesh_index)];
     const lt::Vec3 corners[8] = {
         {local_min.x, local_min.y, local_min.z},
         {local_max.x, local_min.y, local_min.z},
@@ -970,7 +1134,7 @@ void draw_scene_reference_outlines(ImDrawList* draw_list) {
     const ImU32 selected_color = IM_COL32(255, 150, 35, 230);
     for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
         const bool selected = i == g_editor.selected_mesh;
-        draw_mesh_bounds_outline(draw_list, g_editor.scene.meshes[static_cast<size_t>(i)], selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
+        draw_mesh_bounds_outline(draw_list, i, selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
     }
 }
 
@@ -984,7 +1148,7 @@ void draw_gizmo_overlay() {
     const float radius = std::max(18.0f, radius3 * 90.0f);
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (g_editor.tool_mode == ToolMode::Select) {
-        draw_mesh_bounds_outline(draw_list, g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)], IM_COL32(255, 150, 35, 255), 2.0f);
+        draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, IM_COL32(255, 150, 35, 255), 2.0f);
     }
     if (g_editor.tool_mode == ToolMode::Move || g_editor.tool_mode == ToolMode::Scale) {
         ImVec2 px{}, py{}, pz{}, pxy{}, pyz{}, pzx{};
@@ -1176,8 +1340,9 @@ bool toolbar_button(ToolMode mode) {
     return clicked;
 }
 
-void draw_top_bar() {
-    if (!ImGui::BeginMainMenuBar()) return;
+float draw_top_bar() {
+    const float height = ImGui::GetFrameHeight();
+    if (!ImGui::BeginMainMenuBar()) return height;
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open", "O")) open_scene_dialog();
         if (ImGui::MenuItem("Save", "Ctrl+S")) save_scene();
@@ -1203,6 +1368,7 @@ void draw_top_bar() {
                 g_editor.last_sample_ms,
                 g_editor.scene_path.c_str());
     ImGui::EndMainMenuBar();
+    return height;
 }
 
 void draw_toolbar() {
@@ -1256,11 +1422,23 @@ void draw_properties() {
                     *out = scene->materials[static_cast<size_t>(idx)]->name.c_str();
                     return true;
                 }, &g_editor.scene, static_cast<int>(g_editor.scene.materials.size()))) reset_accumulation(lt::RenderDirty::Geometry);
-                if (ImGui::Checkbox("Light", &mesh.light.enabled)) reset_accumulation(lt::RenderDirty::Geometry);
+                if (ImGui::Checkbox("Light", &mesh.light.enabled)) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
                 if (mesh.light.enabled) {
+                    if (ImGui::Checkbox("Double-sided Light", &mesh.light.double_sided)) {
+                        g_editor.scene.uses_builtin_default_meshes = false;
+                        reset_accumulation(lt::RenderDirty::Geometry);
+                    }
+                    const lt::Vec3 old_color = mesh.light.color;
                     color_edit("Light Color", mesh.light.color, lt::RenderDirty::Geometry);
+                    if (old_color.x != mesh.light.color.x || old_color.y != mesh.light.color.y || old_color.z != mesh.light.color.z) {
+                        g_editor.scene.uses_builtin_default_meshes = false;
+                    }
                     if (ImGui::DragFloat("Intensity", &mesh.light.intensity, 0.1f, 0.0f, 1000.0f, "%.2f")) {
                         mesh.light.intensity = std::max(0.0f, mesh.light.intensity);
+                        g_editor.scene.uses_builtin_default_meshes = false;
                         reset_accumulation(lt::RenderDirty::Geometry);
                     }
                 }
@@ -1307,6 +1485,9 @@ void draw_properties() {
                     if (ImGui::Button("Load Texture")) {
                         load_texture_dialog(*material);
                     }
+                    if (ImGui::Checkbox("Double-sided Material", &material->double_sided)) {
+                        reset_accumulation(lt::RenderDirty::Material);
+                    }
                     const char* models[] = {"Lambertian", "Principled", "Mirror", "Dielectric", "Conductor"};
                     int model = static_cast<int>(material->model());
                     if (ImGui::Combo("BRDF", &model, models, IM_ARRAYSIZE(models))) {
@@ -1320,7 +1501,59 @@ void draw_properties() {
                         } else if (const auto* dielectric = dynamic_cast<const lt::DielectricMaterial*>(material.get())) {
                             roughness = dielectric->ior;
                         }
-                        material = lt::make_material(name, albedo, static_cast<lt::BrdfModel>(model), roughness, metallic);
+                        const auto next_model = static_cast<lt::BrdfModel>(model);
+                        if (next_model == lt::BrdfModel::Dielectric && material->model() != lt::BrdfModel::Dielectric) {
+                            roughness = 1.5f;
+                        } else if (next_model != lt::BrdfModel::Dielectric && material->model() == lt::BrdfModel::Dielectric) {
+                            roughness = 0.5f;
+                        }
+                        std::shared_ptr<lt::Texture> base_texture = material->albedo_texture;
+                        std::shared_ptr<lt::Texture> normal_texture = material->normal_texture;
+                        std::shared_ptr<lt::Texture> emission_texture = material->emission_texture;
+                        const float alpha = material->alpha;
+                        const float alpha_cutoff = material->alpha_cutoff;
+                        const lt::AlphaMode alpha_mode = material->alpha_mode;
+                        const bool double_sided = material->double_sided;
+                        const float normal_scale = material->normal_scale;
+                        const lt::Vec3 emission = material->emission;
+                        lt::Vec3 sheen_color;
+                        float sheen_roughness = 0.0f;
+                        std::shared_ptr<lt::Texture> sheen_color_texture;
+                        std::shared_ptr<lt::Texture> sheen_roughness_texture;
+                        float clearcoat = 0.0f;
+                        float clearcoat_roughness = 0.0f;
+                        std::shared_ptr<lt::Texture> clearcoat_texture;
+                        std::shared_ptr<lt::Texture> clearcoat_roughness_texture;
+                        if (const auto* principled = dynamic_cast<const lt::PrincipledMaterial*>(material.get())) {
+                            sheen_color = principled->sheen_color;
+                            sheen_roughness = principled->sheen_roughness;
+                            sheen_color_texture = principled->sheen_color_texture;
+                            sheen_roughness_texture = principled->sheen_roughness_texture;
+                            clearcoat = principled->clearcoat;
+                            clearcoat_roughness = principled->clearcoat_roughness;
+                            clearcoat_texture = principled->clearcoat_texture;
+                            clearcoat_roughness_texture = principled->clearcoat_roughness_texture;
+                        }
+                        material = lt::make_material(name, albedo, next_model, roughness, metallic);
+                        material->albedo_texture = std::move(base_texture);
+                        material->normal_texture = std::move(normal_texture);
+                        material->emission_texture = std::move(emission_texture);
+                        material->alpha = alpha;
+                        material->alpha_cutoff = alpha_cutoff;
+                        material->alpha_mode = alpha_mode;
+                        material->double_sided = double_sided;
+                        material->normal_scale = normal_scale;
+                        material->emission = emission;
+                        if (auto* principled = dynamic_cast<lt::PrincipledMaterial*>(material.get())) {
+                            principled->sheen_color = sheen_color;
+                            principled->sheen_roughness = sheen_roughness;
+                            principled->sheen_color_texture = std::move(sheen_color_texture);
+                            principled->sheen_roughness_texture = std::move(sheen_roughness_texture);
+                            principled->clearcoat = clearcoat;
+                            principled->clearcoat_roughness = clearcoat_roughness;
+                            principled->clearcoat_texture = std::move(clearcoat_texture);
+                            principled->clearcoat_roughness_texture = std::move(clearcoat_roughness_texture);
+                        }
                         reset_accumulation(lt::RenderDirty::Material);
                     }
                     if (material->model() == lt::BrdfModel::Mirror) {
@@ -1337,6 +1570,63 @@ void draw_properties() {
                         if (ImGui::DragFloat("Metallic", &principled->metallic, 0.01f, 0.0f, 1.0f, "%.2f")) {
                             principled->metallic = std::clamp(principled->metallic, 0.0f, 1.0f);
                             reset_accumulation(lt::RenderDirty::Material);
+                        }
+                        if (ImGui::TreeNodeEx("Sheen", ImGuiTreeNodeFlags_DefaultOpen)) {
+                            if (color_edit("Sheen Color", principled->sheen_color, lt::RenderDirty::Material)) {
+                                principled->sheen_color = lt::clamp(principled->sheen_color);
+                            }
+                            if (ImGui::DragFloat("Sheen Roughness", &principled->sheen_roughness, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                principled->sheen_roughness = std::clamp(principled->sheen_roughness, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            int sheen_color_texture = 0;
+                            int sheen_roughness_texture = 0;
+                            for (int i = 0; i < static_cast<int>(g_editor.scene.textures.size()); ++i) {
+                                if (g_editor.scene.textures[static_cast<size_t>(i)] == principled->sheen_color_texture) {
+                                    sheen_color_texture = i + 1;
+                                }
+                                if (g_editor.scene.textures[static_cast<size_t>(i)] == principled->sheen_roughness_texture) {
+                                    sheen_roughness_texture = i + 1;
+                                }
+                            }
+                            if (ImGui::Combo("Sheen Color Texture", &sheen_color_texture, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
+                                principled->sheen_color_texture = sheen_color_texture > 0 ? g_editor.scene.textures[static_cast<size_t>(sheen_color_texture - 1)] : nullptr;
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            if (ImGui::Combo("Sheen Roughness Texture", &sheen_roughness_texture, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
+                                principled->sheen_roughness_texture = sheen_roughness_texture > 0 ? g_editor.scene.textures[static_cast<size_t>(sheen_roughness_texture - 1)] : nullptr;
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            ImGui::TreePop();
+                        }
+                        if (ImGui::TreeNodeEx("Clearcoat", ImGuiTreeNodeFlags_DefaultOpen)) {
+                            if (ImGui::DragFloat("Clearcoat", &principled->clearcoat, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                principled->clearcoat = std::clamp(principled->clearcoat, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            if (ImGui::DragFloat("Clearcoat Roughness", &principled->clearcoat_roughness, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                principled->clearcoat_roughness = std::clamp(principled->clearcoat_roughness, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            int clearcoat_texture = 0;
+                            int clearcoat_roughness_texture = 0;
+                            for (int i = 0; i < static_cast<int>(g_editor.scene.textures.size()); ++i) {
+                                if (g_editor.scene.textures[static_cast<size_t>(i)] == principled->clearcoat_texture) {
+                                    clearcoat_texture = i + 1;
+                                }
+                                if (g_editor.scene.textures[static_cast<size_t>(i)] == principled->clearcoat_roughness_texture) {
+                                    clearcoat_roughness_texture = i + 1;
+                                }
+                            }
+                            if (ImGui::Combo("Clearcoat Texture", &clearcoat_texture, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
+                                principled->clearcoat_texture = clearcoat_texture > 0 ? g_editor.scene.textures[static_cast<size_t>(clearcoat_texture - 1)] : nullptr;
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            if (ImGui::Combo("Clearcoat Roughness Texture", &clearcoat_roughness_texture, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
+                                principled->clearcoat_roughness_texture = clearcoat_roughness_texture > 0 ? g_editor.scene.textures[static_cast<size_t>(clearcoat_roughness_texture - 1)] : nullptr;
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            ImGui::TreePop();
                         }
                     }
                     if (auto* dielectric = dynamic_cast<lt::DielectricMaterial*>(material.get())) {
@@ -1393,14 +1683,11 @@ void draw_properties() {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
             }
-            const char* accel_modes[] = {"Auto (Flat)", "Flat BVH", "Two-level BVH"};
+            const char* accel_modes[] = {"Auto", "Flat BVH", "Two-level BVH"};
             int accel_mode = static_cast<int>(g_editor.settings.acceleration_structure);
             if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
                 g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
                 reset_accumulation(lt::RenderDirty::Geometry);
-            }
-            if (ImGui::Checkbox("Primary hit cache", &g_editor.settings.use_primary_hit_cache)) {
-                reset_accumulation(lt::RenderDirty::Camera);
             }
             ImGui::SeparatorText("Environment");
             color_edit("Environment Color", g_editor.scene.environment.color, lt::RenderDirty::Environment);
@@ -1451,11 +1738,16 @@ void handle_viewport_input() {
     }
 }
 
+bool point_in_rect(ImVec2 p, ImVec2 min, ImVec2 max) {
+    return p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y;
+}
+
 void draw_viewport() {
-    ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoCollapse);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImVec2 available = ImGui::GetContentRegionAvail();
     available.x = std::max(64.0f, available.x);
-    available.y = std::max(64.0f, available.y - 26.0f);
+    available.y = std::max(64.0f, available.y);
     g_editor.viewport_size = available;
     render_preview_if_needed();
     if (g_preview.srv) {
@@ -1480,14 +1772,36 @@ void draw_viewport() {
         if (g_editor.tool_mode == ToolMode::Scale) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
     }
     handle_viewport_input();
-    ImGui::Text("%s tool | LMB select/drag | RMB look | WASD/QE fly | G/R/S tools", tool_mode_name(g_editor.tool_mode));
+    const char* hint = "LMB select/drag | RMB look | WASD/QE fly";
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const float button_size = 28.0f;
+    const ImVec2 button_min = {g_editor.viewport_image_max.x - button_size - 10.0f, g_editor.viewport_image_min.y + 10.0f};
+    const ImVec2 button_max = {button_min.x + button_size, button_min.y + button_size};
+    draw_list->AddRectFilled(button_min, button_max, IM_COL32(18, 18, 20, 210), 4.0f);
+    draw_list->AddRect(button_min, button_max, IM_COL32(95, 100, 110, 230), 4.0f);
+    const char* fullscreen_label = g_editor.viewport_fullscreen ? "X" : "F";
+    const ImVec2 label_size = ImGui::CalcTextSize(fullscreen_label);
+    draw_list->AddText({button_min.x + (button_size - label_size.x) * 0.5f, button_min.y + (button_size - label_size.y) * 0.5f}, IM_COL32(235, 238, 242, 255), fullscreen_label);
+    const bool fullscreen_hovered = point_in_rect(ImGui::GetIO().MousePos, button_min, button_max);
+    if (fullscreen_hovered) {
+        ImGui::SetTooltip(g_editor.viewport_fullscreen ? "Exit fullscreen viewport" : "Fullscreen viewport");
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen;
+        }
+    }
+    const ImVec2 text_size = ImGui::CalcTextSize(hint);
+    const ImVec2 text_pos = {g_editor.viewport_image_min.x + 8.0f, g_editor.viewport_image_max.y - text_size.y - 8.0f};
+    draw_list->AddRectFilled({text_pos.x - 6.0f, text_pos.y - 4.0f}, {text_pos.x + text_size.x + 6.0f, text_pos.y + text_size.y + 4.0f}, IM_COL32(18, 18, 20, 180), 3.0f);
+    draw_list->AddText(text_pos, IM_COL32(220, 222, 225, 230), hint);
     ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 void draw_status_bar() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos({viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - 26.0f});
-    ImGui::SetNextWindowSize({viewport->WorkSize.x, 26.0f});
+    ImGui::SetNextWindowPos({viewport->Pos.x, viewport->Pos.y + viewport->Size.y - 26.0f});
+    ImGui::SetNextWindowSize({viewport->Size.x, 26.0f});
     ImGui::Begin("Status", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
     size_t vertex_count = 0;
     size_t triangle_count = 0;
@@ -1504,30 +1818,127 @@ void draw_status_bar() {
     ImGui::End();
 }
 
-void draw_ui() {
-    draw_top_bar();
+void draw_layout_splitters(ImVec2 layout_pos, ImVec2 layout_size, float top, float content_height, float viewport_width, float outliner_height) {
+    enum class ActiveSplitter { None, Toolbar, Properties, Outliner };
+    static ActiveSplitter active = ActiveSplitter::None;
+
+    constexpr float grab = 8.0f;
+    const float content_top = layout_pos.y + top;
+    const float toolbar_x = layout_pos.x + g_editor.toolbar_width;
+    const float properties_x = layout_pos.x + g_editor.toolbar_width + viewport_width;
+    const float outliner_y = content_top + outliner_height;
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+
+    const ImVec2 toolbar_min{toolbar_x - grab * 0.5f, content_top};
+    const ImVec2 toolbar_max{toolbar_x + grab * 0.5f, content_top + content_height};
+    const ImVec2 properties_min{properties_x - grab * 0.5f, content_top};
+    const ImVec2 properties_max{properties_x + grab * 0.5f, content_top + content_height};
+    const ImVec2 outliner_min{properties_x, outliner_y - grab * 0.5f};
+    const ImVec2 outliner_max{layout_pos.x + layout_size.x, outliner_y + grab * 0.5f};
+
+    const bool hover_toolbar = point_in_rect(mouse, toolbar_min, toolbar_max);
+    const bool hover_properties = point_in_rect(mouse, properties_min, properties_max);
+    const bool hover_outliner = point_in_rect(mouse, outliner_min, outliner_max);
+    if (active == ActiveSplitter::None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (hover_toolbar) {
+            active = ActiveSplitter::Toolbar;
+        } else if (hover_properties) {
+            active = ActiveSplitter::Properties;
+        } else if (hover_outliner) {
+            active = ActiveSplitter::Outliner;
+        }
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        active = ActiveSplitter::None;
+    }
+
+    if (hover_toolbar || hover_properties || active == ActiveSplitter::Toolbar || active == ActiveSplitter::Properties) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+    if (hover_outliner || active == ActiveSplitter::Outliner) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+
+    const ImVec2 delta = ImGui::GetIO().MouseDelta;
+    if (active == ActiveSplitter::Toolbar) {
+        const float total = g_editor.toolbar_width + viewport_width;
+        g_editor.toolbar_width = std::clamp(g_editor.toolbar_width + delta.x, 56.0f, total - 160.0f);
+    } else if (active == ActiveSplitter::Properties) {
+        const float max_properties = layout_size.x - g_editor.toolbar_width - 160.0f;
+        g_editor.properties_width = std::clamp(g_editor.properties_width - delta.x, 220.0f, std::max(220.0f, max_properties));
+    } else if (active == ActiveSplitter::Outliner) {
+        g_editor.outliner_fraction = std::clamp(g_editor.outliner_fraction + delta.y / std::max(1.0f, content_height), 0.18f, 0.75f);
+    }
+
+    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+    const ImU32 line_color = IM_COL32(78, 82, 88, 190);
+    draw_list->AddLine({toolbar_x, content_top}, {toolbar_x, content_top + content_height}, line_color, 1.0f);
+    draw_list->AddLine({properties_x, content_top}, {properties_x, content_top + content_height}, line_color, 1.0f);
+    draw_list->AddLine({properties_x, outliner_y}, {layout_pos.x + layout_size.x, outliner_y}, line_color, 1.0f);
+}
+
+void draw_loading_overlay() {
+    if (!scene_load_in_progress()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - g_load_task.started).count();
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float top = ImGui::GetFrameHeight();
+    ImGui::SetNextWindowPos({viewport->Pos.x + viewport->Size.x - 320.0f, viewport->Pos.y + 44.0f}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({292.0f, 86.0f}, ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.11f, 0.12f, 0.94f));
+    if (ImGui::Begin("SceneLoadOverlay", nullptr, flags)) {
+        ImGui::TextUnformatted("Loading scene");
+        ImGui::TextDisabled("%s", g_load_task.path.c_str());
+        const float phase = static_cast<float>(std::fmod(elapsed * 0.45, 1.0));
+        ImGui::ProgressBar(phase, {-1.0f, 8.0f}, "");
+        ImGui::TextDisabled("%.1f s", elapsed);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+void draw_ui() {
+    const float top = draw_top_bar();
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float bottom = 26.0f;
-    const float left = 74.0f;
-    const float right = 340.0f;
-    const ImVec2 work_pos = viewport->WorkPos;
-    const ImVec2 work_size = viewport->WorkSize;
-    const float content_height = std::max(64.0f, work_size.y - top - bottom);
-    const float viewport_width = std::max(64.0f, work_size.x - left - right);
-    ImGui::SetNextWindowPos({work_pos.x, work_pos.y + top}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({left, content_height}, ImGuiCond_Always);
+    const ImVec2 layout_pos = viewport->Pos;
+    const ImVec2 layout_size = viewport->Size;
+    if (g_window_minimized || IsIconic(g_hwnd) || layout_size.x <= 480.0f || layout_size.y <= 240.0f) {
+        return;
+    }
+    const float content_height = std::max(64.0f, layout_size.y - top - bottom);
+    const float max_toolbar = std::max(56.0f, layout_size.x - g_editor.properties_width - 160.0f);
+    g_editor.toolbar_width = std::clamp(g_editor.toolbar_width, 56.0f, max_toolbar);
+    const float max_properties = std::max(220.0f, layout_size.x - g_editor.toolbar_width - 160.0f);
+    g_editor.properties_width = std::clamp(g_editor.properties_width, 220.0f, max_properties);
+    float viewport_width = std::max(64.0f, layout_size.x - g_editor.toolbar_width - g_editor.properties_width);
+    const float outliner_height = content_height * g_editor.outliner_fraction;
+    if (g_editor.viewport_fullscreen) {
+        ImGui::SetNextWindowPos({layout_pos.x, layout_pos.y + top}, ImGuiCond_Always);
+        ImGui::SetNextWindowSize({layout_size.x, content_height}, ImGuiCond_Always);
+        draw_viewport();
+        draw_status_bar();
+        draw_loading_overlay();
+        return;
+    }
+    ImGui::SetNextWindowPos({layout_pos.x, layout_pos.y + top}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({g_editor.toolbar_width, content_height}, ImGuiCond_Always);
     draw_toolbar();
-    ImGui::SetNextWindowPos({work_pos.x + left, work_pos.y + top}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos({layout_pos.x + g_editor.toolbar_width, layout_pos.y + top}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({viewport_width, content_height}, ImGuiCond_Always);
     draw_viewport();
-    ImGui::SetNextWindowPos({work_pos.x + left + viewport_width, work_pos.y + top}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({right, content_height * 0.38f}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos({layout_pos.x + g_editor.toolbar_width + viewport_width, layout_pos.y + top}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({g_editor.properties_width, outliner_height}, ImGuiCond_Always);
     draw_outliner();
-    ImGui::SetNextWindowPos({work_pos.x + left + viewport_width, work_pos.y + top + content_height * 0.38f}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({right, content_height * 0.62f}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos({layout_pos.x + g_editor.toolbar_width + viewport_width, layout_pos.y + top + outliner_height}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({g_editor.properties_width, content_height - outliner_height}, ImGuiCond_Always);
     draw_properties();
+    draw_layout_splitters(layout_pos, layout_size, top, content_height, viewport_width, outliner_height);
     draw_status_bar();
+    draw_loading_overlay();
 }
 
 void handle_global_shortcuts() {
@@ -1539,6 +1950,7 @@ void handle_global_shortcuts() {
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) delete_selected();
     if (ImGui::IsKeyPressed(ImGuiKey_O)) open_scene_dialog();
     if (ImGui::IsKeyPressed(ImGuiKey_Space)) g_editor.paused = !g_editor.paused;
+    if (ImGui::IsKeyPressed(ImGuiKey_F11)) g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen;
     if (!io.KeyCtrl) {
         if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A)) add_mesh();
     }
@@ -1548,16 +1960,28 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) return true;
     switch (msg) {
     case WM_SIZE:
+        g_window_minimized = wparam == SIZE_MINIMIZED;
+        if (g_window_minimized) {
+            return 0;
+        }
         if (g_device && wparam != SIZE_MINIMIZED) {
+            const UINT width = LOWORD(lparam);
+            const UINT height = HIWORD(lparam);
+            if (width == 0 || height == 0 || (width == g_swap_chain_width && height == g_swap_chain_height)) {
+                return 0;
+            }
             cleanup_render_target();
-            g_swap_chain->ResizeBuffers(0, LOWORD(lparam), HIWORD(lparam), DXGI_FORMAT_UNKNOWN, 0);
+            g_swap_chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
             create_render_target();
+            g_swap_chain_width = width;
+            g_swap_chain_height = height;
         }
         return 0;
     case WM_SYSCOMMAND:
         if ((wparam & 0xfff0) == SC_KEYMENU) return 0;
         break;
     case WM_DESTROY:
+        g_shutting_down = true;
         PostQuitMessage(0);
         return 0;
     default:
@@ -1593,9 +2017,7 @@ void load_editor_fonts(ImGuiIO& io) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
-    g_editor.scene_path = command_line_scene();
-    lt::SceneLoadResult loaded = lt::load_scene(g_editor.scene_path);
-    if (loaded.error.empty()) g_editor.scene = loaded.scene;
+    g_editor.scene_path = resolve_startup_scene_path(command_line_scene());
     g_editor.settings.samples_per_pixel = 1;
     g_editor.settings.max_bounces = 5;
     select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
@@ -1626,6 +2048,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     apply_blender_style();
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_device, g_context);
+    load_scene_file(g_editor.scene_path);
 
     bool running = true;
     while (running) {
@@ -1639,6 +2062,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        poll_scene_load_result();
         handle_global_shortcuts();
         draw_ui();
         ImGui::Render();
@@ -1649,9 +2073,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
         g_swap_chain->Present(1, 0);
     }
 
-    if (g_render_future.valid()) {
-        g_render_future.wait();
-    }
+    release_editor_memory();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

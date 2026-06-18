@@ -11,6 +11,7 @@ namespace lt {
 
 struct LightComponent {
     bool enabled = false;
+    bool double_sided = true;
     Vec3 color = {1.0f, 1.0f, 1.0f};
     float intensity = 1.0f;
 };
@@ -33,13 +34,20 @@ struct Camera {
     Vec3 target = {0.0f, 1.0f, 0.0f};
     Vec3 up = {0.0f, 1.0f, 0.0f};
     float fov_degrees = 45.0f;
+    float right_sign = 1.0f;
 };
 
 struct Environment {
+    enum class Mapping { Equirectangular = 0, EqualArea = 1 };
+
     Vec3 color = {1.0f, 1.0f, 1.0f};
     float strength = 1.0f;
     std::shared_ptr<Texture> texture;
     bool constant = false;
+    Mapping mapping = Mapping::Equirectangular;
+    Vec3 light_from_world_x = {1.0f, 0.0f, 0.0f};
+    Vec3 light_from_world_y = {0.0f, 1.0f, 0.0f};
+    Vec3 light_from_world_z = {0.0f, 0.0f, 1.0f};
 };
 
 struct Scene {
@@ -51,6 +59,7 @@ struct Scene {
 
     Camera camera;
     Environment environment;
+    bool uses_builtin_default_meshes = false;
     std::vector<std::shared_ptr<Material>> materials;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<Mesh> meshes;
@@ -64,6 +73,8 @@ struct Triangle {
     Vec3 n0;
     Vec3 n1;
     Vec3 n2;
+    Vec3 tangent;
+    Vec3 bitangent;
     Vec3 centroid;
     Vec2 uv0;
     Vec2 uv1;
@@ -111,6 +122,7 @@ struct SceneLoadResult {
 Scene make_default_scene();
 SceneLoadResult load_scene(const std::string& path);
 SceneLoadResult load_gltf_scene(const std::string& path);
+SceneLoadResult load_pbrt_scene(const std::string& path);
 bool save_scene(const Scene& scene, const std::string& path, std::string& error);
 int find_material(const Scene& scene, const std::string& name);
 RenderScene build_render_scene(const Scene& scene);

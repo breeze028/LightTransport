@@ -569,6 +569,18 @@ int material_texture_source(const Json& root, int texture_index) {
     return root["textures"][static_cast<size_t>(texture_index)]["source"].integer(-1);
 }
 
+std::shared_ptr<Texture> scene_texture_for_gltf_texture(const Json& root, const std::vector<int>& image_to_texture, const Scene& scene, int texture_index) {
+    const int source = material_texture_source(root, texture_index);
+    if (source < 0 || source >= static_cast<int>(image_to_texture.size())) {
+        return {};
+    }
+    const int scene_texture = image_to_texture[static_cast<size_t>(source)];
+    if (scene_texture < 0 || scene_texture >= static_cast<int>(scene.textures.size())) {
+        return {};
+    }
+    return scene.textures[static_cast<size_t>(scene_texture)];
+}
+
 void load_images(const Json& root, const std::string& scene_dir, const std::vector<std::vector<unsigned char>>& buffers, const std::vector<BufferView>& views, Scene& scene, std::vector<int>& image_to_texture) {
     image_to_texture.assign(root["images"].array().size(), -1);
     for (size_t i = 0; i < root["images"].array().size(); ++i) {
@@ -610,20 +622,85 @@ void load_materials(const Json& root, const std::vector<int>& image_to_texture, 
     for (size_t i = 0; i < root["materials"].array().size(); ++i) {
         const Json& material_json = root["materials"][i];
         const Json& pbr = material_json["pbrMetallicRoughness"];
-        Vec3 base{0.8f, 0.8f, 0.8f};
+        Vec3 base{1.0f, 1.0f, 1.0f};
         if (pbr["baseColorFactor"].is_array()) {
             base = {pbr["baseColorFactor"][0].number(1.0f), pbr["baseColorFactor"][1].number(1.0f), pbr["baseColorFactor"][2].number(1.0f)};
         }
-        const float roughness = pbr["roughnessFactor"].number(0.5f);
-        const float metallic = pbr["metallicFactor"].number(0.0f);
-        std::shared_ptr<Material> material = make_material(material_json["name"].string("material_" + std::to_string(i)), base, BrdfModel::Principled, roughness, metallic);
-        const int tex_index = pbr["baseColorTexture"]["index"].integer(-1);
-        const int source = material_texture_source(root, tex_index);
-        if (source >= 0 && source < static_cast<int>(image_to_texture.size())) {
-            const int scene_texture = image_to_texture[static_cast<size_t>(source)];
-            if (scene_texture >= 0 && scene_texture < static_cast<int>(scene.textures.size())) {
-                material->albedo_texture = scene.textures[static_cast<size_t>(scene_texture)];
+        const float roughness = pbr["roughnessFactor"].number(1.0f);
+        const float metallic = pbr["metallicFactor"].number(1.0f);
+        const Json& extensions = material_json["extensions"];
+        const Json& transmission = extensions["KHR_materials_transmission"];
+        const bool has_transmission_texture = !transmission["transmissionTexture"].is_null();
+        const float transmission_factor = std::clamp(transmission["transmissionFactor"].number(has_transmission_texture ? 1.0f : 0.0f), 0.0f, 1.0f);
+        const bool uses_transmission = transmission_factor > 0.0f;
+        const float ior = std::clamp(extensions["KHR_materials_ior"]["ior"].number(1.5f), 1.0f, 3.0f);
+        Vec3 transmission_tint{1.0f, 1.0f, 1.0f};
+        const Json& volume = extensions["KHR_materials_volume"];
+        if (volume["attenuationColor"].is_array()) {
+            transmission_tint = {
+                volume["attenuationColor"][0].number(1.0f),
+                volume["attenuationColor"][1].number(1.0f),
+                volume["attenuationColor"][2].number(1.0f),
+            };
+        }
+        std::shared_ptr<Material> material = make_material(
+            material_json["name"].string("material_" + std::to_string(i)),
+            base,
+            uses_transmission ? BrdfModel::Dielectric : BrdfModel::Principled,
+            uses_transmission ? ior : roughness,
+            metallic);
+        if (auto* dielectric = dynamic_cast<DielectricMaterial*>(material.get())) {
+            dielectric->transmission_tint = transmission_tint;
+        }
+        if (pbr["baseColorFactor"].is_array() && pbr["baseColorFactor"].array().size() >= 4) {
+            material->alpha = std::clamp(pbr["baseColorFactor"][3].number(1.0f), 0.0f, 1.0f);
+        }
+        const std::string alpha_mode = material_json["alphaMode"].string("OPAQUE");
+        if (alpha_mode == "MASK") {
+            material->alpha_mode = AlphaMode::Mask;
+        } else if (alpha_mode == "BLEND") {
+            material->alpha_mode = AlphaMode::Blend;
+        }
+        material->double_sided = material_json["doubleSided"].boolean(false);
+        material->alpha_cutoff = std::clamp(material_json["alphaCutoff"].number(0.5f), 0.0f, 1.0f);
+        const int base_texture = pbr["baseColorTexture"]["index"].integer(-1);
+        material->albedo_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, base_texture);
+        const int normal_texture = material_json["normalTexture"]["index"].integer(-1);
+        material->normal_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, normal_texture);
+        material->normal_scale = material_json["normalTexture"]["scale"].number(1.0f);
+        if (material_json["emissiveFactor"].is_array()) {
+            material->emission = {
+                material_json["emissiveFactor"][0].number(),
+                material_json["emissiveFactor"][1].number(),
+                material_json["emissiveFactor"][2].number(),
+            };
+        }
+        const float emissive_strength = extensions["KHR_materials_emissive_strength"]["emissiveStrength"].number(1.0f);
+        material->emission = material->emission * std::max(0.0f, emissive_strength);
+        const int emission_texture = material_json["emissiveTexture"]["index"].integer(-1);
+        material->emission_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, emission_texture);
+        if (material->emission_texture && material->emission.x == 0.0f && material->emission.y == 0.0f && material->emission.z == 0.0f) {
+            material->emission = Vec3{1.0f, 1.0f, 1.0f} * std::max(0.0f, emissive_strength);
+        }
+        if (auto* principled = dynamic_cast<PrincipledMaterial*>(material.get())) {
+            const int metallic_roughness_texture = pbr["metallicRoughnessTexture"]["index"].integer(-1);
+            principled->metallic_roughness_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, metallic_roughness_texture);
+            const Json& sheen = extensions["KHR_materials_sheen"];
+            if (sheen["sheenColorFactor"].is_array()) {
+                principled->sheen_color = {
+                    sheen["sheenColorFactor"][0].number(),
+                    sheen["sheenColorFactor"][1].number(),
+                    sheen["sheenColorFactor"][2].number(),
+                };
             }
+            principled->sheen_roughness = std::clamp(sheen["sheenRoughnessFactor"].number(0.0f), 0.0f, 1.0f);
+            principled->sheen_color_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, sheen["sheenColorTexture"]["index"].integer(-1));
+            principled->sheen_roughness_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, sheen["sheenRoughnessTexture"]["index"].integer(-1));
+            const Json& clearcoat = extensions["KHR_materials_clearcoat"];
+            principled->clearcoat = std::clamp(clearcoat["clearcoatFactor"].number(0.0f), 0.0f, 1.0f);
+            principled->clearcoat_roughness = std::clamp(clearcoat["clearcoatRoughnessFactor"].number(0.0f), 0.0f, 1.0f);
+            principled->clearcoat_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, clearcoat["clearcoatTexture"]["index"].integer(-1));
+            principled->clearcoat_roughness_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, clearcoat["clearcoatRoughnessTexture"]["index"].integer(-1));
         }
         scene.materials.push_back(material);
     }
@@ -674,12 +751,17 @@ void import_primitive(
 
     const int indices_accessor = primitive["indices"].integer(-1);
     if (indices_accessor >= 0 && indices_accessor < static_cast<int>(accessors.size())) {
-        read_indices(buffers, views, accessors[static_cast<size_t>(indices_accessor)], mesh.indices);
+        if (!read_indices(buffers, views, accessors[static_cast<size_t>(indices_accessor)], mesh.indices)) {
+            return;
+        }
     } else {
         mesh.indices.resize(mesh.vertices.size());
         for (uint32_t i = 0; i < mesh.indices.size(); ++i) mesh.indices[i] = i;
     }
-    if (mesh.indices.size() >= 3) {
+    const bool indices_valid = std::all_of(mesh.indices.begin(), mesh.indices.end(), [&](uint32_t index) {
+        return index < mesh.vertices.size();
+    });
+    if (mesh.indices.size() >= 3 && mesh.indices.size() % 3 == 0 && indices_valid) {
         scene.meshes.push_back(std::move(mesh));
     }
 }

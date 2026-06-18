@@ -65,6 +65,7 @@ MinSizeRel/
 *.jpeg
 
 # Editor / OS files
+.vscode/
 .DS_Store
 Thumbs.db
 desktop.ini
