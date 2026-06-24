@@ -159,7 +159,8 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
         }
     }
     const RenderScene render_scene = build_render_scene(scene);
-    if (!size_fits_int(render_scene.triangles.size()) || !size_fits_int(render_scene.triangle_indices.size()) ||
+    if (!size_fits_int(render_scene.triangles.size()) || !size_fits_int(render_scene.spheres.size()) ||
+        !size_fits_int(render_scene.triangle_indices.size()) ||
         !size_fits_int(render_scene.flat_triangle_indices.size()) || !size_fits_int(render_scene.flat_bvh_nodes.size()) ||
         !size_fits_int(render_scene.bvh_nodes.size()) || !size_fits_int(render_scene.light_triangle_indices.size()) ||
         !size_fits_int(render_scene.mesh_instances.size()) || !size_fits_int(render_scene.mesh_instance_indices.size()) ||
@@ -168,10 +169,12 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
     }
     gpu.use_two_level = use_two_level_accel(render_scene, settings.acceleration_structure) ? 1 : 0;
     gpu.triangle_count = static_cast<int>(render_scene.triangles.size());
+    gpu.sphere_count = static_cast<int>(render_scene.spheres.size());
     gpu.bvh_node_count = gpu.use_two_level ? static_cast<int>(render_scene.bvh_nodes.size()) : static_cast<int>(render_scene.flat_bvh_nodes.size());
     gpu.mesh_instance_count = static_cast<int>(render_scene.mesh_instances.size());
     gpu.tlas_node_count = static_cast<int>(render_scene.tlas_nodes.size());
     packed.triangles.resize(render_scene.triangles.size());
+    packed.spheres.resize(render_scene.spheres.size());
     packed.triangle_indices = gpu.use_two_level ? render_scene.triangle_indices : render_scene.flat_triangle_indices;
     const std::vector<BvhNode>& source_bvh_nodes = gpu.use_two_level ? render_scene.bvh_nodes : render_scene.flat_bvh_nodes;
     packed.bvh_nodes.resize(source_bvh_nodes.size());
@@ -206,6 +209,13 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
             }
         }
         packed.triangles[static_cast<size_t>(i)] = {tri.v0, tri.v1, tri.v2, tri.normal, tri.n0, tri.n1, tri.n2, tri.tangent, tri.bitangent, tri.centroid, emission, tri.uv0, tri.uv1, tri.uv2, tri.material, tri.mesh, light_double_sided};
+    }
+    for (int i = 0; i < gpu.sphere_count; ++i) {
+        const RenderSphere& sphere = render_scene.spheres[static_cast<size_t>(i)];
+        if (sphere.material < 0 || sphere.material >= gpu.material_count) {
+            return false;
+        }
+        packed.spheres[static_cast<size_t>(i)] = {sphere.center, sphere.radius, sphere.material, sphere.sphere};
     }
     for (int i = 0; i < static_cast<int>(packed.triangle_indices.size()); ++i) {
         const int tri_index = packed.triangle_indices[static_cast<size_t>(i)];

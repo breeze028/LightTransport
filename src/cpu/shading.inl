@@ -268,7 +268,326 @@ Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scen
     return direct;
 }
 
+struct StylizedTraceContext {
+    int styled_vertices = 0;
+};
+
+float channel_average(Vec3 v) {
+    return (v.x + v.y + v.z) / 3.0f;
+}
+
+Vec3 mix_color(Vec3 a, Vec3 b, float t) {
+    return a * (1.0f - t) + b * t;
+}
+
+Vec3 color_map_gradient(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    const Vec3 c0{0.095f, 0.050f, 0.270f};
+    const Vec3 c1{0.170f, 0.280f, 0.600f};
+    const Vec3 c2{0.130f, 0.570f, 0.550f};
+    const Vec3 c3{0.470f, 0.800f, 0.340f};
+    const Vec3 c4{0.990f, 0.890f, 0.220f};
+    if (t < 0.25f) {
+        return mix_color(c0, c1, t * 4.0f);
+    }
+    if (t < 0.5f) {
+        return mix_color(c1, c2, (t - 0.25f) * 4.0f);
+    }
+    if (t < 0.75f) {
+        return mix_color(c2, c3, (t - 0.5f) * 4.0f);
+    }
+    return mix_color(c3, c4, (t - 0.75f) * 4.0f);
+}
+
+Vec3 dominant_light_direction(const RenderScene& render_scene, const Hit& hit) {
+    if (!render_scene.light_triangle_indices.empty()) {
+        const int light_index = render_scene.light_triangle_indices.front();
+        if (light_index >= 0 && light_index < static_cast<int>(render_scene.triangles.size())) {
+            const Vec3 to_light = render_scene.triangles[static_cast<size_t>(light_index)].centroid - hit.position;
+            if (dot(to_light, to_light) > 1.0e-8f) {
+                return normalize(to_light);
+            }
+        }
+    }
+    return normalize({0.35f, 0.85f, 0.35f});
+}
+
+float quantize_tone(float tone, int steps) {
+    tone = std::clamp(tone, 0.0f, 1.0f);
+    if (steps <= 1) {
+        return tone;
+    }
+    const float levels = static_cast<float>(steps - 1);
+    return std::round(tone * levels) / levels;
+}
+
+Vec3 xtoon_ramp(const Material& material, const Hit& hit, float tone) {
+    const NprSettings& npr = material.npr;
+    const Vec3 base = material.base_color(hit.uv);
+    const float q = quantize_tone(tone, npr.xtoon_steps);
+    const Vec3 shadow = base * npr.xtoon_shadow;
+    const Vec3 mid = base * npr.xtoon_mid;
+    const Vec3 lit = base * npr.xtoon_lit;
+    return q < 0.5f ? mix_color(shadow, mid, q * 2.0f) : mix_color(mid, lit, (q - 0.5f) * 2.0f);
+}
+
+float xtoon_depth_detail(const Scene& scene, const Material& material, const Hit& hit) {
+    const NprSettings& npr = material.npr;
+    const float z = std::max(1.0e-4f, length(hit.position - scene.camera.position));
+    const float z_min = std::max(1.0e-4f, npr.xtoon_depth_near);
+    const float z_max = std::max(z_min + 1.0e-4f, npr.xtoon_depth_far);
+    return std::clamp(1.0f - std::log(z / z_min) / std::log(z_max / z_min), 0.0f, 1.0f);
+}
+
+float xtoon_attribute_detail(const RenderScene& render_scene, const Scene& scene, const Material& material, const Hit& hit, Vec3 wo) {
+    const NprSettings& npr = material.npr;
+    const float power = std::max(0.001f, npr.xtoon_detail_power);
+    if (npr.xtoon_detail_mode == XToonDetailMode::Depth) {
+        return xtoon_depth_detail(scene, material, hit);
+    }
+    if (npr.xtoon_detail_mode == XToonDetailMode::NearSilhouette) {
+        return std::pow(std::clamp(1.0f - std::fabs(dot(hit.normal, wo)), 0.0f, 1.0f), power);
+    }
+    if (npr.xtoon_detail_mode == XToonDetailMode::Highlight) {
+        const Vec3 light_dir = dominant_light_direction(render_scene, hit);
+        const Vec3 reflected = normalize(hit.normal * (2.0f * dot(hit.normal, light_dir)) - light_dir);
+        return std::pow(std::max(0.0f, dot(wo, reflected)), power);
+    }
+    return 1.0f;
+}
+
+Vec3 apply_xtoon_style(const RenderScene& render_scene, const Scene& scene, const Material& material, const Hit& hit, Vec3 wo) {
+    const NprSettings& npr = material.npr;
+    const Vec3 light_dir = dominant_light_direction(render_scene, hit);
+    const float ndotl_raw = dot(hit.normal, light_dir);
+    const float tone = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
+    Vec3 toon = xtoon_ramp(material, hit, tone);
+    const float detail = xtoon_attribute_detail(render_scene, scene, material, hit, wo);
+    const float strength = std::clamp(npr.xtoon_detail_strength, 0.0f, 1.0f);
+
+    if (npr.xtoon_detail_mode == XToonDetailMode::Depth) {
+        const Vec3 abstract_tone = material.base_color(hit.uv) * npr.xtoon_mid;
+        return mix_color(abstract_tone, toon, 1.0f - (1.0f - detail) * strength);
+    }
+    if (npr.xtoon_detail_mode == XToonDetailMode::NearSilhouette || npr.xtoon_detail_mode == XToonDetailMode::Highlight) {
+        if (detail >= std::clamp(npr.xtoon_detail_threshold, 0.0f, 1.0f)) {
+            return mix_color(toon, npr.xtoon_accent, strength);
+        }
+    }
+    return toon;
+}
+
+void hatch_view_basis(const Camera& camera, Vec3& right, Vec3& up) {
+    Vec3 forward = normalize(camera.target - camera.position);
+    if (dot(forward, forward) <= 0.0f) {
+        forward = {0.0f, 0.0f, -1.0f};
+    }
+    Vec3 camera_up = camera.up;
+    right = normalize(cross(forward, camera_up));
+    if (dot(right, right) <= 0.0f) {
+        camera_up = std::fabs(forward.y) < 0.999f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+        right = normalize(cross(forward, camera_up));
+    }
+    if (dot(right, right) <= 0.0f) {
+        right = {1.0f, 0.0f, 0.0f};
+    }
+    const float right_sign = camera.right_sign < 0.0f ? -1.0f : 1.0f;
+    right *= right_sign;
+    up = cross(right, forward) * right_sign;
+}
+
+bool hit_periodic_hatch_plane(Vec3 position, Vec3 origin, Vec3 normal, float spacing, float width) {
+    const float x = dot(position - origin, normal);
+    const float nearest = std::round(x / spacing) * spacing;
+    return std::fabs(x - nearest) <= width * 0.5f;
+}
+
+bool first_hatch_light_point(const RenderScene& render_scene, Vec3& point) {
+    if (render_scene.light_triangle_indices.empty()) {
+        return false;
+    }
+    const int light_index = render_scene.light_triangle_indices.front();
+    if (light_index < 0 || light_index >= static_cast<int>(render_scene.triangles.size())) {
+        return false;
+    }
+    point = render_scene.triangles[static_cast<size_t>(light_index)].centroid;
+    return true;
+}
+
+bool occluded_from_hatch_light(const RenderScene& render_scene, const RenderSettings& settings, const Hit& hit, Vec3 light_point) {
+    const Vec3 to_light = light_point - hit.position;
+    const float dist2 = dot(to_light, to_light);
+    if (dist2 <= 1.0e-8f) {
+        return false;
+    }
+    const float dist = std::sqrt(dist2);
+    const Vec3 light_dir = to_light / dist;
+    const float offset_side = dot(hit.normal, light_dir) >= 0.0f ? 1.0f : -1.0f;
+    Ray shadow_ray{hit.position + hit.normal * (0.002f * offset_side), light_dir};
+    Hit shadow_hit;
+    if (!intersect_scene(render_scene, shadow_ray, shadow_hit, settings.acceleration_structure)) {
+        return false;
+    }
+    return shadow_hit.t < dist - 0.01f;
+}
+
+Vec3 apply_cross_hatching_style(const RenderScene& render_scene, const Scene& scene, const RenderSettings& settings, const Material& material, const Hit& hit, Vec3 estimate) {
+    const NprSettings& npr = material.npr;
+    const bool passthrough = npr.hatch_passthrough || npr.hatch_shadow_only;
+    if (npr.hatch_shadow_only) {
+        Vec3 light_point;
+        if (!first_hatch_light_point(render_scene, light_point) ||
+            !occluded_from_hatch_light(render_scene, settings, hit, light_point)) {
+            return estimate;
+        }
+    }
+    const int hatch_sets = std::clamp(npr.hatch_sets, 1, 8);
+    const float spacing = std::max(1.0e-4f, npr.hatch_spacing);
+    const float width = std::clamp(npr.hatch_width, 1.0e-5f, spacing);
+    const float lo = npr.hatch_value_min;
+    const float hi = std::max(lo + 1.0e-6f, npr.hatch_value_max);
+    const float tone = std::clamp((channel_average(estimate) - lo) / (hi - lo), 0.0f, 1.0f);
+    const float darkness = 1.0f - tone;
+    const int active_sets = std::clamp(static_cast<int>(std::ceil(darkness * static_cast<float>(hatch_sets) - 1.0e-6f)), 0, hatch_sets);
+    if (active_sets <= 0) {
+        return passthrough ? estimate : npr.hatch_paper;
+    }
+
+    Vec3 right;
+    Vec3 up;
+    hatch_view_basis(scene.camera, right, up);
+    const Vec3 origin = scene.camera.target;
+    for (int i = 0; i < active_sets; ++i) {
+        const float angle = npr.hatch_angle + static_cast<float>(i) * kPi / static_cast<float>(hatch_sets);
+        const Vec3 normal = normalize(right * std::cos(angle) + up * std::sin(angle));
+        if (hit_periodic_hatch_plane(hit.position, origin, normal, spacing, width)) {
+            return npr.hatch_ink;
+        }
+    }
+    return passthrough ? estimate : npr.hatch_paper;
+}
+
+Vec3 apply_npr_style(const RenderScene& render_scene, const Scene& scene, const RenderSettings& settings, const Material& material, const Hit& hit, Vec3 wo, Vec3 estimate) {
+    const float brightness = channel_average(estimate);
+    if (material.npr.style == NprStyle::ColorMap) {
+        const float lo = material.npr.value_min;
+        const float hi = std::max(lo + 1.0e-6f, material.npr.value_max);
+        return color_map_gradient((brightness - lo) / (hi - lo));
+    }
+    if (material.npr.style == NprStyle::XToon) {
+        return apply_xtoon_style(render_scene, scene, material, hit, wo);
+    }
+    if (material.npr.style == NprStyle::CrossHatching) {
+        return apply_cross_hatching_style(render_scene, scene, settings, material, hit, estimate);
+    }
+    return estimate;
+}
+
+bool should_apply_style(const RenderSettings& settings, const Material& material, const StylizedTraceContext& context) {
+    return material.npr.style != NprStyle::None && settings.stylized_samples > 0 && context.styled_vertices < settings.stylized_max_depth;
+}
+
+Vec3 trace_stylized_radiance(
+    const RenderScene& render_scene,
+    const Scene& scene,
+    Ray ray,
+    Rng& rng,
+    const RenderSettings& settings,
+    StylizedTraceContext context,
+    int bounce,
+    Vec3 previous_position,
+    float previous_bsdf_pdf,
+    bool previous_delta) {
+    if (bounce >= settings.max_bounces) {
+        return {};
+    }
+
+    const float sample_clamp = bounce == 0 ? 64.0f : 8.0f;
+    Hit hit;
+    if (!intersect_scene(render_scene, ray, hit, settings.acceleration_structure)) {
+        return clamp_sample_radiance(environment_radiance(scene, ray.direction, settings), sample_clamp);
+    }
+
+    if (hit.material < 0 || hit.material >= static_cast<int>(scene.materials.size())) {
+        return {};
+    }
+    const std::shared_ptr<Material>& material = scene.materials[static_cast<size_t>(hit.material)];
+    if (!material) {
+        return {};
+    }
+    if (!material_visible(*material, hit.uv, rng)) {
+        return trace_stylized_radiance(
+            render_scene,
+            scene,
+            {hit.position + ray.direction * 0.002f, ray.direction},
+            rng,
+            settings,
+            context,
+            bounce + 1,
+            previous_position,
+            previous_bsdf_pdf,
+            previous_delta);
+    }
+
+    hit.normal = apply_normal_map(*material, hit, ray.direction);
+    Vec3 emission;
+    if (hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
+        emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction);
+    }
+    if (has_light_emission(emission)) {
+        if (bounce == 0 || previous_delta) {
+            return clamp_sample_radiance(emission, sample_clamp);
+        }
+        if (settings.use_mis && hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
+            const Triangle& light = render_scene.triangles[static_cast<size_t>(hit.triangle)];
+            const float light_pmf = render_scene.light_triangle_indices.empty() ? 0.0f : 1.0f / static_cast<float>(render_scene.light_triangle_indices.size());
+            const float light_pdf = light_pdf_solid_angle(scene, light, previous_position, hit.position, light_pmf);
+            return clamp_sample_radiance(emission * mis_weight(previous_bsdf_pdf, light_pdf, settings.mis_heuristic), sample_clamp);
+        }
+        return {};
+    }
+
+    const bool stylize_here = should_apply_style(settings, *material, context);
+    const int sample_count = stylize_here ? std::clamp(settings.stylized_samples, 1, 128) : 1;
+    StylizedTraceContext child_context = context;
+    if (stylize_here) {
+        ++child_context.styled_vertices;
+    }
+
+    const Vec3 wo = -ray.direction;
+    Vec3 estimate;
+    for (int i = 0; i < sample_count; ++i) {
+        Vec3 outgoing = estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings);
+        if (bounce + 1 < settings.max_bounces) {
+            const MaterialSample sample = material->sample(hit.normal, wo, hit.uv, hit.front_face, rng);
+            if (std::isfinite(sample.pdf) && sample.pdf > 0.0f && is_finite(sample.weight) && dot(sample.weight, sample.weight) > 0.0f) {
+                const float offset_side = dot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;
+                const Ray next_ray{hit.position + hit.normal * (0.001f * offset_side), sample.direction};
+                const Vec3 incoming = trace_stylized_radiance(
+                    render_scene,
+                    scene,
+                    next_ray,
+                    rng,
+                    settings,
+                    child_context,
+                    bounce + 1,
+                    hit.position,
+                    sample.pdf,
+                    sample.delta);
+                outgoing += clamp_sample_radiance(sample.weight * incoming, sample_clamp);
+            }
+        }
+        estimate += outgoing;
+    }
+    estimate = estimate / static_cast<float>(sample_count);
+    return stylize_here ? apply_npr_style(render_scene, scene, settings, *material, hit, wo, estimate) : estimate;
+}
+
 Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rng& rng, const RenderSettings& settings) {
+    if (stylized_rendering_enabled(settings, scene)) {
+        return trace_stylized_radiance(render_scene, scene, ray, rng, settings, {}, 0, {}, 0.0f, false);
+    }
+
     Vec3 radiance;
     Vec3 throughput{1.0f};
     Vec3 previous_position;

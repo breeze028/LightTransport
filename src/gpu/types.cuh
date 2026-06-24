@@ -51,6 +51,13 @@ struct GpuTriangle {
     int light_double_sided = 0;
 };
 
+struct GpuSphere {
+    Vec3 center;
+    float radius = 0.5f;
+    int material = 0;
+    int sphere = -1;
+};
+
 struct GpuBvhNode {
     Vec3 bounds_min;
     Vec3 bounds_max;
@@ -71,6 +78,7 @@ struct GpuScene {
     Camera camera;
     int material_count = 0;
     int triangle_count = 0;
+    int sphere_count = 0;
     int bvh_node_count = 0;
     int tlas_node_count = 0;
     int mesh_instance_count = 0;
@@ -88,6 +96,7 @@ struct GpuScene {
     GpuMaterial* materials = nullptr;
     GpuTexture* textures = nullptr;
     GpuTriangle* triangles = nullptr;
+    GpuSphere* spheres = nullptr;
     int* triangle_indices = nullptr;
     int* light_indices = nullptr;
     GpuBvhNode* bvh_nodes = nullptr;
@@ -101,6 +110,7 @@ struct PackedGpuScene {
     std::vector<GpuMaterial> materials;
     std::vector<GpuTexture> textures;
     std::vector<GpuTriangle> triangles;
+    std::vector<GpuSphere> spheres;
     std::vector<int> triangle_indices;
     std::vector<int> light_indices;
     std::vector<GpuBvhNode> bvh_nodes;
@@ -119,6 +129,7 @@ struct GpuHit {
     int material = -1;
     int mesh = -1;
     int triangle = -1;
+    int sphere = -1;
     Vec3 emission;
     bool front_face = true;
 };

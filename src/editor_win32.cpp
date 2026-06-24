@@ -1,4 +1,6 @@
 #include "lt/renderer.h"
+#include "editor/editor_platform.h"
+#include "editor/editor_state.h"
 
 #include <windows.h>
 #include <commdlg.h>
@@ -24,103 +26,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg
 
 namespace {
 
-enum class ToolMode { Select, Move, Rotate, Scale };
-enum class TransformSpace { Local, World };
-enum class GizmoHandle { None, AxisX, AxisY, AxisZ, PlaneXY, PlaneYZ, PlaneZX, Uniform };
-
-struct GpuPreview {
-    ID3D11Texture2D* texture = nullptr;
-    ID3D11ShaderResourceView* srv = nullptr;
-    int width = 0;
-    int height = 0;
-};
-
-struct Editor {
-    lt::Scene scene = lt::make_default_scene();
-    lt::Framebuffer framebuffer;
-    lt::RenderSettings settings;
-    lt::CpuPathTracer cpu;
-    lt::CudaPathTracer cuda;
-    lt::IRenderer* renderer = &cpu;
-    lt::RenderDirty dirty = lt::RenderDirty::All;
-    std::string scene_path = "scenes/cornell.lt";
-    uint32_t frame_index = 0;
-    uint64_t render_generation = 1;
-    int selected_mesh = 0;
-    bool viewport_focused = false;
-    bool viewport_hovered = false;
-    bool paused = false;
-    bool gizmo_dragging = false;
-    ToolMode tool_mode = ToolMode::Select;
-    TransformSpace move_space = TransformSpace::Local;
-    ImVec2 viewport_size = {960.0f, 540.0f};
-    ImVec2 viewport_image_min = {};
-    ImVec2 viewport_image_max = {};
-    ImVec2 drag_start_mouse = {};
-    lt::Mesh drag_start_mesh = {};
-    int drag_start_mesh_index = -1;
-    GizmoHandle hovered_gizmo = GizmoHandle::None;
-    GizmoHandle active_gizmo = GizmoHandle::None;
-    ImVec2 drag_start_center_screen = {};
-    ImVec2 drag_start_axis_a_screen = {};
-    ImVec2 drag_start_axis_b_screen = {};
-    float drag_start_depth = 1.0f;
-    float drag_start_angle = 0.0f;
-    double last_sample_ms = 0.0;
-    float toolbar_width = 74.0f;
-    float properties_width = 340.0f;
-    float outliner_fraction = 0.38f;
-    bool viewport_fullscreen = false;
-};
-
-struct RenderResult {
-    uint64_t generation = 0;
-    uint32_t completed_frame = 0;
-    double elapsed_ms = 0.0;
-    lt::Framebuffer framebuffer;
-};
-
-struct SceneLoadTask {
-    uint64_t generation = 0;
-    std::string path;
-    std::chrono::steady_clock::time_point started;
-    std::future<lt::SceneLoadResult> future;
-};
-
-struct MeshBoundsCache {
-    uint64_t scene_generation = 0;
-    std::vector<lt::Vec3> local_min;
-    std::vector<lt::Vec3> local_max;
-};
-
-struct PickSceneCache {
-    uint64_t scene_generation = 0;
-    lt::RenderScene render_scene;
-};
-
-struct ViewTransform {
-    lt::Vec3 forward;
-    lt::Vec3 right;
-    lt::Vec3 up;
-    float half_width = 1.0f;
-    float half_height = 1.0f;
-};
-
-Editor g_editor;
-GpuPreview g_preview;
-HWND g_hwnd = nullptr;
-ID3D11Device* g_device = nullptr;
-ID3D11DeviceContext* g_context = nullptr;
-IDXGISwapChain* g_swap_chain = nullptr;
-ID3D11RenderTargetView* g_main_rtv = nullptr;
-std::future<RenderResult> g_render_future;
-SceneLoadTask g_load_task;
-MeshBoundsCache g_bounds_cache;
-PickSceneCache g_pick_cache;
-UINT g_swap_chain_width = 0;
-UINT g_swap_chain_height = 0;
-bool g_window_minimized = false;
-bool g_shutting_down = false;
+using namespace lt::editor;
 
 void upload_preview_texture();
 
@@ -144,104 +50,6 @@ const char* tool_mode_icon(ToolMode mode) {
     }
 }
 
-std::wstring widen(const std::string& text) {
-    const int count = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-    std::wstring out(static_cast<size_t>(std::max(1, count)), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), count);
-    if (!out.empty() && out.back() == L'\0') out.pop_back();
-    return out;
-}
-
-std::string narrow(const wchar_t* text) {
-    const int count = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(std::max(1, count)), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), count, nullptr, nullptr);
-    if (!out.empty() && out.back() == '\0') out.pop_back();
-    return out;
-}
-
-void release_preview_texture() {
-    if (g_preview.srv) g_preview.srv->Release();
-    if (g_preview.texture) g_preview.texture->Release();
-    g_preview = {};
-}
-
-void create_render_target() {
-    ID3D11Texture2D* back_buffer = nullptr;
-    g_swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
-    g_device->CreateRenderTargetView(back_buffer, nullptr, &g_main_rtv);
-    back_buffer->Release();
-    RECT client{};
-    if (g_hwnd && GetClientRect(g_hwnd, &client)) {
-        g_swap_chain_width = static_cast<UINT>(std::max<LONG>(0, client.right - client.left));
-        g_swap_chain_height = static_cast<UINT>(std::max<LONG>(0, client.bottom - client.top));
-    }
-}
-
-void cleanup_render_target() {
-    if (g_main_rtv) {
-        g_main_rtv->Release();
-        g_main_rtv = nullptr;
-    }
-}
-
-bool create_device(HWND hwnd) {
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    D3D_FEATURE_LEVEL feature_level{};
-    const D3D_FEATURE_LEVEL requested[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
-    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, requested, 2, D3D11_SDK_VERSION, &sd, &g_swap_chain, &g_device, &feature_level, &g_context) != S_OK) {
-        return false;
-    }
-    create_render_target();
-    return true;
-}
-
-void cleanup_device() {
-    release_preview_texture();
-    cleanup_render_target();
-    if (g_swap_chain) {
-        g_swap_chain->Release();
-        g_swap_chain = nullptr;
-    }
-    if (g_context) {
-        g_context->ClearState();
-        g_context->Flush();
-        g_context->Release();
-        g_context = nullptr;
-    }
-    if (g_device) {
-        g_device->Release();
-        g_device = nullptr;
-    }
-}
-
-void release_editor_memory() {
-    if (g_render_future.valid()) {
-        g_render_future.wait();
-        (void)g_render_future.get();
-    }
-    if (g_load_task.future.valid()) {
-        g_load_task.future.wait();
-        (void)g_load_task.future.get();
-    }
-    g_editor.cuda.reset();
-    g_editor.cpu.reset();
-    g_editor.renderer = &g_editor.cpu;
-    g_editor.scene = {};
-    g_editor.framebuffer = {};
-    g_editor.drag_start_mesh = {};
-    g_bounds_cache = {};
-    g_pick_cache = {};
-    g_load_task = {};
-}
-
 void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
     g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
     ++g_editor.render_generation;
@@ -251,7 +59,8 @@ void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
 }
 
 void set_renderer(bool use_cuda) {
-    lt::IRenderer* next = use_cuda && g_editor.cuda.available() ? static_cast<lt::IRenderer*>(&g_editor.cuda) : static_cast<lt::IRenderer*>(&g_editor.cpu);
+    const bool can_use_cuda = use_cuda && g_editor.cuda.available() && !lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
+    lt::IRenderer* next = can_use_cuda ? static_cast<lt::IRenderer*>(&g_editor.cuda) : static_cast<lt::IRenderer*>(&g_editor.cpu);
     if (g_editor.renderer != next) {
         g_editor.renderer = next;
         reset_accumulation(lt::RenderDirty::All);
@@ -259,11 +68,49 @@ void set_renderer(bool use_cuda) {
 }
 
 void select_mesh(int index) {
-    g_editor.selected_mesh = (index >= 0 && index < static_cast<int>(g_editor.scene.meshes.size())) ? index : -1;
+    if (index >= 0 && index < static_cast<int>(g_editor.scene.meshes.size())) {
+        g_editor.selection_kind = SelectionKind::Mesh;
+        g_editor.selected_mesh = index;
+        g_editor.selected_sphere = -1;
+    } else {
+        g_editor.selection_kind = SelectionKind::None;
+        g_editor.selected_mesh = -1;
+        g_editor.selected_sphere = -1;
+    }
+}
+
+void select_sphere(int index) {
+    if (index >= 0 && index < static_cast<int>(g_editor.scene.spheres.size())) {
+        g_editor.selection_kind = SelectionKind::Sphere;
+        g_editor.selected_sphere = index;
+        g_editor.selected_mesh = -1;
+    } else {
+        g_editor.selection_kind = SelectionKind::None;
+        g_editor.selected_mesh = -1;
+        g_editor.selected_sphere = -1;
+    }
 }
 
 bool has_selection() {
-    return g_editor.selected_mesh >= 0 && g_editor.selected_mesh < static_cast<int>(g_editor.scene.meshes.size());
+    if (g_editor.selection_kind == SelectionKind::Mesh) {
+        return g_editor.selected_mesh >= 0 && g_editor.selected_mesh < static_cast<int>(g_editor.scene.meshes.size());
+    }
+    if (g_editor.selection_kind == SelectionKind::Sphere) {
+        return g_editor.selected_sphere >= 0 && g_editor.selected_sphere < static_cast<int>(g_editor.scene.spheres.size());
+    }
+    return false;
+}
+
+bool has_mesh_selection() {
+    return g_editor.selection_kind == SelectionKind::Mesh &&
+        g_editor.selected_mesh >= 0 &&
+        g_editor.selected_mesh < static_cast<int>(g_editor.scene.meshes.size());
+}
+
+bool has_sphere_selection() {
+    return g_editor.selection_kind == SelectionKind::Sphere &&
+        g_editor.selected_sphere >= 0 &&
+        g_editor.selected_sphere < static_cast<int>(g_editor.scene.spheres.size());
 }
 
 void invalidate_mesh_bounds_cache() {
@@ -278,7 +125,11 @@ void set_scene(lt::Scene scene, const std::string& path) {
     g_editor.scene = std::move(scene);
     g_editor.scene_path = path;
     invalidate_mesh_bounds_cache();
-    select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
+    if (!g_editor.scene.meshes.empty()) {
+        select_mesh(0);
+    } else {
+        select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
+    }
     reset_accumulation(lt::RenderDirty::All);
 }
 
@@ -325,10 +176,10 @@ void poll_scene_load_result() {
     const std::string path = g_load_task.path;
     g_load_task = {};
     if (!loaded.error.empty()) {
-        if (loaded.scene.meshes.empty()) {
+        if (loaded.scene.meshes.empty() && loaded.scene.spheres.empty()) {
             MessageBoxW(g_hwnd, widen(loaded.error).c_str(), L"Scene load warning", MB_OK | MB_ICONWARNING);
         }
-        if (loaded.scene.meshes.empty()) {
+        if (loaded.scene.meshes.empty() && loaded.scene.spheres.empty()) {
             return;
         }
     }
@@ -435,35 +286,197 @@ void save_scene() {
     }
 }
 
-void add_mesh() {
-    int material = lt::find_material(g_editor.scene, "white");
-    if (material < 0) material = 0;
-    const lt::Vec3 forward = lt::normalize(g_editor.scene.camera.target - g_editor.scene.camera.position);
-    g_editor.scene.meshes.push_back(lt::make_cube_mesh("Mesh", material, g_editor.scene.camera.position + forward * 1.5f, 0.35f));
+int default_material(const char* preferred) {
+    int material = lt::find_material(g_editor.scene, preferred);
+    if (material < 0) material = lt::find_material(g_editor.scene, "white");
+    if (material >= 0) return material;
+    const bool is_light = std::string(preferred) == "light";
+    g_editor.scene.materials.push_back(lt::make_material(
+        is_light ? "light" : "white",
+        is_light ? lt::Vec3{1.0f, 0.9f, 0.72f} : lt::Vec3{0.78f, 0.78f, 0.72f},
+        lt::BrdfModel::Lambertian,
+        0.65f,
+        0.0f));
+    return static_cast<int>(g_editor.scene.materials.size()) - 1;
+}
+
+bool material_name_exists(const std::string& name, int ignore_index = -1) {
+    for (int i = 0; i < static_cast<int>(g_editor.scene.materials.size()); ++i) {
+        if (i == ignore_index) continue;
+        const std::shared_ptr<lt::Material>& material = g_editor.scene.materials[static_cast<size_t>(i)];
+        if (material && material->name == name) return true;
+    }
+    return false;
+}
+
+std::string unique_material_name(std::string base, int ignore_index = -1) {
+    if (base.empty()) {
+        base = "Material";
+    }
+    if (!material_name_exists(base, ignore_index)) {
+        return base;
+    }
+    for (int suffix = 1; suffix < 100000; ++suffix) {
+        const std::string candidate = base + "_" + std::to_string(suffix);
+        if (!material_name_exists(candidate, ignore_index)) {
+            return candidate;
+        }
+    }
+    return base + "_" + std::to_string(static_cast<int>(g_editor.scene.materials.size()));
+}
+
+void add_material() {
+    g_editor.scene.materials.push_back(lt::make_material(
+        unique_material_name("Material"),
+        {0.8f, 0.8f, 0.8f},
+        lt::BrdfModel::Lambertian,
+        0.5f,
+        0.0f));
+    reset_accumulation(lt::RenderDirty::Material);
+}
+
+bool object_name_exists(const std::string& name, SelectionKind ignore_kind = SelectionKind::None, int ignore_index = -1) {
+    for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
+        if (ignore_kind == SelectionKind::Mesh && i == ignore_index) continue;
+        if (g_editor.scene.meshes[static_cast<size_t>(i)].name == name) return true;
+    }
+    for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
+        if (ignore_kind == SelectionKind::Sphere && i == ignore_index) continue;
+        if (g_editor.scene.spheres[static_cast<size_t>(i)].name == name) return true;
+    }
+    return false;
+}
+
+std::string unique_object_name(std::string base, SelectionKind ignore_kind = SelectionKind::None, int ignore_index = -1) {
+    if (base.empty()) {
+        base = "Object";
+    }
+    if (!object_name_exists(base, ignore_kind, ignore_index)) {
+        return base;
+    }
+    for (int suffix = 1; suffix < 100000; ++suffix) {
+        const std::string candidate = base + "_" + std::to_string(suffix);
+        if (!object_name_exists(candidate, ignore_kind, ignore_index)) {
+            return candidate;
+        }
+    }
+    return base + "_" + std::to_string(static_cast<int>(g_editor.scene.meshes.size() + g_editor.scene.spheres.size()));
+}
+
+lt::Vec3 spawn_position(float distance = 1.5f) {
+    lt::Vec3 forward = lt::normalize(g_editor.scene.camera.target - g_editor.scene.camera.position);
+    if (lt::dot(forward, forward) <= 0.0f) {
+        forward = {0.0f, 0.0f, -1.0f};
+    }
+    return g_editor.scene.camera.position + forward * distance;
+}
+
+void add_cube_mesh() {
+    const int material = default_material("white");
+    g_editor.scene.meshes.push_back(lt::make_cube_mesh(unique_object_name("Cube"), material, spawn_position(), 0.35f));
     g_editor.scene.uses_builtin_default_meshes = false;
     invalidate_mesh_bounds_cache();
     select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
-    reset_accumulation(lt::RenderDirty::Geometry);
+    reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
+}
+
+void add_plane_mesh() {
+    const int material = default_material("white");
+    lt::Mesh plane = lt::make_quad_mesh(unique_object_name("Plane"), material,
+        {-0.5f, 0.0f, -0.5f},
+        {0.5f, 0.0f, -0.5f},
+        {0.5f, 0.0f, 0.5f},
+        {-0.5f, 0.0f, 0.5f});
+    plane.translation = spawn_position();
+    g_editor.scene.meshes.push_back(std::move(plane));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    invalidate_mesh_bounds_cache();
+    select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
+    reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
+}
+
+void add_uv_sphere_mesh() {
+    const int material = default_material("white");
+    g_editor.scene.meshes.push_back(lt::make_uv_sphere_mesh(unique_object_name("UV_Sphere"), material, spawn_position(), 0.35f, 32, 16));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    invalidate_mesh_bounds_cache();
+    select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
+    reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
+}
+
+void add_analytic_sphere() {
+    lt::Sphere sphere;
+    sphere.name = unique_object_name("Sphere");
+    sphere.material = default_material("white");
+    sphere.center = spawn_position();
+    sphere.radius = 0.35f;
+    g_editor.scene.spheres.push_back(std::move(sphere));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    select_sphere(static_cast<int>(g_editor.scene.spheres.size()) - 1);
+    reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
+}
+
+void add_area_light_mesh() {
+    const int material = default_material("light");
+    lt::Mesh light = lt::make_quad_mesh(unique_object_name("Area_Light"), material,
+        {-0.35f, 0.0f, -0.35f},
+        {0.35f, 0.0f, -0.35f},
+        {0.35f, 0.0f, 0.35f},
+        {-0.35f, 0.0f, 0.35f});
+    light.translation = spawn_position(1.2f);
+    light.light = {true, true, {1.0f, 0.888889f, 0.666667f}, 9.0f};
+    g_editor.scene.meshes.push_back(std::move(light));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    invalidate_mesh_bounds_cache();
+    select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
+    reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
+}
+
+void add_mesh() {
+    add_cube_mesh();
 }
 
 void duplicate_selected() {
     if (!has_selection()) return;
-    lt::Mesh copy = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
-    copy.name += "_copy";
-    copy.translation.x += std::max({copy.scale.x, copy.scale.y, copy.scale.z}) * 1.2f;
-    g_editor.scene.meshes.push_back(copy);
+    if (has_mesh_selection()) {
+        lt::Mesh copy = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
+        copy.name = unique_object_name(copy.name + "_copy");
+        copy.translation.x += std::max({copy.scale.x, copy.scale.y, copy.scale.z}) * 1.2f;
+        g_editor.scene.meshes.push_back(copy);
+        select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
+    } else if (has_sphere_selection()) {
+        lt::Sphere copy = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
+        copy.name = unique_object_name(copy.name + "_copy");
+        copy.center.x += copy.radius * 2.2f;
+        g_editor.scene.spheres.push_back(copy);
+        select_sphere(static_cast<int>(g_editor.scene.spheres.size()) - 1);
+    }
     g_editor.scene.uses_builtin_default_meshes = false;
     invalidate_mesh_bounds_cache();
-    select_mesh(static_cast<int>(g_editor.scene.meshes.size()) - 1);
     reset_accumulation(lt::RenderDirty::Geometry);
 }
 
 void delete_selected() {
     if (!has_selection()) return;
-    g_editor.scene.meshes.erase(g_editor.scene.meshes.begin() + g_editor.selected_mesh);
+    if (has_mesh_selection()) {
+        const int old_index = g_editor.selected_mesh;
+        g_editor.scene.meshes.erase(g_editor.scene.meshes.begin() + old_index);
+        if (!g_editor.scene.meshes.empty()) {
+            select_mesh(std::min(old_index, static_cast<int>(g_editor.scene.meshes.size()) - 1));
+        } else {
+            select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
+        }
+    } else if (has_sphere_selection()) {
+        const int old_index = g_editor.selected_sphere;
+        g_editor.scene.spheres.erase(g_editor.scene.spheres.begin() + old_index);
+        if (!g_editor.scene.spheres.empty()) {
+            select_sphere(std::min(old_index, static_cast<int>(g_editor.scene.spheres.size()) - 1));
+        } else {
+            select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
+        }
+    }
     g_editor.scene.uses_builtin_default_meshes = false;
     invalidate_mesh_bounds_cache();
-    select_mesh(g_editor.scene.meshes.empty() ? -1 : std::min(g_editor.selected_mesh, static_cast<int>(g_editor.scene.meshes.size()) - 1));
     reset_accumulation(lt::RenderDirty::Geometry);
 }
 
@@ -516,7 +529,7 @@ void launch_render_task() {
     lt::RenderSettings settings = g_editor.settings;
     lt::Framebuffer framebuffer = g_editor.framebuffer;
     const uint64_t generation = g_editor.render_generation;
-    lt::IRenderer* renderer = g_editor.renderer;
+    lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene) ? static_cast<lt::IRenderer*>(&g_editor.cpu) : g_editor.renderer;
     settings.frame_index = g_editor.frame_index;
     settings.dirty = g_editor.dirty;
     g_editor.dirty = lt::RenderDirty::None;
@@ -593,22 +606,49 @@ bool intersect_triangle(const lt::Triangle& tri, const lt::Ray& ray, float& t) {
     return t > 0.001f;
 }
 
-bool pick_mesh(ImVec2 mouse, int& mesh_index) {
+bool intersect_sphere_pick(const lt::RenderSphere& sphere, const lt::Ray& ray, float& t) {
+    const lt::Vec3 oc = ray.origin - sphere.center;
+    const float a = lt::dot(ray.direction, ray.direction);
+    const float half_b = lt::dot(oc, ray.direction);
+    const float c = lt::dot(oc, oc) - sphere.radius * sphere.radius;
+    const float discriminant = half_b * half_b - a * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+    const float root = std::sqrt(discriminant);
+    t = (-half_b - root) / a;
+    if (t <= 0.001f) {
+        t = (-half_b + root) / a;
+    }
+    return t > 0.001f;
+}
+
+bool pick_object(ImVec2 mouse, SelectionKind& kind, int& object_index) {
     const lt::Ray ray = make_view_ray_from_screen(mouse);
     if (g_pick_cache.scene_generation != g_editor.render_generation) {
         g_pick_cache.render_scene = lt::build_render_scene(g_editor.scene);
         g_pick_cache.scene_generation = g_editor.render_generation;
     }
     float best_t = lt::kInfinity;
-    mesh_index = -1;
+    kind = SelectionKind::None;
+    object_index = -1;
     for (const lt::Triangle& tri : g_pick_cache.render_scene.triangles) {
         float t = 0.0f;
         if (intersect_triangle(tri, ray, t) && t < best_t) {
             best_t = t;
-            mesh_index = tri.mesh;
+            kind = SelectionKind::Mesh;
+            object_index = tri.mesh;
         }
     }
-    return mesh_index >= 0;
+    for (const lt::RenderSphere& sphere : g_pick_cache.render_scene.spheres) {
+        float t = 0.0f;
+        if (intersect_sphere_pick(sphere, ray, t) && t < best_t) {
+            best_t = t;
+            kind = SelectionKind::Sphere;
+            object_index = sphere.sphere;
+        }
+    }
+    return kind != SelectionKind::None && object_index >= 0;
 }
 
 void mesh_center_radius(const lt::Mesh& mesh, lt::Vec3& center, float& radius) {
@@ -723,6 +763,19 @@ void handle_plane_axes(const lt::Mesh& mesh, GizmoHandle handle, lt::Vec3& a, lt
     }
 }
 
+void handle_plane_axes(GizmoHandle handle, lt::Vec3& a, lt::Vec3& b) {
+    if (handle == GizmoHandle::PlaneXY) {
+        a = {1.0f, 0.0f, 0.0f};
+        b = {0.0f, 1.0f, 0.0f};
+    } else if (handle == GizmoHandle::PlaneYZ) {
+        a = {0.0f, 1.0f, 0.0f};
+        b = {0.0f, 0.0f, 1.0f};
+    } else {
+        a = {0.0f, 0.0f, 1.0f};
+        b = {1.0f, 0.0f, 0.0f};
+    }
+}
+
 float distance_to_segment(ImVec2 p, ImVec2 a, ImVec2 b) {
     const ImVec2 ab{b.x - a.x, b.y - a.y};
     const ImVec2 ap{p.x - a.x, p.y - a.y};
@@ -752,15 +805,12 @@ bool point_in_triangle(ImVec2 p, ImVec2 a, ImVec2 b, ImVec2 c) {
     return !(has_neg && has_pos);
 }
 
-GizmoHandle pick_move_gizmo(const lt::Mesh& mesh, lt::Vec3 center3, ImVec2 mouse, bool allow_uniform) {
+GizmoHandle pick_move_gizmo_axes(lt::Vec3 center3, lt::Vec3 ax, lt::Vec3 ay, lt::Vec3 az, ImVec2 mouse, bool allow_uniform) {
     ImVec2 c{}, x{}, y{}, z{}, xy{}, yz{}, zx{};
     if (!project_point(center3, c)) return GizmoHandle::None;
     if (allow_uniform && distance(mouse, c) <= 10.0f) {
         return GizmoHandle::Uniform;
     }
-    const lt::Vec3 ax = transform_axis(mesh, {1.0f, 0.0f, 0.0f});
-    const lt::Vec3 ay = transform_axis(mesh, {0.0f, 1.0f, 0.0f});
-    const lt::Vec3 az = transform_axis(mesh, {0.0f, 0.0f, 1.0f});
     project_point(center3 + ax * 0.55f, x);
     project_point(center3 + ay * 0.55f, y);
     project_point(center3 + az * 0.55f, z);
@@ -780,6 +830,26 @@ GizmoHandle pick_move_gizmo(const lt::Mesh& mesh, lt::Vec3 center3, ImVec2 mouse
     if (point_in_triangle(mouse, c, y, yz) || point_in_triangle(mouse, c, z, yz)) return GizmoHandle::PlaneYZ;
     if (point_in_triangle(mouse, c, z, zx) || point_in_triangle(mouse, c, x, zx)) return GizmoHandle::PlaneZX;
     return result;
+}
+
+GizmoHandle pick_move_gizmo(const lt::Mesh& mesh, lt::Vec3 center3, ImVec2 mouse, bool allow_uniform) {
+    return pick_move_gizmo_axes(
+        center3,
+        transform_axis(mesh, {1.0f, 0.0f, 0.0f}),
+        transform_axis(mesh, {0.0f, 1.0f, 0.0f}),
+        transform_axis(mesh, {0.0f, 0.0f, 1.0f}),
+        mouse,
+        allow_uniform);
+}
+
+GizmoHandle pick_sphere_move_gizmo(lt::Vec3 center3, ImVec2 mouse) {
+    return pick_move_gizmo_axes(
+        center3,
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        mouse,
+        false);
 }
 
 GizmoHandle pick_rotate_gizmo(const lt::Mesh& mesh, lt::Vec3 center3, ImVec2 mouse) {
@@ -865,9 +935,111 @@ void setup_drag_projection(const lt::Mesh& mesh, lt::Vec3 center3, GizmoHandle h
     g_editor.drag_start_angle = ellipse_angle(g_editor.drag_start_mouse, g_editor.drag_start_center_screen, axis_a, axis_b);
 }
 
-void handle_gizmo_drag() {
-    if (!has_selection()) {
+void setup_sphere_drag_projection(lt::Vec3 center3, GizmoHandle handle) {
+    project_point(center3, g_editor.drag_start_center_screen, &g_editor.drag_start_depth);
+    if (handle == GizmoHandle::AxisX || handle == GizmoHandle::AxisY || handle == GizmoHandle::AxisZ) {
+        project_point(center3 + handle_axis(handle), g_editor.drag_start_axis_a_screen);
+        g_editor.drag_start_axis_b_screen = g_editor.drag_start_center_screen;
+        return;
+    }
+
+    lt::Vec3 a{}, b{};
+    handle_plane_axes(handle, a, b);
+    project_point(center3 + a, g_editor.drag_start_axis_a_screen);
+    project_point(center3 + b, g_editor.drag_start_axis_b_screen);
+}
+
+void handle_sphere_gizmo_drag() {
+    if (g_editor.tool_mode != ToolMode::Move) {
         g_editor.hovered_gizmo = GizmoHandle::None;
+        if (g_editor.drag_start_sphere_index >= 0) {
+            g_editor.gizmo_dragging = false;
+            g_editor.active_gizmo = GizmoHandle::None;
+            g_editor.drag_start_sphere_index = -1;
+        }
+        return;
+    }
+
+    lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
+    ImVec2 center{};
+    float depth = 1.0f;
+    if (!project_point(sphere.center, center, &depth)) {
+        g_editor.hovered_gizmo = GizmoHandle::None;
+        return;
+    }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const GizmoHandle picked = pick_sphere_move_gizmo(sphere.center, mouse);
+    g_editor.hovered_gizmo = picked;
+    if (g_editor.viewport_hovered && picked != GizmoHandle::None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        g_editor.gizmo_dragging = true;
+        g_editor.drag_start_mouse = mouse;
+        g_editor.drag_start_mesh_index = -1;
+        g_editor.drag_start_sphere = sphere;
+        g_editor.drag_start_sphere_index = g_editor.selected_sphere;
+        g_editor.active_gizmo = picked;
+        setup_sphere_drag_projection(sphere.center, picked);
+    }
+    if (!g_editor.gizmo_dragging) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+        g_editor.selection_kind != SelectionKind::Sphere ||
+        g_editor.drag_start_sphere_index != g_editor.selected_sphere) {
+        g_editor.gizmo_dragging = false;
+        g_editor.active_gizmo = GizmoHandle::None;
+        g_editor.drag_start_sphere_index = -1;
+        return;
+    }
+
+    const ImVec2 delta{mouse.x - g_editor.drag_start_mouse.x, mouse.y - g_editor.drag_start_mouse.y};
+    const ViewTransform view = make_view_transform(true);
+    const float world_per_pixel = g_editor.drag_start_depth * view.half_height * 2.0f / std::max(1.0f, g_editor.viewport_size.y);
+    if (g_editor.active_gizmo == GizmoHandle::AxisX || g_editor.active_gizmo == GizmoHandle::AxisY || g_editor.active_gizmo == GizmoHandle::AxisZ) {
+        const lt::Vec3 axis = handle_axis(g_editor.active_gizmo);
+        const ImVec2 screen_axis{
+            g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const float len = std::sqrt(screen_axis.x * screen_axis.x + screen_axis.y * screen_axis.y);
+        const float amount = len > 0.0f ? (delta.x * screen_axis.x + delta.y * screen_axis.y) / len * world_per_pixel : 0.0f;
+        sphere.center = g_editor.drag_start_sphere.center + axis * amount;
+    } else {
+        lt::Vec3 a{}, b{};
+        handle_plane_axes(g_editor.active_gizmo, a, b);
+        const ImVec2 sa{
+            g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const ImVec2 sb{
+            g_editor.drag_start_axis_b_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_b_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const float det = sa.x * sb.y - sa.y * sb.x;
+        if (std::fabs(det) > 80.0f) {
+            const float amount_a = (delta.x * sb.y - delta.y * sb.x) / det;
+            const float amount_b = (sa.x * delta.y - sa.y * delta.x) / det;
+            sphere.center = g_editor.drag_start_sphere.center + a * amount_a + b * amount_b;
+        } else {
+            const ImVec2 combined{sa.x + sb.x, sa.y + sb.y};
+            const float len = std::sqrt(combined.x * combined.x + combined.y * combined.y);
+            const float amount = len > 1.0f ? (delta.x * combined.x + delta.y * combined.y) / len * world_per_pixel : 0.0f;
+            sphere.center = g_editor.drag_start_sphere.center + lt::normalize(a + b) * amount;
+        }
+    }
+    g_editor.scene.uses_builtin_default_meshes = false;
+    reset_accumulation(lt::RenderDirty::Geometry);
+}
+
+void handle_gizmo_drag() {
+    if (has_sphere_selection()) {
+        handle_sphere_gizmo_drag();
+        return;
+    }
+    if (!has_mesh_selection()) {
+        g_editor.hovered_gizmo = GizmoHandle::None;
+        g_editor.gizmo_dragging = false;
+        g_editor.active_gizmo = GizmoHandle::None;
+        g_editor.drag_start_mesh_index = -1;
+        g_editor.drag_start_sphere_index = -1;
         return;
     }
     lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
@@ -894,6 +1066,7 @@ void handle_gizmo_drag() {
         g_editor.drag_start_mouse = mouse;
         g_editor.drag_start_mesh = mesh;
         g_editor.drag_start_mesh_index = g_editor.selected_mesh;
+        g_editor.drag_start_sphere_index = -1;
         g_editor.active_gizmo = picked;
         setup_drag_projection(mesh, center3, picked);
     }
@@ -1080,7 +1253,7 @@ void draw_polyline_ellipse(ImDrawList* draw_list, ImVec2 center, ImVec2 axis_a, 
 }
 
 void draw_mesh_outline(ImDrawList* draw_list) {
-    if (!has_selection()) return;
+    if (!has_mesh_selection()) return;
     const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
     constexpr ImU32 orange = IM_COL32(255, 150, 35, 255);
     for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
@@ -1129,78 +1302,127 @@ void draw_mesh_bounds_outline(ImDrawList* draw_list, int mesh_index, ImU32 color
     }
 }
 
+void draw_sphere_outline(ImDrawList* draw_list, int sphere_index, ImU32 color, float thickness) {
+    if (sphere_index < 0 || sphere_index >= static_cast<int>(g_editor.scene.spheres.size())) return;
+    const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(sphere_index)];
+    ImVec2 center{};
+    float depth = 1.0f;
+    if (!project_point(sphere.center, center, &depth)) return;
+    const ViewTransform view = make_view_transform(true);
+    const int segments = 72;
+    ImVec2 previous{};
+    bool has_previous = false;
+    for (int i = 0; i <= segments; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(segments) * 2.0f * lt::kPi;
+        const lt::Vec3 p = sphere.center + view.right * (std::cos(t) * sphere.radius) + view.up * (std::sin(t) * sphere.radius);
+        ImVec2 projected{};
+        if (project_point(p, projected)) {
+            if (has_previous) {
+                draw_list->AddLine(previous, projected, color, thickness);
+            }
+            previous = projected;
+            has_previous = true;
+        } else {
+            has_previous = false;
+        }
+    }
+}
+
+void draw_move_gizmo_handles(ImDrawList* draw_list, lt::Vec3 center3, lt::Vec3 ax, lt::Vec3 ay, lt::Vec3 az, bool draw_uniform) {
+    ImVec2 center{};
+    if (!project_point(center3, center)) return;
+    ImVec2 px{}, py{}, pz{}, pxy{}, pyz{}, pzx{};
+    const bool okx = project_point(center3 + ax * 0.55f, px);
+    const bool oky = project_point(center3 + ay * 0.55f, py);
+    const bool okz = project_point(center3 + az * 0.55f, pz);
+    const bool okxy = project_point(center3 + (ax + ay) * 0.28f, pxy);
+    const bool okyz = project_point(center3 + (ay + az) * 0.28f, pyz);
+    const bool okzx = project_point(center3 + (az + ax) * 0.28f, pzx);
+    if (okx && oky && okxy) {
+        const ImU32 fill = handle_is_hot(GizmoHandle::PlaneXY) ? IM_COL32(255, 235, 80, 115) : IM_COL32(235, 200, 70, 70);
+        const ImU32 edge = hot_color(GizmoHandle::PlaneXY, IM_COL32(235, 200, 70, 210));
+        const ImVec2 a{center.x + (px.x - center.x) * 0.28f + (py.x - center.x) * 0.28f, center.y + (px.y - center.y) * 0.28f + (py.y - center.y) * 0.28f};
+        const ImVec2 b{center.x + (px.x - center.x) * 0.48f + (py.x - center.x) * 0.28f, center.y + (px.y - center.y) * 0.48f + (py.y - center.y) * 0.28f};
+        const ImVec2 c{center.x + (px.x - center.x) * 0.48f + (py.x - center.x) * 0.48f, center.y + (px.y - center.y) * 0.48f + (py.y - center.y) * 0.48f};
+        const ImVec2 d{center.x + (px.x - center.x) * 0.28f + (py.x - center.x) * 0.48f, center.y + (px.y - center.y) * 0.28f + (py.y - center.y) * 0.48f};
+        draw_list->AddQuadFilled(a, b, c, d, fill);
+        draw_list->AddQuad(a, b, c, d, edge, hot_thickness(GizmoHandle::PlaneXY, 1.5f));
+    }
+    if (oky && okz && okyz) {
+        const ImU32 fill = handle_is_hot(GizmoHandle::PlaneYZ) ? IM_COL32(255, 235, 80, 105) : IM_COL32(70, 180, 235, 65);
+        const ImU32 edge = hot_color(GizmoHandle::PlaneYZ, IM_COL32(70, 180, 235, 200));
+        const ImVec2 a{center.x + (py.x - center.x) * 0.28f + (pz.x - center.x) * 0.28f, center.y + (py.y - center.y) * 0.28f + (pz.y - center.y) * 0.28f};
+        const ImVec2 b{center.x + (py.x - center.x) * 0.48f + (pz.x - center.x) * 0.28f, center.y + (py.y - center.y) * 0.48f + (pz.y - center.y) * 0.28f};
+        const ImVec2 c{center.x + (py.x - center.x) * 0.48f + (pz.x - center.x) * 0.48f, center.y + (py.y - center.y) * 0.48f + (pz.y - center.y) * 0.48f};
+        const ImVec2 d{center.x + (py.x - center.x) * 0.28f + (pz.x - center.x) * 0.48f, center.y + (py.y - center.y) * 0.28f + (pz.y - center.y) * 0.48f};
+        draw_list->AddQuadFilled(a, b, c, d, fill);
+        draw_list->AddQuad(a, b, c, d, edge, hot_thickness(GizmoHandle::PlaneYZ, 1.5f));
+    }
+    if (okz && okx && okzx) {
+        const ImU32 fill = handle_is_hot(GizmoHandle::PlaneZX) ? IM_COL32(255, 235, 80, 105) : IM_COL32(235, 90, 180, 65);
+        const ImU32 edge = hot_color(GizmoHandle::PlaneZX, IM_COL32(235, 90, 180, 200));
+        const ImVec2 a{center.x + (pz.x - center.x) * 0.28f + (px.x - center.x) * 0.28f, center.y + (pz.y - center.y) * 0.28f + (px.y - center.y) * 0.28f};
+        const ImVec2 b{center.x + (pz.x - center.x) * 0.48f + (px.x - center.x) * 0.28f, center.y + (pz.y - center.y) * 0.48f + (px.y - center.y) * 0.28f};
+        const ImVec2 c{center.x + (pz.x - center.x) * 0.48f + (px.x - center.x) * 0.48f, center.y + (pz.y - center.y) * 0.48f + (px.y - center.y) * 0.48f};
+        const ImVec2 d{center.x + (pz.x - center.x) * 0.28f + (px.x - center.x) * 0.48f, center.y + (pz.y - center.y) * 0.28f + (px.y - center.y) * 0.48f};
+        draw_list->AddQuadFilled(a, b, c, d, fill);
+        draw_list->AddQuad(a, b, c, d, edge, hot_thickness(GizmoHandle::PlaneZX, 1.5f));
+    }
+    if (okx) draw_arrow_2d_handle(draw_list, center, px, IM_COL32(235, 80, 80, 255), GizmoHandle::AxisX);
+    if (oky) draw_arrow_2d_handle(draw_list, center, py, IM_COL32(80, 210, 105, 255), GizmoHandle::AxisY);
+    if (okz) draw_arrow_2d_handle(draw_list, center, pz, IM_COL32(90, 140, 255, 255), GizmoHandle::AxisZ);
+    if (okx) draw_axis_label(draw_list, {px.x + 18.0f, px.y}, "X", IM_COL32(245, 92, 88, 255));
+    if (oky) draw_axis_label(draw_list, {py.x + 18.0f, py.y}, "Y", IM_COL32(100, 230, 130, 255));
+    if (okz) draw_axis_label(draw_list, {pz.x + 18.0f, pz.y}, "Z", IM_COL32(116, 160, 255, 255));
+    if (draw_uniform) {
+        draw_gizmo_center(draw_list, center);
+    }
+}
+
 void draw_scene_reference_outlines(ImDrawList* draw_list) {
     const ImU32 mesh_color = IM_COL32(150, 170, 190, 130);
     const ImU32 selected_color = IM_COL32(255, 150, 35, 230);
     for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
-        const bool selected = i == g_editor.selected_mesh;
+        const bool selected = g_editor.selection_kind == SelectionKind::Mesh && i == g_editor.selected_mesh;
         draw_mesh_bounds_outline(draw_list, i, selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
+    }
+    for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
+        const bool selected = g_editor.selection_kind == SelectionKind::Sphere && i == g_editor.selected_sphere;
+        draw_sphere_outline(draw_list, i, selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
     }
 }
 
 void draw_gizmo_overlay() {
     if (!has_selection()) return;
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    if (has_sphere_selection()) {
+        const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
+        draw_sphere_outline(draw_list, g_editor.selected_sphere, IM_COL32(255, 150, 35, 255), 2.0f);
+        if (g_editor.tool_mode == ToolMode::Move) {
+            draw_move_gizmo_handles(
+                draw_list,
+                sphere.center,
+                {1.0f, 0.0f, 0.0f},
+                {0.0f, 1.0f, 0.0f},
+                {0.0f, 0.0f, 1.0f},
+                false);
+        }
+        return;
+    }
     lt::Vec3 center3{};
     float radius3 = 1.0f;
     mesh_center_radius(g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)], center3, radius3);
     ImVec2 center{};
     if (!project_point(center3, center)) return;
-    const float radius = std::max(18.0f, radius3 * 90.0f);
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (g_editor.tool_mode == ToolMode::Select) {
         draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, IM_COL32(255, 150, 35, 255), 2.0f);
     }
     if (g_editor.tool_mode == ToolMode::Move || g_editor.tool_mode == ToolMode::Scale) {
-        ImVec2 px{}, py{}, pz{}, pxy{}, pyz{}, pzx{};
         const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
         const lt::Vec3 ax = transform_axis(mesh, {1.0f, 0.0f, 0.0f});
         const lt::Vec3 ay = transform_axis(mesh, {0.0f, 1.0f, 0.0f});
         const lt::Vec3 az = transform_axis(mesh, {0.0f, 0.0f, 1.0f});
-        const bool okx = project_point(center3 + ax * 0.55f, px);
-        const bool oky = project_point(center3 + ay * 0.55f, py);
-        const bool okz = project_point(center3 + az * 0.55f, pz);
-        const bool okxy = project_point(center3 + (ax + ay) * 0.28f, pxy);
-        const bool okyz = project_point(center3 + (ay + az) * 0.28f, pyz);
-        const bool okzx = project_point(center3 + (az + ax) * 0.28f, pzx);
-        if (okx && oky && okxy) {
-            const ImU32 fill = handle_is_hot(GizmoHandle::PlaneXY) ? IM_COL32(255, 235, 80, 115) : IM_COL32(235, 200, 70, 70);
-            const ImU32 edge = hot_color(GizmoHandle::PlaneXY, IM_COL32(235, 200, 70, 210));
-            const ImVec2 a{center.x + (px.x - center.x) * 0.28f + (py.x - center.x) * 0.28f, center.y + (px.y - center.y) * 0.28f + (py.y - center.y) * 0.28f};
-            const ImVec2 b{center.x + (px.x - center.x) * 0.48f + (py.x - center.x) * 0.28f, center.y + (px.y - center.y) * 0.48f + (py.y - center.y) * 0.28f};
-            const ImVec2 c{center.x + (px.x - center.x) * 0.48f + (py.x - center.x) * 0.48f, center.y + (px.y - center.y) * 0.48f + (py.y - center.y) * 0.48f};
-            const ImVec2 d{center.x + (px.x - center.x) * 0.28f + (py.x - center.x) * 0.48f, center.y + (px.y - center.y) * 0.28f + (py.y - center.y) * 0.48f};
-            draw_list->AddQuadFilled(a, b, c, d, fill);
-            draw_list->AddQuad(a, b, c, d, edge, hot_thickness(GizmoHandle::PlaneXY, 1.5f));
-        }
-        if (oky && okz && okyz) {
-            const ImU32 fill = handle_is_hot(GizmoHandle::PlaneYZ) ? IM_COL32(255, 235, 80, 105) : IM_COL32(70, 180, 235, 65);
-            const ImU32 edge = hot_color(GizmoHandle::PlaneYZ, IM_COL32(70, 180, 235, 200));
-            const ImVec2 a{center.x + (py.x - center.x) * 0.28f + (pz.x - center.x) * 0.28f, center.y + (py.y - center.y) * 0.28f + (pz.y - center.y) * 0.28f};
-            const ImVec2 b{center.x + (py.x - center.x) * 0.48f + (pz.x - center.x) * 0.28f, center.y + (py.y - center.y) * 0.48f + (pz.y - center.y) * 0.28f};
-            const ImVec2 c{center.x + (py.x - center.x) * 0.48f + (pz.x - center.x) * 0.48f, center.y + (py.y - center.y) * 0.48f + (pz.y - center.y) * 0.48f};
-            const ImVec2 d{center.x + (py.x - center.x) * 0.28f + (pz.x - center.x) * 0.48f, center.y + (py.y - center.y) * 0.28f + (pz.y - center.y) * 0.48f};
-            draw_list->AddQuadFilled(a, b, c, d, fill);
-            draw_list->AddQuad(a, b, c, d, edge, hot_thickness(GizmoHandle::PlaneYZ, 1.5f));
-        }
-        if (okz && okx && okzx) {
-            const ImU32 fill = handle_is_hot(GizmoHandle::PlaneZX) ? IM_COL32(255, 235, 80, 105) : IM_COL32(235, 90, 180, 65);
-            const ImU32 edge = hot_color(GizmoHandle::PlaneZX, IM_COL32(235, 90, 180, 200));
-            const ImVec2 a{center.x + (pz.x - center.x) * 0.28f + (px.x - center.x) * 0.28f, center.y + (pz.y - center.y) * 0.28f + (px.y - center.y) * 0.28f};
-            const ImVec2 b{center.x + (pz.x - center.x) * 0.48f + (px.x - center.x) * 0.28f, center.y + (pz.y - center.y) * 0.48f + (px.y - center.y) * 0.28f};
-            const ImVec2 c{center.x + (pz.x - center.x) * 0.48f + (px.x - center.x) * 0.48f, center.y + (pz.y - center.y) * 0.48f + (px.y - center.y) * 0.48f};
-            const ImVec2 d{center.x + (pz.x - center.x) * 0.28f + (px.x - center.x) * 0.48f, center.y + (pz.y - center.y) * 0.28f + (px.y - center.y) * 0.48f};
-            draw_list->AddQuadFilled(a, b, c, d, fill);
-            draw_list->AddQuad(a, b, c, d, edge, hot_thickness(GizmoHandle::PlaneZX, 1.5f));
-        }
-        if (okx) draw_arrow_2d_handle(draw_list, center, px, IM_COL32(235, 80, 80, 255), GizmoHandle::AxisX);
-        if (oky) draw_arrow_2d_handle(draw_list, center, py, IM_COL32(80, 210, 105, 255), GizmoHandle::AxisY);
-        if (okz) draw_arrow_2d_handle(draw_list, center, pz, IM_COL32(90, 140, 255, 255), GizmoHandle::AxisZ);
-        if (okx) draw_axis_label(draw_list, {px.x + 18.0f, px.y}, "X", IM_COL32(245, 92, 88, 255));
-        if (oky) draw_axis_label(draw_list, {py.x + 18.0f, py.y}, "Y", IM_COL32(100, 230, 130, 255));
-        if (okz) draw_axis_label(draw_list, {pz.x + 18.0f, pz.y}, "Z", IM_COL32(116, 160, 255, 255));
-        if (g_editor.tool_mode == ToolMode::Scale) {
-            draw_gizmo_center(draw_list, center);
-        }
+        draw_move_gizmo_handles(draw_list, center3, ax, ay, az, g_editor.tool_mode == ToolMode::Scale);
     } else if (g_editor.tool_mode == ToolMode::Rotate) {
         const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
         ImVec2 px{}, py{}, pz{};
@@ -1278,6 +1500,111 @@ bool color_edit(const char* label, lt::Vec3& value, lt::RenderDirty dirty = lt::
     return false;
 }
 
+bool color_edit_hdr(const char* label, lt::Vec3& value, lt::RenderDirty dirty = lt::RenderDirty::Render) {
+    float data[3] = {value.x, value.y, value.z};
+    if (ImGui::ColorEdit3(label, data, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR)) {
+        value = {std::max(0.0f, data[0]), std::max(0.0f, data[1]), std::max(0.0f, data[2])};
+        reset_accumulation(dirty);
+        return true;
+    }
+    return false;
+}
+
+void mark_npr_dirty() {
+    if (lt::scene_has_npr_styles(g_editor.scene)) {
+        set_renderer(false);
+    }
+    reset_accumulation(lt::RenderDirty::Material);
+}
+
+void draw_npr_controls(lt::Material& material) {
+    ImGui::SeparatorText("NPR");
+    const char* npr_styles[] = {"None", "Color Map", "X-Toon", "Cross Hatching"};
+    int npr_style = static_cast<int>(material.npr.style);
+    if (ImGui::Combo("NPR Style", &npr_style, npr_styles, IM_ARRAYSIZE(npr_styles))) {
+        material.npr.style = static_cast<lt::NprStyle>(npr_style);
+        mark_npr_dirty();
+    }
+
+    if (material.npr.style == lt::NprStyle::ColorMap) {
+        float range[2] = {material.npr.value_min, material.npr.value_max};
+        if (ImGui::DragFloat2("Brightness Range", range, 0.01f, -100.0f, 100.0f, "%.2f")) {
+            material.npr.value_min = range[0];
+            material.npr.value_max = std::max(range[1], range[0] + 1.0e-4f);
+            mark_npr_dirty();
+        }
+    } else if (material.npr.style == lt::NprStyle::XToon) {
+        const char* detail_modes[] = {"Constant", "Depth", "Near Silhouette", "Highlight"};
+        int detail_mode = static_cast<int>(material.npr.xtoon_detail_mode);
+        if (ImGui::Combo("Detail Mode", &detail_mode, detail_modes, IM_ARRAYSIZE(detail_modes))) {
+            material.npr.xtoon_detail_mode = static_cast<lt::XToonDetailMode>(detail_mode);
+            mark_npr_dirty();
+        }
+        if (ImGui::DragInt("Tone Steps", &material.npr.xtoon_steps, 1.0f, 1, 8)) {
+            material.npr.xtoon_steps = std::clamp(material.npr.xtoon_steps, 1, 8);
+            mark_npr_dirty();
+        }
+        color_edit_hdr("Shadow", material.npr.xtoon_shadow, lt::RenderDirty::Material);
+        color_edit_hdr("Mid", material.npr.xtoon_mid, lt::RenderDirty::Material);
+        color_edit_hdr("Lit", material.npr.xtoon_lit, lt::RenderDirty::Material);
+        color_edit_hdr("Accent", material.npr.xtoon_accent, lt::RenderDirty::Material);
+        if (ImGui::DragFloat("Detail Strength", &material.npr.xtoon_detail_strength, 0.01f, 0.0f, 1.0f, "%.2f")) {
+            material.npr.xtoon_detail_strength = std::clamp(material.npr.xtoon_detail_strength, 0.0f, 1.0f);
+            mark_npr_dirty();
+        }
+        if (ImGui::DragFloat("Detail Threshold", &material.npr.xtoon_detail_threshold, 0.01f, 0.0f, 1.0f, "%.2f")) {
+            material.npr.xtoon_detail_threshold = std::clamp(material.npr.xtoon_detail_threshold, 0.0f, 1.0f);
+            mark_npr_dirty();
+        }
+        if (ImGui::DragFloat("Detail Power", &material.npr.xtoon_detail_power, 1.0f, 1.0f, 256.0f, "%.0f")) {
+            material.npr.xtoon_detail_power = std::clamp(material.npr.xtoon_detail_power, 1.0f, 256.0f);
+            mark_npr_dirty();
+        }
+        if (material.npr.xtoon_detail_mode == lt::XToonDetailMode::Depth) {
+            if (ImGui::DragFloat("Depth Near", &material.npr.xtoon_depth_near, 0.05f, 0.001f, 1000.0f, "%.3f")) {
+                material.npr.xtoon_depth_near = std::max(0.001f, material.npr.xtoon_depth_near);
+                material.npr.xtoon_depth_far = std::max(material.npr.xtoon_depth_far, material.npr.xtoon_depth_near + 0.001f);
+                mark_npr_dirty();
+            }
+            if (ImGui::DragFloat("Depth Far", &material.npr.xtoon_depth_far, 0.05f, 0.001f, 1000.0f, "%.3f")) {
+                material.npr.xtoon_depth_far = std::max(material.npr.xtoon_depth_far, material.npr.xtoon_depth_near + 0.001f);
+                mark_npr_dirty();
+            }
+        }
+    } else if (material.npr.style == lt::NprStyle::CrossHatching) {
+        if (ImGui::DragInt("Hatch Sets", &material.npr.hatch_sets, 1.0f, 1, 8)) {
+            material.npr.hatch_sets = std::clamp(material.npr.hatch_sets, 1, 8);
+            mark_npr_dirty();
+        }
+        if (ImGui::DragFloat("Spacing", &material.npr.hatch_spacing, 0.002f, 0.001f, 10.0f, "%.4f")) {
+            material.npr.hatch_spacing = std::max(0.001f, material.npr.hatch_spacing);
+            material.npr.hatch_width = std::min(material.npr.hatch_width, material.npr.hatch_spacing);
+            mark_npr_dirty();
+        }
+        if (ImGui::DragFloat("Line Width", &material.npr.hatch_width, 0.001f, 0.0001f, 10.0f, "%.4f")) {
+            material.npr.hatch_width = std::clamp(material.npr.hatch_width, 0.0001f, material.npr.hatch_spacing);
+            mark_npr_dirty();
+        }
+        if (ImGui::SliderAngle("Angle", &material.npr.hatch_angle, -180.0f, 180.0f)) {
+            mark_npr_dirty();
+        }
+        float range[2] = {material.npr.hatch_value_min, material.npr.hatch_value_max};
+        if (ImGui::DragFloat2("Brightness Range", range, 0.01f, -100.0f, 100.0f, "%.2f")) {
+            material.npr.hatch_value_min = range[0];
+            material.npr.hatch_value_max = std::max(range[1], range[0] + 1.0e-4f);
+            mark_npr_dirty();
+        }
+        color_edit_hdr("Ink", material.npr.hatch_ink, lt::RenderDirty::Material);
+        color_edit_hdr("Paper", material.npr.hatch_paper, lt::RenderDirty::Material);
+        if (ImGui::Checkbox("Passthrough", &material.npr.hatch_passthrough)) {
+            mark_npr_dirty();
+        }
+        if (ImGui::Checkbox("Shadow Only", &material.npr.hatch_shadow_only)) {
+            mark_npr_dirty();
+        }
+    }
+}
+
 void apply_blender_style() {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
@@ -1350,7 +1677,15 @@ float draw_top_bar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Object")) {
-        if (ImGui::MenuItem("Add Mesh", "Shift+A")) add_mesh();
+        if (ImGui::BeginMenu("Add Mesh")) {
+            if (ImGui::MenuItem("Cube", "Shift+A")) add_cube_mesh();
+            if (ImGui::MenuItem("Plane")) add_plane_mesh();
+            if (ImGui::MenuItem("UV Sphere")) add_uv_sphere_mesh();
+            if (ImGui::MenuItem("Analytic Sphere")) add_analytic_sphere();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Area Light")) add_area_light_mesh();
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, has_selection())) duplicate_selected();
         if (ImGui::MenuItem("Delete", "Del", false, has_selection())) delete_selected();
         ImGui::EndMenu();
@@ -1361,9 +1696,10 @@ float draw_top_bar() {
         ImGui::EndMenu();
     }
     ImGui::Separator();
+    const lt::IRenderer* effective_renderer = lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene) ? static_cast<const lt::IRenderer*>(&g_editor.cpu) : g_editor.renderer;
     ImGui::Text("%s | %s | samples %u | %.2f ms | %s",
                 tool_mode_name(g_editor.tool_mode),
-                g_editor.renderer->name(),
+                effective_renderer->name(),
                 g_editor.frame_index,
                 g_editor.last_sample_ms,
                 g_editor.scene_path.c_str());
@@ -1394,7 +1730,19 @@ void draw_outliner() {
     ImGui::Begin("Scene Collection", nullptr, ImGuiWindowFlags_NoCollapse);
     if (ImGui::TreeNodeEx("Meshes", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
-            if (ImGui::Selectable(g_editor.scene.meshes[static_cast<size_t>(i)].name.c_str(), g_editor.selected_mesh == i)) select_mesh(i);
+            const bool selected = g_editor.selection_kind == SelectionKind::Mesh && g_editor.selected_mesh == i;
+            ImGui::PushID(i);
+            if (ImGui::Selectable(g_editor.scene.meshes[static_cast<size_t>(i)].name.c_str(), selected)) select_mesh(i);
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+    if (ImGui::TreeNodeEx("Spheres", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
+            const bool selected = g_editor.selection_kind == SelectionKind::Sphere && g_editor.selected_sphere == i;
+            ImGui::PushID(i);
+            if (ImGui::Selectable(g_editor.scene.spheres[static_cast<size_t>(i)].name.c_str(), selected)) select_sphere(i);
+            ImGui::PopID();
         }
         ImGui::TreePop();
     }
@@ -1405,11 +1753,21 @@ void draw_properties() {
     ImGui::Begin("Properties", nullptr, ImGuiWindowFlags_NoCollapse);
     if (ImGui::BeginTabBar("PropertiesTabs")) {
         if (ImGui::BeginTabItem("Object")) {
-            if (has_selection()) {
+            if (has_mesh_selection()) {
                 lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
                 char name[128] = {};
                 std::strncpy(name, mesh.name.c_str(), sizeof(name) - 1);
-                if (ImGui::InputText("Name", name, sizeof(name))) mesh.name = name;
+                if (ImGui::InputText("Name", name, sizeof(name))) {
+                    mesh.name = name;
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    const std::string unique = unique_object_name(mesh.name, SelectionKind::Mesh, g_editor.selected_mesh);
+                    if (mesh.name != unique) {
+                        mesh.name = unique;
+                        g_editor.scene.uses_builtin_default_meshes = false;
+                    }
+                }
                 edit_location_world("Location", mesh);
                 edit_rotation_degrees("Rotation", mesh.rotation);
                 if (edit_vec3("Scale", mesh.scale, 0.01f, lt::RenderDirty::Geometry)) {
@@ -1423,8 +1781,17 @@ void draw_properties() {
                     return true;
                 }, &g_editor.scene, static_cast<int>(g_editor.scene.materials.size()))) reset_accumulation(lt::RenderDirty::Geometry);
                 if (ImGui::Checkbox("Light", &mesh.light.enabled)) {
+                    if (mesh.light.enabled) {
+                        mesh.light.double_sided = true;
+                        if (lt::dot(mesh.light.color, mesh.light.color) <= 0.0f) {
+                            mesh.light.color = {1.0f, 0.888889f, 0.666667f};
+                        }
+                        if (mesh.light.intensity <= 1.0f) {
+                            mesh.light.intensity = 9.0f;
+                        }
+                    }
                     g_editor.scene.uses_builtin_default_meshes = false;
-                    reset_accumulation(lt::RenderDirty::Geometry);
+                    reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
                 }
                 if (mesh.light.enabled) {
                     if (ImGui::Checkbox("Double-sided Light", &mesh.light.double_sided)) {
@@ -1444,16 +1811,54 @@ void draw_properties() {
                 }
                 ImGui::Text("Vertices: %d", static_cast<int>(mesh.vertices.size()));
                 ImGui::Text("Triangles: %d", static_cast<int>(mesh.indices.size() / 3));
+            } else if (has_sphere_selection()) {
+                lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
+                char name[128] = {};
+                std::strncpy(name, sphere.name.c_str(), sizeof(name) - 1);
+                if (ImGui::InputText("Name", name, sizeof(name))) {
+                    sphere.name = name;
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    const std::string unique = unique_object_name(sphere.name, SelectionKind::Sphere, g_editor.selected_sphere);
+                    if (sphere.name != unique) {
+                        sphere.name = unique;
+                        g_editor.scene.uses_builtin_default_meshes = false;
+                    }
+                }
+                if (edit_vec3("Location", sphere.center, 0.02f, lt::RenderDirty::Geometry)) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                if (ImGui::DragFloat("Radius", &sphere.radius, 0.01f, 0.001f, 1000.0f, "%.3f")) {
+                    sphere.radius = std::max(0.001f, sphere.radius);
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
+                if (ImGui::Combo("Material", &sphere.material, [](void* data, int idx, const char** out) {
+                    const auto* scene = static_cast<const lt::Scene*>(data);
+                    *out = scene->materials[static_cast<size_t>(idx)]->name.c_str();
+                    return true;
+                }, &g_editor.scene, static_cast<int>(g_editor.scene.materials.size()))) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
+                ImGui::TextDisabled("Analytic sphere");
             } else {
-                ImGui::TextDisabled("No mesh selected");
+                ImGui::TextDisabled("No object selected");
             }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Material")) {
-            for (std::shared_ptr<lt::Material>& material : g_editor.scene.materials) {
+            if (ImGui::Button("Add Material")) {
+                add_material();
+            }
+            ImGui::Separator();
+            for (int material_index = 0; material_index < static_cast<int>(g_editor.scene.materials.size()); ++material_index) {
+                std::shared_ptr<lt::Material>& material = g_editor.scene.materials[static_cast<size_t>(material_index)];
                 if (!material) {
                     continue;
                 }
+                ImGui::PushID(material_index);
                 if (ImGui::TreeNodeEx(material->name.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
                     color_edit("Base Color", material->albedo, lt::RenderDirty::Material);
                     int texture_index = 0;
@@ -1516,6 +1921,7 @@ void draw_properties() {
                         const bool double_sided = material->double_sided;
                         const float normal_scale = material->normal_scale;
                         const lt::Vec3 emission = material->emission;
+                        const lt::NprSettings npr = material->npr;
                         lt::Vec3 sheen_color;
                         float sheen_roughness = 0.0f;
                         std::shared_ptr<lt::Texture> sheen_color_texture;
@@ -1544,6 +1950,7 @@ void draw_properties() {
                         material->double_sided = double_sided;
                         material->normal_scale = normal_scale;
                         material->emission = emission;
+                        material->npr = npr;
                         if (auto* principled = dynamic_cast<lt::PrincipledMaterial*>(material.get())) {
                             principled->sheen_color = sheen_color;
                             principled->sheen_roughness = sheen_roughness;
@@ -1635,8 +2042,10 @@ void draw_properties() {
                             reset_accumulation(lt::RenderDirty::Material);
                         }
                     }
+                    draw_npr_controls(*material);
                     ImGui::TreePop();
                 }
+                ImGui::PopID();
             }
             ImGui::EndTabItem();
         }
@@ -1657,7 +2066,8 @@ void draw_properties() {
                     set_renderer(false);
                 }
                 const bool cuda_available = g_editor.cuda.available();
-                ImGui::BeginDisabled(!cuda_available);
+                const bool cuda_disabled = !cuda_available || lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
+                ImGui::BeginDisabled(cuda_disabled);
                 if (ImGui::Selectable("CUDA Path Tracer", using_cuda)) {
                     set_renderer(true);
                 }
@@ -1688,6 +2098,21 @@ void draw_properties() {
             if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
                 g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
                 reset_accumulation(lt::RenderDirty::Geometry);
+            }
+            ImGui::SeparatorText("NPR Sampling");
+            if (ImGui::DragInt("Style Samples", &g_editor.settings.stylized_samples, 1.0f, 1, 128)) {
+                g_editor.settings.stylized_samples = std::clamp(g_editor.settings.stylized_samples, 1, 128);
+                if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
+                    set_renderer(false);
+                }
+                reset_accumulation();
+            }
+            if (ImGui::DragInt("Style Depth", &g_editor.settings.stylized_max_depth, 1.0f, 0, 32)) {
+                g_editor.settings.stylized_max_depth = std::clamp(g_editor.settings.stylized_max_depth, 0, 32);
+                if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
+                    set_renderer(false);
+                }
+                reset_accumulation();
             }
             ImGui::SeparatorText("Environment");
             color_edit("Environment Color", g_editor.scene.environment.color, lt::RenderDirty::Environment);
@@ -1758,8 +2183,13 @@ void draw_viewport() {
     g_editor.viewport_hovered = ImGui::IsItemHovered();
     g_editor.viewport_focused = ImGui::IsWindowFocused();
     if (g_editor.viewport_hovered && g_editor.tool_mode == ToolMode::Select && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        int mesh = -1;
-        select_mesh(pick_mesh(ImGui::GetIO().MousePos, mesh) ? mesh : -1);
+        SelectionKind kind = SelectionKind::None;
+        int index = -1;
+        if (pick_object(ImGui::GetIO().MousePos, kind, index)) {
+            kind == SelectionKind::Sphere ? select_sphere(index) : select_mesh(index);
+        } else {
+            select_mesh(-1);
+        }
     }
     handle_gizmo_drag();
     if (g_editor.frame_index == 0) {
@@ -1809,8 +2239,9 @@ void draw_status_bar() {
         vertex_count += mesh.vertices.size();
         triangle_count += mesh.indices.size() / 3;
     }
-    ImGui::Text("Meshes: %d | Vertices: %zu | Triangles: %zu | %dx%d",
+    ImGui::Text("Meshes: %d | Spheres: %d | Vertices: %zu | Triangles: %zu | %dx%d",
                 static_cast<int>(g_editor.scene.meshes.size()),
+                static_cast<int>(g_editor.scene.spheres.size()),
                 vertex_count,
                 triangle_count,
                 g_editor.settings.width,
@@ -2020,7 +2451,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     g_editor.scene_path = resolve_startup_scene_path(command_line_scene());
     g_editor.settings.samples_per_pixel = 1;
     g_editor.settings.max_bounces = 5;
-    select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
+    if (!g_editor.scene.meshes.empty()) {
+        select_mesh(0);
+    } else {
+        select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
+    }
     if (g_editor.cuda.available()) g_editor.renderer = &g_editor.cuda;
 
     WNDCLASSW wc{};

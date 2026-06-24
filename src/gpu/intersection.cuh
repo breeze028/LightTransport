@@ -21,6 +21,68 @@ __device__ bool intersect_triangle(const GpuTriangle& tri, const Ray& ray, float
     return t > 0.001f;
 }
 
+__device__ Vec2 sphere_uv_gpu(Vec3 normal) {
+    const float u = atan2f(normal.z, normal.x) / (2.0f * kPi) + 0.5f;
+    const float v = acosf(dclamp(normal.y, -1.0f, 1.0f)) / kPi;
+    return {u, 1.0f - v};
+}
+
+__device__ void sphere_basis_gpu(Vec3 normal, Vec3& tangent, Vec3& bitangent) {
+    const Vec3 up = fabsf(normal.z) < 0.999f ? Vec3{0.0f, 0.0f, 1.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    tangent = dnormalize(dcross(up, normal));
+    bitangent = dcross(normal, tangent);
+}
+
+__device__ bool intersect_sphere_gpu(const GpuSphere& sphere, const Ray& ray, GpuHit& hit) {
+    const Vec3 oc = sub(ray.origin, sphere.center);
+    const float a = ddot(ray.direction, ray.direction);
+    const float half_b = ddot(oc, ray.direction);
+    const float c = ddot(oc, oc) - sphere.radius * sphere.radius;
+    const float discriminant = half_b * half_b - a * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+    const float root = sqrtf(discriminant);
+    float t = (-half_b - root) / a;
+    if (t <= 0.001f || t >= hit.t) {
+        t = (-half_b + root) / a;
+        if (t <= 0.001f || t >= hit.t) {
+            return false;
+        }
+    }
+
+    const Vec3 position = add(ray.origin, mul(ray.direction, t));
+    const Vec3 outward_normal = dnormalize(divv(sub(position, sphere.center), sphere.radius));
+    Vec3 tangent;
+    Vec3 bitangent;
+    sphere_basis_gpu(outward_normal, tangent, bitangent);
+    hit.t = t;
+    hit.position = position;
+    hit.front_face = ddot(outward_normal, ray.direction) < 0.0f;
+    hit.normal = hit.front_face ? outward_normal : mul(outward_normal, -1.0f);
+    hit.tangent = tangent;
+    hit.bitangent = bitangent;
+    hit.uv = sphere_uv_gpu(outward_normal);
+    hit.material = sphere.material;
+    hit.mesh = -1;
+    hit.triangle = -1;
+    hit.sphere = sphere.sphere;
+    hit.emission = {};
+    return true;
+}
+
+__device__ bool intersect_spheres_gpu(const GpuScene& scene, const Ray& ray, GpuHit& hit) {
+    bool found = false;
+    for (int i = 0; i < scene.sphere_count; ++i) {
+        const GpuSphere sphere = scene.spheres[i];
+        if (sphere.material < 0 || sphere.material >= scene.material_count) {
+            continue;
+        }
+        found = intersect_sphere_gpu(sphere, ray, hit) || found;
+    }
+    return found;
+}
+
 __device__ bool intersect_aabb_gpu(Vec3 bounds_min, Vec3 bounds_max, const Ray& ray, float max_t, float* out_tmin = nullptr) {
     float tmin = 0.001f;
     float tmax = max_t;
@@ -133,63 +195,65 @@ __device__ bool intersect_blas_gpu(const GpuScene& scene, const Ray& ray, int ro
 
 __device__ bool intersect_gpu(const GpuScene& scene, const Ray& ray, GpuHit& hit) {
     if (scene.use_two_level == 0) {
-        return scene.bvh_node_count > 0 &&
+        bool found = scene.bvh_node_count > 0 &&
             intersect_bvh_gpu(scene, scene.bvh_nodes, scene.bvh_node_count, scene.triangle_indices, scene.triangle_count, ray, 0, hit);
-    }
-    if (scene.tlas_node_count <= 0 || scene.mesh_instance_count <= 0) {
-        return false;
+        found = intersect_spheres_gpu(scene, ray, hit) || found;
+        return found;
     }
 
     bool found = false;
-    int stack[64];
-    int stack_size = 0;
-    stack[stack_size++] = 0;
+    if (scene.tlas_node_count > 0 && scene.mesh_instance_count > 0) {
+        int stack[64];
+        int stack_size = 0;
+        stack[stack_size++] = 0;
 
-    while (stack_size > 0) {
-        const int node_index = stack[--stack_size];
-        if (node_index < 0 || node_index >= scene.tlas_node_count) {
-            continue;
-        }
-        const GpuBvhNode node = scene.tlas_nodes[node_index];
-        if (!intersect_aabb_gpu(node.bounds_min, node.bounds_max, ray, hit.t)) {
-            continue;
-        }
-
-        if (node.count > 0) {
-            for (int i = 0; i < node.count; ++i) {
-                const int index_offset = node.first + i;
-                if (index_offset < 0 || index_offset >= scene.mesh_instance_count) {
-                    continue;
-                }
-                const int instance_index = scene.mesh_instance_indices[index_offset];
-                if (instance_index < 0 || instance_index >= scene.mesh_instance_count) {
-                    continue;
-                }
-                const GpuMeshInstance instance = scene.mesh_instances[instance_index];
-                if (instance.bvh_root >= 0 &&
-                    intersect_aabb_gpu(instance.bounds_min, instance.bounds_max, ray, hit.t)) {
-                    found = intersect_blas_gpu(scene, ray, instance.bvh_root, hit) || found;
-                }
+        while (stack_size > 0) {
+            const int node_index = stack[--stack_size];
+            if (node_index < 0 || node_index >= scene.tlas_node_count) {
+                continue;
             }
-        } else {
-            float left_t = kInfinity;
-            float right_t = kInfinity;
-            const bool hit_left = node.left >= 0 && node.left < scene.tlas_node_count &&
-                intersect_aabb_gpu(scene.tlas_nodes[node.left].bounds_min, scene.tlas_nodes[node.left].bounds_max, ray, hit.t, &left_t);
-            const bool hit_right = node.right >= 0 && node.right < scene.tlas_node_count &&
-                intersect_aabb_gpu(scene.tlas_nodes[node.right].bounds_min, scene.tlas_nodes[node.right].bounds_max, ray, hit.t, &right_t);
-            if (hit_left && hit_right) {
-                const int near_child = left_t <= right_t ? node.left : node.right;
-                const int far_child = left_t <= right_t ? node.right : node.left;
-                if (stack_size < 64) stack[stack_size++] = far_child;
-                if (stack_size < 64) stack[stack_size++] = near_child;
-            } else if (hit_left) {
-                if (stack_size < 64) stack[stack_size++] = node.left;
-            } else if (hit_right) {
-                if (stack_size < 64) stack[stack_size++] = node.right;
+            const GpuBvhNode node = scene.tlas_nodes[node_index];
+            if (!intersect_aabb_gpu(node.bounds_min, node.bounds_max, ray, hit.t)) {
+                continue;
+            }
+
+            if (node.count > 0) {
+                for (int i = 0; i < node.count; ++i) {
+                    const int index_offset = node.first + i;
+                    if (index_offset < 0 || index_offset >= scene.mesh_instance_count) {
+                        continue;
+                    }
+                    const int instance_index = scene.mesh_instance_indices[index_offset];
+                    if (instance_index < 0 || instance_index >= scene.mesh_instance_count) {
+                        continue;
+                    }
+                    const GpuMeshInstance instance = scene.mesh_instances[instance_index];
+                    if (instance.bvh_root >= 0 &&
+                        intersect_aabb_gpu(instance.bounds_min, instance.bounds_max, ray, hit.t)) {
+                        found = intersect_blas_gpu(scene, ray, instance.bvh_root, hit) || found;
+                    }
+                }
+            } else {
+                float left_t = kInfinity;
+                float right_t = kInfinity;
+                const bool hit_left = node.left >= 0 && node.left < scene.tlas_node_count &&
+                    intersect_aabb_gpu(scene.tlas_nodes[node.left].bounds_min, scene.tlas_nodes[node.left].bounds_max, ray, hit.t, &left_t);
+                const bool hit_right = node.right >= 0 && node.right < scene.tlas_node_count &&
+                    intersect_aabb_gpu(scene.tlas_nodes[node.right].bounds_min, scene.tlas_nodes[node.right].bounds_max, ray, hit.t, &right_t);
+                if (hit_left && hit_right) {
+                    const int near_child = left_t <= right_t ? node.left : node.right;
+                    const int far_child = left_t <= right_t ? node.right : node.left;
+                    if (stack_size < 64) stack[stack_size++] = far_child;
+                    if (stack_size < 64) stack[stack_size++] = near_child;
+                } else if (hit_left) {
+                    if (stack_size < 64) stack[stack_size++] = node.left;
+                } else if (hit_right) {
+                    if (stack_size < 64) stack[stack_size++] = node.right;
+                }
             }
         }
     }
+    found = intersect_spheres_gpu(scene, ray, hit) || found;
     return found;
 }
 

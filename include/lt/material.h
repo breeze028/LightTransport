@@ -23,6 +23,47 @@ enum class AlphaMode {
     Blend = 2,
 };
 
+enum class NprStyle {
+    None = 0,
+    ColorMap = 1,
+    XToon = 2,
+    CrossHatching = 3,
+};
+
+enum class XToonDetailMode {
+    Constant = 0,
+    Depth = 1,
+    NearSilhouette = 2,
+    Highlight = 3,
+};
+
+struct NprSettings {
+    NprStyle style = NprStyle::None;
+    float value_min = 0.0f;
+    float value_max = 1.0f;
+    XToonDetailMode xtoon_detail_mode = XToonDetailMode::Highlight;
+    int xtoon_steps = 3;
+    Vec3 xtoon_shadow = {0.45f, 0.45f, 0.55f};
+    Vec3 xtoon_mid = {0.82f, 0.82f, 0.90f};
+    Vec3 xtoon_lit = {1.16f, 1.14f, 1.05f};
+    Vec3 xtoon_accent = {1.0f, 0.92f, 0.68f};
+    float xtoon_detail_strength = 0.75f;
+    float xtoon_detail_threshold = 0.18f;
+    float xtoon_detail_power = 24.0f;
+    float xtoon_depth_near = 1.0f;
+    float xtoon_depth_far = 8.0f;
+    int hatch_sets = 3;
+    float hatch_spacing = 0.08f;
+    float hatch_width = 0.012f;
+    float hatch_angle = 0.0f;
+    float hatch_value_min = 0.0f;
+    float hatch_value_max = 1.0f;
+    Vec3 hatch_ink = {0.05f, 0.045f, 0.04f};
+    Vec3 hatch_paper = {0.96f, 0.94f, 0.88f};
+    bool hatch_passthrough = false;
+    bool hatch_shadow_only = false;
+};
+
 struct MaterialSample {
     Vec3 direction;
     Vec3 weight;
@@ -43,6 +84,7 @@ public:
     float normal_scale = 1.0f;
     Vec3 emission = {};
     std::shared_ptr<Texture> emission_texture;
+    NprSettings npr;
 
     Material() = default;
     Material(std::string name_, Vec3 albedo_) : name(std::move(name_)), albedo(albedo_) {}
@@ -146,5 +188,9 @@ public:
 
 std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, BrdfModel model, float roughness, float metallic);
 BrdfModel parse_brdf_model(const std::string& name);
+NprStyle parse_npr_style(const std::string& name);
+const char* npr_style_name(NprStyle style);
+XToonDetailMode parse_xtoon_detail_mode(const std::string& name);
+const char* xtoon_detail_mode_name(XToonDetailMode mode);
 
 } // namespace lt

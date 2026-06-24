@@ -38,6 +38,7 @@ void CudaPathTracer::reset() {
     cudaFree(device_materials_);
     cudaFree(device_textures_);
     cudaFree(device_triangles_);
+    cudaFree(device_spheres_);
     cudaFree(device_triangle_indices_);
     cudaFree(device_light_indices_);
     cudaFree(device_bvh_nodes_);
@@ -50,6 +51,7 @@ void CudaPathTracer::reset() {
     device_materials_ = nullptr;
     device_textures_ = nullptr;
     device_triangles_ = nullptr;
+    device_spheres_ = nullptr;
     device_triangle_indices_ = nullptr;
     device_light_indices_ = nullptr;
     device_bvh_nodes_ = nullptr;
@@ -60,6 +62,7 @@ void CudaPathTracer::reset() {
     cached_materials_ = 0;
     cached_textures_ = 0;
     cached_triangles_ = 0;
+    cached_spheres_ = 0;
     cached_triangle_indices_ = 0;
     cached_lights_ = 0;
     cached_bvh_nodes_ = 0;
@@ -124,6 +127,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         if (!upload_buffer(device_materials_, cached_materials_, packed.materials) ||
             !upload_buffer(device_textures_, cached_textures_, packed.textures) ||
             !upload_buffer(device_triangles_, cached_triangles_, packed.triangles) ||
+            !upload_buffer(device_spheres_, cached_spheres_, packed.spheres) ||
             !upload_buffer(device_triangle_indices_, cached_triangle_indices_, packed.triangle_indices) ||
             !upload_buffer(device_light_indices_, cached_lights_, packed.light_indices) ||
             !upload_buffer(device_bvh_nodes_, cached_bvh_nodes_, packed.bvh_nodes) ||
@@ -138,6 +142,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.materials = static_cast<GpuMaterial*>(device_materials_);
         packed.scene.textures = static_cast<GpuTexture*>(device_textures_);
         packed.scene.triangles = static_cast<GpuTriangle*>(device_triangles_);
+        packed.scene.spheres = static_cast<GpuSphere*>(device_spheres_);
         packed.scene.triangle_indices = static_cast<int*>(device_triangle_indices_);
         packed.scene.light_indices = static_cast<int*>(device_light_indices_);
         packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(device_bvh_nodes_);
