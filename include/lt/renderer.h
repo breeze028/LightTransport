@@ -51,9 +51,24 @@ struct RenderSettings {
     bool use_mis = false;
     MisHeuristic mis_heuristic = MisHeuristic::Power;
     AccelerationStructure acceleration_structure = AccelerationStructure::Auto;
+    int stylized_samples = 8;
+    int stylized_max_depth = 1;
     uint32_t frame_index = 0;
     RenderDirty dirty = RenderDirty::All;
 };
+
+inline bool scene_has_npr_styles(const Scene& scene) {
+    for (const std::shared_ptr<Material>& material : scene.materials) {
+        if (material && material->npr.style != NprStyle::None) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool stylized_rendering_enabled(const RenderSettings& settings, const Scene& scene) {
+    return settings.stylized_samples > 0 && settings.stylized_max_depth > 0 && scene_has_npr_styles(scene);
+}
 
 struct Framebuffer {
     int width = 0;
@@ -113,6 +128,7 @@ private:
     void* device_materials_ = nullptr;
     void* device_textures_ = nullptr;
     void* device_triangles_ = nullptr;
+    void* device_spheres_ = nullptr;
     void* device_triangle_indices_ = nullptr;
     void* device_light_indices_ = nullptr;
     void* device_bvh_nodes_ = nullptr;
@@ -125,6 +141,7 @@ private:
     int cached_materials_ = 0;
     int cached_textures_ = 0;
     int cached_triangles_ = 0;
+    int cached_spheres_ = 0;
     int cached_triangle_indices_ = 0;
     int cached_lights_ = 0;
     int cached_bvh_nodes_ = 0;

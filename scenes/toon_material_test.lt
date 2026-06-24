@@ -1,0 +1,30 @@
+# Minimal material-level X-Toon test scene with an analytic sphere.
+
+camera 0 1.05 -3.0   0 0.45 0   38
+environment 0.04 0.045 0.055 0.25
+
+material white 0.86 0.86 0.82 lambertian 0.65 0
+material toon 0.22 0.34 0.95 principled 0.35 0
+material light 1 0.9 0.72 lambertian 0.5 0
+npr white cross_hatching 3 0.10 0.015 0.35 0 1 0.03 0.025 0.02 0.86 0.86 0.82 1 1
+npr toon x_toon highlight 3 0.34 0.36 0.58 0.76 0.80 0.98 1.15 1.16 1.04 1.00 0.94 0.70 0.90 0.06 24 0.6 5.0
+
+light Area_Light 1.0 0.88 0.66 8.0 1
+
+sphere Toon_Ball toon 0 0.45 0 0.45
+
+mesh Floor white 0 0 0 0 0 0 1 1 1 4 2
+-2 0 -2
+2 0 -2
+2 0 2
+-2 0 2
+0 1 2
+0 2 3
+
+mesh Area_Light light 0 2.0 -0.35 0 0 0 1 1 1 4 2
+-0.38 0 -0.38
+0.38 0 -0.38
+0.38 0 0.38
+-0.38 0 0.38
+0 2 1
+0 3 2

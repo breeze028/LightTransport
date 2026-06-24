@@ -50,6 +50,62 @@ bool intersect_triangle(const Triangle& tri, const Ray& ray, float& t, float& u,
     return t > 0.001f;
 }
 
+Vec2 sphere_uv(Vec3 normal) {
+    const float u = std::atan2(normal.z, normal.x) / (2.0f * kPi) + 0.5f;
+    const float v = std::acos(std::clamp(normal.y, -1.0f, 1.0f)) / kPi;
+    return {u, 1.0f - v};
+}
+
+void sphere_basis(Vec3 normal, Vec3& tangent, Vec3& bitangent) {
+    const Vec3 up = std::fabs(normal.z) < 0.999f ? Vec3{0.0f, 0.0f, 1.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    tangent = normalize(cross(up, normal));
+    bitangent = cross(normal, tangent);
+}
+
+bool intersect_sphere(const RenderSphere& sphere, const Ray& ray, Hit& hit) {
+    const Vec3 oc = ray.origin - sphere.center;
+    const float a = dot(ray.direction, ray.direction);
+    const float half_b = dot(oc, ray.direction);
+    const float c = dot(oc, oc) - sphere.radius * sphere.radius;
+    const float discriminant = half_b * half_b - a * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+    const float root = std::sqrt(discriminant);
+    float t = (-half_b - root) / a;
+    if (t <= 0.001f || t >= hit.t) {
+        t = (-half_b + root) / a;
+        if (t <= 0.001f || t >= hit.t) {
+            return false;
+        }
+    }
+
+    const Vec3 position = ray.origin + ray.direction * t;
+    const Vec3 outward_normal = normalize((position - sphere.center) / sphere.radius);
+    Vec3 tangent;
+    Vec3 bitangent;
+    sphere_basis(outward_normal, tangent, bitangent);
+    hit.t = t;
+    hit.position = position;
+    hit.front_face = dot(outward_normal, ray.direction) < 0.0f;
+    hit.normal = face_forward(outward_normal, ray.direction);
+    hit.tangent = tangent;
+    hit.bitangent = bitangent;
+    hit.uv = sphere_uv(outward_normal);
+    hit.material = sphere.material;
+    hit.mesh = -1;
+    hit.triangle = -1;
+    return true;
+}
+
+bool intersect_spheres(const RenderScene& render_scene, const Ray& ray, Hit& hit) {
+    bool found = false;
+    for (const RenderSphere& sphere : render_scene.spheres) {
+        found = intersect_sphere(sphere, ray, hit) || found;
+    }
+    return found;
+}
+
 bool intersect_bvh_nodes(const RenderScene& render_scene, const std::vector<BvhNode>& nodes, const std::vector<int>& indices, const Ray& ray, int root, Hit& hit) {
     bool found = false;
     int stack[kTraversalStackSize] = {};
@@ -118,46 +174,48 @@ bool use_two_level(const RenderScene& render_scene, AccelerationStructure accele
 
 bool intersect_scene(const RenderScene& render_scene, const Ray& ray, Hit& hit, AccelerationStructure acceleration_structure) {
     if (!use_two_level(render_scene, acceleration_structure)) {
-        return !render_scene.flat_bvh_nodes.empty() &&
+        bool found = !render_scene.flat_bvh_nodes.empty() &&
             intersect_bvh_nodes(render_scene, render_scene.flat_bvh_nodes, render_scene.flat_triangle_indices, ray, 0, hit);
-    }
-    if (render_scene.tlas_nodes.empty() || render_scene.mesh_instances.empty()) {
-        return false;
+        found = intersect_spheres(render_scene, ray, hit) || found;
+        return found;
     }
 
     bool found = false;
-    int stack[kTraversalStackSize] = {};
-    int stack_size = 0;
-    stack[stack_size++] = 0;
+    if (!render_scene.tlas_nodes.empty() && !render_scene.mesh_instances.empty()) {
+        int stack[kTraversalStackSize] = {};
+        int stack_size = 0;
+        stack[stack_size++] = 0;
 
-    while (stack_size > 0) {
-        const BvhNode& node = render_scene.tlas_nodes[static_cast<size_t>(stack[--stack_size])];
-        if (!intersect_aabb(node.bounds, ray, hit.t)) {
-            continue;
-        }
-        if (node.count > 0) {
-            for (int i = 0; i < node.count; ++i) {
-                const int index_offset = node.first + i;
-                if (index_offset < 0 || index_offset >= static_cast<int>(render_scene.mesh_instance_indices.size())) {
-                    continue;
-                }
-                const int instance_index = render_scene.mesh_instance_indices[static_cast<size_t>(index_offset)];
-                if (instance_index < 0 || instance_index >= static_cast<int>(render_scene.mesh_instances.size())) {
-                    continue;
-                }
-                const RenderScene::MeshInstance& instance = render_scene.mesh_instances[static_cast<size_t>(instance_index)];
-                if (instance.bvh_root >= 0 && intersect_aabb(instance.bounds, ray, hit.t)) {
-                    found = intersect_blas(render_scene, ray, instance.bvh_root, hit) || found;
-                }
+        while (stack_size > 0) {
+            const BvhNode& node = render_scene.tlas_nodes[static_cast<size_t>(stack[--stack_size])];
+            if (!intersect_aabb(node.bounds, ray, hit.t)) {
+                continue;
             }
-        } else {
-            if (node.left >= 0 && node.left < static_cast<int>(render_scene.tlas_nodes.size()) && stack_size < kTraversalStackSize) {
-                stack[stack_size++] = node.left;
-            }
-            if (node.right >= 0 && node.right < static_cast<int>(render_scene.tlas_nodes.size()) && stack_size < kTraversalStackSize) {
-                stack[stack_size++] = node.right;
+            if (node.count > 0) {
+                for (int i = 0; i < node.count; ++i) {
+                    const int index_offset = node.first + i;
+                    if (index_offset < 0 || index_offset >= static_cast<int>(render_scene.mesh_instance_indices.size())) {
+                        continue;
+                    }
+                    const int instance_index = render_scene.mesh_instance_indices[static_cast<size_t>(index_offset)];
+                    if (instance_index < 0 || instance_index >= static_cast<int>(render_scene.mesh_instances.size())) {
+                        continue;
+                    }
+                    const RenderScene::MeshInstance& instance = render_scene.mesh_instances[static_cast<size_t>(instance_index)];
+                    if (instance.bvh_root >= 0 && intersect_aabb(instance.bounds, ray, hit.t)) {
+                        found = intersect_blas(render_scene, ray, instance.bvh_root, hit) || found;
+                    }
+                }
+            } else {
+                if (node.left >= 0 && node.left < static_cast<int>(render_scene.tlas_nodes.size()) && stack_size < kTraversalStackSize) {
+                    stack[stack_size++] = node.left;
+                }
+                if (node.right >= 0 && node.right < static_cast<int>(render_scene.tlas_nodes.size()) && stack_size < kTraversalStackSize) {
+                    stack[stack_size++] = node.right;
+                }
             }
         }
     }
+    found = intersect_spheres(render_scene, ray, hit) || found;
     return found;
 }

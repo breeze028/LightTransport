@@ -29,6 +29,13 @@ struct Mesh {
     LightComponent light;
 };
 
+struct Sphere {
+    std::string name = "Sphere";
+    int material = 0;
+    Vec3 center = {};
+    float radius = 0.5f;
+};
+
 struct Camera {
     Vec3 position = {0.0f, 1.0f, 4.0f};
     Vec3 target = {0.0f, 1.0f, 0.0f};
@@ -63,6 +70,7 @@ struct Scene {
     std::vector<std::shared_ptr<Material>> materials;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<Mesh> meshes;
+    std::vector<Sphere> spheres;
 };
 
 struct Triangle {
@@ -81,6 +89,13 @@ struct Triangle {
     Vec2 uv2;
     int material = 0;
     int mesh = -1;
+};
+
+struct RenderSphere {
+    Vec3 center;
+    float radius = 0.5f;
+    int material = 0;
+    int sphere = -1;
 };
 
 struct Aabb {
@@ -104,6 +119,7 @@ struct RenderScene {
     };
 
     std::vector<Triangle> triangles;
+    std::vector<RenderSphere> spheres;
     std::vector<int> triangle_indices;
     std::vector<int> flat_triangle_indices;
     std::vector<int> light_triangle_indices;

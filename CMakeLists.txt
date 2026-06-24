@@ -18,6 +18,9 @@ add_library(lt_core
     src/material.cpp
     src/pbrt/pbrt_loader.cpp
     src/scene.cpp
+    src/scene/render_scene.cpp
+    src/scene/scene_geometry.cpp
+    src/scene/scene_io.cpp
     src/texture.cpp
 )
 
@@ -52,7 +55,10 @@ else()
     target_compile_definitions(lt_core PUBLIC LT_HAS_CUDA=0)
 endif()
 
-add_executable(lt_render src/main.cpp)
+add_executable(lt_render
+    src/main.cpp
+    src/cli/render_options.cpp
+)
 target_link_libraries(lt_render PRIVATE lt_core)
 
 if(LT_BUILD_EDITOR AND WIN32)
@@ -77,7 +83,11 @@ if(LT_BUILD_EDITOR AND WIN32)
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
     target_compile_definitions(imgui PUBLIC IMGUI_DEFINE_MATH_OPERATORS)
 
-    add_executable(lt_editor WIN32 src/editor_win32.cpp)
+    add_executable(lt_editor WIN32
+        src/editor_win32.cpp
+        src/editor/editor_platform.cpp
+        src/editor/editor_state.cpp
+    )
     target_link_libraries(lt_editor PRIVATE lt_core imgui user32 gdi32 comdlg32 shell32 d3d11 dxgi)
     target_compile_definitions(lt_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

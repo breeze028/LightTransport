@@ -254,4 +254,54 @@ BrdfModel parse_brdf_model(const std::string& name) {
     return BrdfModel::Lambertian;
 }
 
+NprStyle parse_npr_style(const std::string& name) {
+    if (name == "color_map" || name == "color-map" || name == "colormap" || name == "color") {
+        return NprStyle::ColorMap;
+    }
+    if (name == "x_toon" || name == "x-toon" || name == "xtoon" || name == "toon") {
+        return NprStyle::XToon;
+    }
+    if (name == "cross_hatching" || name == "cross-hatching" || name == "crosshatching" ||
+        name == "cross_hatch" || name == "cross-hatch" || name == "crosshatch" ||
+        name == "hatching" || name == "hatch") {
+        return NprStyle::CrossHatching;
+    }
+    return NprStyle::None;
+}
+
+const char* npr_style_name(NprStyle style) {
+    switch (style) {
+    case NprStyle::ColorMap: return "color_map";
+    case NprStyle::XToon: return "x_toon";
+    case NprStyle::CrossHatching: return "cross_hatching";
+    case NprStyle::None:
+    default:
+        return "none";
+    }
+}
+
+XToonDetailMode parse_xtoon_detail_mode(const std::string& name) {
+    if (name == "depth" || name == "distance") {
+        return XToonDetailMode::Depth;
+    }
+    if (name == "silhouette" || name == "near_silhouette" || name == "near-silhouette" || name == "rim") {
+        return XToonDetailMode::NearSilhouette;
+    }
+    if (name == "highlight" || name == "specular") {
+        return XToonDetailMode::Highlight;
+    }
+    return XToonDetailMode::Constant;
+}
+
+const char* xtoon_detail_mode_name(XToonDetailMode mode) {
+    switch (mode) {
+    case XToonDetailMode::Depth: return "depth";
+    case XToonDetailMode::NearSilhouette: return "silhouette";
+    case XToonDetailMode::Highlight: return "highlight";
+    case XToonDetailMode::Constant:
+    default:
+        return "constant";
+    }
+}
+
 } // namespace lt
