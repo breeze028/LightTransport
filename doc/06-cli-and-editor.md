@@ -35,8 +35,19 @@ lt_render [scene_path] [output_path] [options...]
 | `--hatch-paper R G B` | 纸色 |
 | `--hatch-passthrough` | 非线条区域保留原 radiance |
 | `--hatch-shadow-only` | 仅阴影区域画线 |
+| `--log-level trace|debug|info|warn|error|critical|off` | 同时设置控制台和文件日志等级 |
+| `--log-file PATH` | 指定并启用日志文件 |
+| `--no-log-file` | 关闭文件日志 |
+| `--verbose` | 控制台和文件都输出 debug |
+| `--quiet` | 关闭进度输出，并把控制台日志降到 warning |
 
 解析器目前对未知参数静默忽略，对缺失值也不会统一报错。若 CLI 将用于自动化，建议后续增加错误收集、usage 和非零退出码。
+
+### 日志输出
+
+`lt_render` 默认把 `info` 及以上日志写到 stderr，把 `debug` 及以上日志写到 `logs/lt_render.log`。渲染进度仍写 stdout；脚本自动化时建议使用 `--quiet --log-file build/run.log`，这样终端输出较干净，但失败原因仍可追踪。
+
+日志参数只影响观察方式，不改变加载 API 的错误返回语义。比如场景加载失败时，`SceneLoadResult::error` 仍然保留；CLI 同时会记录 fallback 到默认场景的 warning。
 
 ### 执行流程
 
@@ -129,6 +140,7 @@ lt_render [scene_path] [output_path] [options...]
 | gizmo | `handle_gizmo_drag()`、`draw_gizmo_overlay()` |
 | NPR UI | `draw_npr_controls()` |
 | 顶部菜单 | `draw_top_bar()` |
+| 日志面板 | `draw_log_panel()`、`drain_editor_logs()`、`EditorState::logs` |
 | Outliner | `draw_outliner()` |
 | 属性面板 | `draw_properties()` |
 | Viewport | `draw_viewport()` |
@@ -158,6 +170,7 @@ if (ImGui::DragFloat("Aperture", &g_editor.scene.camera.aperture,
 - 改环境颜色/强度/方向用 `Environment`。
 - 新增/删除 Mesh 后调用 `invalidate_mesh_bounds_cache()`，因为拾取与轮廓缓存依赖 Scene。
 - 对 `.lt` 可保存对象修改时，将 `uses_builtin_default_meshes` 置 false，避免保存器省略内置 Mesh。
+- 后台线程需要记录诊断信息时，只调用 `LT_LOG_*`；不要直接操作 ImGui。日志 observer 会先进入 pending queue，再由主线程绘制 Log 面板。
 
 ## 新增面板或对象类型
 

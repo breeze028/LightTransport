@@ -1,5 +1,6 @@
 #pragma once
 
+#include "lt/log.h"
 #include "lt/renderer.h"
 
 #include <windows.h>
@@ -9,6 +10,7 @@
 
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -66,6 +68,12 @@ struct EditorState {
     float properties_width = 340.0f;
     float outliner_fraction = 0.38f;
     bool viewport_fullscreen = false;
+    bool show_log_panel = false;
+    bool log_auto_scroll = true;
+    LogLevel log_filter_level = LogLevel::Info;
+    std::mutex log_mutex;
+    std::vector<LogRecord> pending_logs;
+    std::vector<LogRecord> logs;
 };
 
 struct RenderResult {

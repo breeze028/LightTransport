@@ -1,4 +1,5 @@
 #include "lt/renderer.h"
+#include "lt/log.h"
 #include "editor/editor_platform.h"
 #include "editor/editor_state.h"
 
@@ -13,11 +14,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdio>
+#include <ctime>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <iterator>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -29,6 +35,9 @@ namespace {
 using namespace lt::editor;
 
 void upload_preview_texture();
+
+lt::LogObserverHandle g_editor_log_observer = 0;
+constexpr size_t kMaxEditorLogs = 2000;
 
 const char* tool_mode_name(ToolMode mode) {
     switch (mode) {
@@ -50,6 +59,81 @@ const char* tool_mode_icon(ToolMode mode) {
     }
 }
 
+void enqueue_editor_log(const lt::LogRecord& record) {
+    std::lock_guard lock(g_editor.log_mutex);
+    if (g_editor.pending_logs.size() >= 512) {
+        g_editor.pending_logs.erase(g_editor.pending_logs.begin());
+    }
+    g_editor.pending_logs.push_back(record);
+}
+
+void drain_editor_logs() {
+    std::vector<lt::LogRecord> pending;
+    {
+        std::lock_guard lock(g_editor.log_mutex);
+        pending.swap(g_editor.pending_logs);
+    }
+    if (pending.empty()) {
+        return;
+    }
+    g_editor.logs.insert(g_editor.logs.end(), std::make_move_iterator(pending.begin()), std::make_move_iterator(pending.end()));
+    if (g_editor.logs.size() > kMaxEditorLogs) {
+        g_editor.logs.erase(g_editor.logs.begin(), g_editor.logs.begin() + static_cast<std::ptrdiff_t>(g_editor.logs.size() - kMaxEditorLogs));
+    }
+}
+
+std::string log_time_text(const lt::LogRecord& record) {
+    const std::time_t time = std::chrono::system_clock::to_time_t(record.timestamp);
+    std::tm local_time{};
+    localtime_s(&local_time, &time);
+    char buffer[32] = {};
+    std::strftime(buffer, sizeof(buffer), "%H:%M:%S", &local_time);
+    return buffer;
+}
+
+ImVec4 log_level_color(lt::LogLevel level) {
+    switch (level) {
+    case lt::LogLevel::Trace: return {0.58f, 0.60f, 0.64f, 1.0f};
+    case lt::LogLevel::Debug: return {0.50f, 0.70f, 0.95f, 1.0f};
+    case lt::LogLevel::Info: return {0.86f, 0.86f, 0.84f, 1.0f};
+    case lt::LogLevel::Warn: return {1.0f, 0.73f, 0.30f, 1.0f};
+    case lt::LogLevel::Error: return {1.0f, 0.38f, 0.34f, 1.0f};
+    case lt::LogLevel::Critical: return {1.0f, 0.18f, 0.20f, 1.0f};
+    case lt::LogLevel::Off: return {0.86f, 0.86f, 0.84f, 1.0f};
+    }
+    return {0.86f, 0.86f, 0.84f, 1.0f};
+}
+
+bool passes_log_filter(const lt::LogRecord& record) {
+    return static_cast<int>(record.level) >= static_cast<int>(g_editor.log_filter_level);
+}
+
+void initialize_editor_logging() {
+    lt::LogConfig config;
+    config.logger_name = "lt_editor";
+    config.enable_file = true;
+    config.file_path = "logs/lt_editor.log";
+    config.file_level = lt::LogLevel::Debug;
+    config.enable_console = false;
+    lt::initialize_logging(config);
+    g_editor_log_observer = lt::add_log_observer(enqueue_editor_log);
+    LT_LOG_INFO("Editor logging initialized");
+}
+
+void shutdown_editor_logging() {
+    LT_LOG_INFO("Editor shutting down");
+    lt::remove_log_observer(g_editor_log_observer);
+    g_editor_log_observer = 0;
+    lt::flush_logs();
+    lt::shutdown_logging();
+}
+
+struct EditorLoggingScope {
+    ~EditorLoggingScope() {
+        shutdown_editor_logging();
+    }
+};
+
 void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
     g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
     ++g_editor.render_generation;
@@ -61,8 +145,12 @@ void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
 void set_renderer(bool use_cuda) {
     const bool can_use_cuda = use_cuda && g_editor.cuda.available() && !lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
     lt::IRenderer* next = can_use_cuda ? static_cast<lt::IRenderer*>(&g_editor.cuda) : static_cast<lt::IRenderer*>(&g_editor.cpu);
+    if (use_cuda && !can_use_cuda) {
+        LT_LOG_WARN("CUDA renderer request fell back to CPU");
+    }
     if (g_editor.renderer != next) {
         g_editor.renderer = next;
+        LT_LOG_INFO("Editor renderer changed to {}", g_editor.renderer->name());
         reset_accumulation(lt::RenderDirty::All);
     }
 }
@@ -130,6 +218,12 @@ void set_scene(lt::Scene scene, const std::string& path) {
     } else {
         select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
     }
+    LT_LOG_INFO("Editor scene set to '{}' (meshes={}, spheres={}, materials={}, textures={})",
+        g_editor.scene_path,
+        g_editor.scene.meshes.size(),
+        g_editor.scene.spheres.size(),
+        g_editor.scene.materials.size(),
+        g_editor.scene.textures.size());
     reset_accumulation(lt::RenderDirty::All);
 }
 
@@ -139,9 +233,11 @@ bool scene_load_in_progress() {
 
 void load_scene_file(const std::string& path) {
     if (scene_load_in_progress()) {
+        LT_LOG_WARN("Scene load skipped while another scene is loading: '{}'", path);
         MessageBoxW(g_hwnd, L"A scene is already loading. Please wait for it to finish.", L"Scene load in progress", MB_OK | MB_ICONINFORMATION);
         return;
     }
+    LT_LOG_INFO("Starting async scene load '{}'", path);
     g_load_task.generation += 1;
     g_load_task.path = path;
     g_load_task.started = std::chrono::steady_clock::now();
@@ -151,20 +247,46 @@ void load_scene_file(const std::string& path) {
 }
 
 std::string resolve_startup_scene_path(const std::string& path) {
+    const auto is_url = [](const std::string& value) {
+        return value.rfind("http://", 0) == 0 || value.rfind("https://", 0) == 0;
+    };
+    const auto resolve_from_ancestors = [](std::filesystem::path base, const std::filesystem::path& relative) -> std::string {
+        std::error_code error;
+        base = std::filesystem::absolute(base, error);
+        if (error) {
+            return {};
+        }
+        for (;;) {
+            const std::filesystem::path candidate = base / relative;
+            if (std::filesystem::exists(candidate)) {
+                return candidate.string();
+            }
+            const std::filesystem::path parent = base.parent_path();
+            if (parent.empty() || parent == base) {
+                break;
+            }
+            base = parent;
+        }
+        return {};
+    };
+    if (is_url(path)) {
+        return path;
+    }
     std::filesystem::path scene(path);
-    if (scene.is_absolute() || std::filesystem::exists(scene)) {
+    if (scene.is_absolute()) {
         return scene.string();
+    }
+    if (std::filesystem::exists(scene)) {
+        return std::filesystem::absolute(scene).string();
+    }
+    if (const std::string resolved = resolve_from_ancestors(std::filesystem::current_path(), scene); !resolved.empty()) {
+        return resolved;
     }
     char exe_path[MAX_PATH] = {};
     if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) > 0) {
         const std::filesystem::path exe_dir = std::filesystem::path(exe_path).parent_path();
-        const std::filesystem::path from_exe = exe_dir / scene;
-        if (std::filesystem::exists(from_exe)) {
-            return from_exe.string();
-        }
-        const std::filesystem::path from_build_config = exe_dir.parent_path().parent_path() / scene;
-        if (std::filesystem::exists(from_build_config)) {
-            return from_build_config.string();
+        if (const std::string resolved = resolve_from_ancestors(exe_dir, scene); !resolved.empty()) {
+            return resolved;
         }
     }
     return path;
@@ -176,10 +298,12 @@ void poll_scene_load_result() {
     const std::string path = g_load_task.path;
     g_load_task = {};
     if (!loaded.error.empty()) {
+        LT_LOG_WARN("Scene load warning for '{}': {}", path, loaded.error);
         if (loaded.scene.meshes.empty() && loaded.scene.spheres.empty()) {
             MessageBoxW(g_hwnd, widen(loaded.error).c_str(), L"Scene load warning", MB_OK | MB_ICONWARNING);
         }
         if (loaded.scene.meshes.empty() && loaded.scene.spheres.empty()) {
+            LT_LOG_ERROR("Scene load produced no renderable geometry: '{}'", path);
             return;
         }
     }
@@ -232,12 +356,14 @@ void load_texture_dialog(lt::Material& material) {
     lt::Texture texture;
     std::string error;
     if (!lt::load_texture_file(name, path, texture, error)) {
+        LT_LOG_ERROR("Texture load failed '{}': {}", path, error);
         MessageBoxW(g_hwnd, widen(error).c_str(), L"Texture load failed", MB_OK | MB_ICONERROR);
         return;
     }
     auto shared = std::make_shared<lt::Texture>(std::move(texture));
     g_editor.scene.textures.push_back(shared);
     material.albedo_texture = shared;
+    LT_LOG_INFO("Loaded material texture '{}'", path);
     reset_accumulation(lt::RenderDirty::Texture | lt::RenderDirty::Material);
 }
 
@@ -257,6 +383,7 @@ void load_environment_texture_dialog() {
     lt::Texture texture;
     std::string error;
     if (!lt::load_texture_file(name, path, texture, error)) {
+        LT_LOG_ERROR("Environment load failed '{}': {}", path, error);
         MessageBoxW(g_hwnd, widen(error).c_str(), L"Environment load failed", MB_OK | MB_ICONERROR);
         return;
     }
@@ -268,11 +395,13 @@ void load_environment_texture_dialog() {
     g_editor.scene.environment.light_from_world_x = {1.0f, 0.0f, 0.0f};
     g_editor.scene.environment.light_from_world_y = {0.0f, 1.0f, 0.0f};
     g_editor.scene.environment.light_from_world_z = {0.0f, 0.0f, 1.0f};
+    LT_LOG_INFO("Loaded environment texture '{}'", path);
     reset_accumulation(lt::RenderDirty::Texture | lt::RenderDirty::Environment);
 }
 
 void save_scene() {
     if (lowercase_extension(g_editor.scene_path) != ".lt") {
+        LT_LOG_INFO("Save skipped for imported scene '{}'", g_editor.scene_path);
         MessageBoxW(g_hwnd, L"Imported glTF/GLB scenes can be edited, but saving back to that format is not supported yet. Save is limited to .lt scene files.", L"Save skipped", MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -282,7 +411,10 @@ void save_scene() {
     }
     std::string error;
     if (!lt::save_scene(g_editor.scene, g_editor.scene_path, error)) {
+        LT_LOG_ERROR("Save failed '{}': {}", g_editor.scene_path, error);
         MessageBoxW(g_hwnd, widen(error).c_str(), L"Save failed", MB_OK | MB_ICONERROR);
+    } else {
+        LT_LOG_INFO("Saved scene '{}'", g_editor.scene_path);
     }
 }
 
@@ -1695,6 +1827,10 @@ float draw_top_bar() {
         if (ImGui::MenuItem("Reset Accumulation", "Ctrl+R")) reset_accumulation();
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Window")) {
+        ImGui::MenuItem("Log", nullptr, &g_editor.show_log_panel);
+        ImGui::EndMenu();
+    }
     ImGui::Separator();
     const lt::IRenderer* effective_renderer = lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene) ? static_cast<const lt::IRenderer*>(&g_editor.cpu) : g_editor.renderer;
     ImGui::Text("%s | %s | samples %u | %.2f ms | %s",
@@ -2331,13 +2467,62 @@ void draw_loading_overlay() {
     ImGui::PopStyleVar();
 }
 
+void draw_log_panel() {
+    if (!g_editor.show_log_panel) {
+        return;
+    }
+    ImGui::SetNextWindowSize({760.0f, 320.0f}, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Log", &g_editor.show_log_panel)) {
+        const char* levels[] = {"Trace", "Debug", "Info", "Warn", "Error", "Critical"};
+        int filter = std::clamp(static_cast<int>(g_editor.log_filter_level), 0, static_cast<int>(IM_ARRAYSIZE(levels)) - 1);
+        if (ImGui::Combo("Min Level", &filter, levels, IM_ARRAYSIZE(levels))) {
+            g_editor.log_filter_level = static_cast<lt::LogLevel>(filter);
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-scroll", &g_editor.log_auto_scroll);
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            g_editor.logs.clear();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d records", static_cast<int>(g_editor.logs.size()));
+        ImGui::Separator();
+
+        if (ImGui::BeginChild("LogRecords", {0.0f, 0.0f}, true, ImGuiWindowFlags_HorizontalScrollbar)) {
+            for (const lt::LogRecord& record : g_editor.logs) {
+                if (!passes_log_filter(record)) {
+                    continue;
+                }
+                std::ostringstream line_builder;
+                line_builder << '[' << log_time_text(record) << "] ["
+                    << lt::log_level_name(record.level) << "] [t"
+                    << record.thread_id << "] " << record.message;
+                const std::string line = line_builder.str();
+                ImGui::PushStyleColor(ImGuiCol_Text, log_level_color(record.level));
+                ImGui::TextUnformatted(line.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered() && !record.file.empty()) {
+                    ImGui::SetTooltip("%s:%d\n%s", record.file.c_str(), record.line, record.function.c_str());
+                }
+            }
+            if (g_editor.log_auto_scroll) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
 void draw_ui() {
+    drain_editor_logs();
     const float top = draw_top_bar();
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float bottom = 26.0f;
     const ImVec2 layout_pos = viewport->Pos;
     const ImVec2 layout_size = viewport->Size;
     if (g_window_minimized || IsIconic(g_hwnd) || layout_size.x <= 480.0f || layout_size.y <= 240.0f) {
+        draw_log_panel();
         return;
     }
     const float content_height = std::max(64.0f, layout_size.y - top - bottom);
@@ -2353,6 +2538,7 @@ void draw_ui() {
         draw_viewport();
         draw_status_bar();
         draw_loading_overlay();
+        draw_log_panel();
         return;
     }
     ImGui::SetNextWindowPos({layout_pos.x, layout_pos.y + top}, ImGuiCond_Always);
@@ -2370,6 +2556,7 @@ void draw_ui() {
     draw_layout_splitters(layout_pos, layout_size, top, content_height, viewport_width, outliner_height);
     draw_status_bar();
     draw_loading_overlay();
+    draw_log_panel();
 }
 
 void handle_global_shortcuts() {
@@ -2448,7 +2635,10 @@ void load_editor_fonts(ImGuiIO& io) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
+    initialize_editor_logging();
+    EditorLoggingScope logging_scope;
     g_editor.scene_path = resolve_startup_scene_path(command_line_scene());
+    LT_LOG_INFO("Starting LightTransport Editor with scene '{}'", g_editor.scene_path);
     g_editor.settings.samples_per_pixel = 1;
     g_editor.settings.max_bounces = 5;
     if (!g_editor.scene.meshes.empty()) {
@@ -2456,7 +2646,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     } else {
         select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
     }
-    if (g_editor.cuda.available()) g_editor.renderer = &g_editor.cuda;
+#if LT_HAS_CUDA
+    if (g_editor.cuda.available()) {
+        g_editor.renderer = &g_editor.cuda;
+        LT_LOG_INFO("CUDA renderer is available; editor will start with CUDA");
+    } else {
+        LT_LOG_WARN("CUDA runtime device is unavailable; editor will start with CPU");
+    }
+#else
+    LT_LOG_WARN("CUDA backend is not built; editor will start with CPU");
+#endif
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = window_proc;
@@ -2466,6 +2665,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     RegisterClassW(&wc);
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"LightTransport Editor", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1440, 900, nullptr, nullptr, instance, nullptr);
     if (!create_device(g_hwnd)) {
+        LT_LOG_CRITICAL("Failed to create editor D3D11 device");
         cleanup_device();
         UnregisterClassW(wc.lpszClassName, instance);
         return 1;

@@ -14,6 +14,7 @@
 | 新灯型 | Scene/RenderScene | sampling/PDF | types/pack/sampling | loader/save | 可选 | object properties |
 | 新文件格式 | Scene API | 无 | 无 | loader + dispatch | 无 | Open filter |
 | 新输出格式 | 可选 image API | 无 | 无 | writer | main | 可选 |
+| 新日志/诊断点 | `lt/log.h` | 边界事件 | host fallback | loader warning/error | log options | Log 面板 |
 
 ## 新增一种 BRDF
 
@@ -199,6 +200,15 @@ GPU：
 - [ ] CLI 输出错误返回非零。
 - [ ] PNG 测 alpha/通道顺序。
 - [ ] EXR 测 float 范围，不应用 gamma/clamp。
+
+## 新增日志或诊断点
+
+- [ ] 使用 `LT_LOG_*` 宏，不直接写 `std::cout` / `std::cerr`，除非是 CLI 进度条或最终用户输出。
+- [ ] 加载器入口记录 `info`，失败记录 `error`，可恢复资源缺失记录 `warn`。
+- [ ] GPU fallback 记录 `warn`，同一原因重复出现时可以降为 `debug`。
+- [ ] 编辑器后台任务只写日志，不直接操作 ImGui；Log 面板由主线程消费 `EditorState::pending_logs`。
+- [ ] 不在 CPU 像素循环、sample 循环、BRDF 高频求值或 CUDA device code 中写日志。
+- [ ] 如果新增 CLI 控制项，同步更新 `doc/09-logging.md` 和 `doc/06-cli-and-editor.md`。
 
 ## 修改相机模型
 

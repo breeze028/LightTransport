@@ -2,6 +2,12 @@
 
 公开 API 位于 [`include/lt/`](../include/lt/)，命名空间统一为 `lt`。目前没有版本化 ABI 或安装包约定，最稳妥的使用方式是在同一 CMake 工程中链接 `lt_core`。
 
+## 日志 API：`lt/log.h`
+
+应用层可以在启动时调用 `initialize_logging()` 配置控制台、旋转文件和 observer。核心库不会主动创建日志文件；CLI 使用 `logs/lt_render.log`，编辑器使用 `logs/lt_editor.log`。
+
+常用宏是 `LT_LOG_INFO()`、`LT_LOG_WARN()`、`LT_LOG_ERROR()` 等。宏支持顺序替换 `{}`，并自动记录源文件、行号和函数名。详见[日志系统文档](09-logging.md)。
+
 ## 最小渲染示例
 
 ```cpp

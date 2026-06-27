@@ -1,5 +1,6 @@
 #pragma once
 
+#include "lt/log.h"
 #include "lt/renderer.h"
 
 #include <iosfwd>
@@ -18,6 +19,11 @@ struct RenderOptions {
     std::string output_path = "out.ppm";
     RenderSettings settings;
     bool prefer_cuda = false;
+    bool quiet = false;
+    bool log_file_enabled = true;
+    std::string log_file_path = "logs/lt_render.log";
+    LogLevel log_console_level = LogLevel::Info;
+    LogLevel log_file_level = LogLevel::Debug;
     bool global_style_set = false;
     NprStyle global_style = NprStyle::None;
     float global_color_min = 0.0f;

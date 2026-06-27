@@ -1,4 +1,5 @@
 #include "lt/scene.h"
+#include "lt/log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -610,6 +611,8 @@ void load_images(const Json& root, const std::string& scene_dir, const std::vect
         if (ok) {
             image_to_texture[i] = static_cast<int>(scene.textures.size());
             scene.textures.push_back(std::make_shared<Texture>(std::move(texture)));
+        } else {
+            LT_LOG_WARN("glTF image '{}' was skipped: {}", name, error.empty() ? "unsupported or missing image data" : error);
         }
     }
 }
@@ -807,10 +810,12 @@ void load_camera(const Json& root, Scene& scene) {
 } // namespace
 
 SceneLoadResult load_gltf_scene(const std::string& path) {
+    LT_LOG_INFO("Loading glTF scene '{}'", path);
     Json root;
     std::vector<unsigned char> binary_chunk;
     std::string error;
     if (!load_gltf_document(path, root, binary_chunk, error)) {
+        LT_LOG_ERROR("Failed to load glTF document '{}': {}", path, error);
         return {make_default_scene(), error};
     }
 
@@ -819,6 +824,7 @@ SceneLoadResult load_gltf_scene(const std::string& path) {
     const std::vector<Accessor> accessors = parse_accessors(root);
     std::vector<std::vector<unsigned char>> buffers = load_buffers(root, scene_dir, binary_chunk, error);
     if (!error.empty()) {
+        LT_LOG_ERROR("Failed to load glTF buffers '{}': {}", path, error);
         return {make_default_scene(), error};
     }
 
@@ -836,8 +842,11 @@ SceneLoadResult load_gltf_scene(const std::string& path) {
     }
 
     if (scene.meshes.empty()) {
+        LT_LOG_ERROR("glTF scene '{}' contains no supported triangle meshes", path);
         return {make_default_scene(), "glTF scene contains no supported triangle meshes: " + path};
     }
+    LT_LOG_INFO("Loaded glTF scene '{}' (meshes={}, materials={}, textures={})",
+        path, scene.meshes.size(), scene.materials.size(), scene.textures.size());
     return {std::move(scene), {}};
 }
 

@@ -49,6 +49,21 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.prefer_cuda = true;
         } else if (argument == "--cpu") {
             options.prefer_cuda = false;
+        } else if (argument == "--verbose") {
+            options.log_console_level = LogLevel::Debug;
+            options.log_file_level = LogLevel::Debug;
+        } else if (argument == "--quiet") {
+            options.quiet = true;
+            options.log_console_level = LogLevel::Warn;
+        } else if (argument == "--log-level" && i + 1 < argc) {
+            const LogLevel level = parse_log_level(argv[++i], options.log_console_level);
+            options.log_console_level = level;
+            options.log_file_level = level;
+        } else if (argument == "--log-file" && i + 1 < argc) {
+            options.log_file_enabled = true;
+            options.log_file_path = argv[++i];
+        } else if (argument == "--no-log-file") {
+            options.log_file_enabled = false;
         } else if (argument == "--mis") {
             options.settings.use_mis = true;
         } else if (argument == "--no-mis") {
@@ -128,6 +143,7 @@ void apply_material_styles(const RenderOptions& options, Scene& scene, std::ostr
     for (const MaterialStyleOverride& override : options.material_styles) {
         const int material_index = find_material(scene, override.material);
         if (material_index < 0) {
+            LT_LOG_WARN("Material not found for --material-style: {}", override.material);
             errors << "Material not found for --material-style: " << override.material << "\n";
             continue;
         }

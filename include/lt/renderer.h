@@ -122,6 +122,13 @@ public:
     void render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) override;
 
 private:
+    void render_cpu_fallback(
+        const Scene& scene,
+        const RenderSettings& settings,
+        Framebuffer& framebuffer,
+        const char* reason,
+        const char* detail = nullptr);
+
     void* device_accumulation_ = nullptr;
     void* device_rgba_ = nullptr;
     void* device_scene_ = nullptr;
@@ -149,6 +156,7 @@ private:
     int cached_mesh_instance_indices_ = 0;
     int cached_tlas_nodes_ = 0;
     bool scene_uploaded_ = false;
+    std::vector<std::string> reported_fallback_reasons_;
 };
 
 } // namespace lt

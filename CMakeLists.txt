@@ -5,13 +5,35 @@ project(LightTransport LANGUAGES CXX)
 option(LT_ENABLE_CUDA "Build the CUDA path tracing backend" ON)
 option(LT_BUILD_EDITOR "Build the realtime scene editor" ON)
 option(LT_FETCH_IMGUI "Fetch Dear ImGui when building the editor" ON)
+option(LT_FETCH_SPDLOG "Fetch spdlog when it is not provided by the system" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
+find_package(spdlog CONFIG QUIET)
+if(NOT spdlog_FOUND)
+    if(LT_FETCH_SPDLOG)
+        include(FetchContent)
+        FetchContent_Declare(
+            spdlog
+            URL https://github.com/gabime/spdlog/archive/refs/tags/v1.17.0.zip
+        )
+        FetchContent_MakeAvailable(spdlog)
+    else()
+        message(FATAL_ERROR "spdlog was not found. Enable LT_FETCH_SPDLOG or provide spdlog::spdlog.")
+    endif()
+endif()
+
+if(TARGET spdlog::spdlog_header_only)
+    set(LT_SPDLOG_TARGET spdlog::spdlog_header_only)
+else()
+    set(LT_SPDLOG_TARGET spdlog::spdlog)
+endif()
+
 add_library(lt_core
+    src/log.cpp
     src/cpu/path_tracer.cpp
     src/cpu/cuda_stub.cpp
     src/gltf_loader.cpp
@@ -25,6 +47,7 @@ add_library(lt_core
 )
 
 target_include_directories(lt_core PUBLIC include)
+target_link_libraries(lt_core PUBLIC ${LT_SPDLOG_TARGET})
 
 if(WIN32)
     target_link_libraries(lt_core PUBLIC windowscodecs ole32 urlmon)
@@ -32,6 +55,7 @@ endif()
 
 if(MSVC)
     target_compile_options(lt_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
+    target_compile_definitions(lt_core PUBLIC _SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING)
 else()
     target_compile_options(lt_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
 endif()

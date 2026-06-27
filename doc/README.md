@@ -19,6 +19,7 @@
 | [06-cli-and-editor.md](06-cli-and-editor.md) | 命令行参数和编辑器 UI 的入口、状态和刷新规则 |
 | [07-development-recipes.md](07-development-recipes.md) | 按功能查找要改的代码，包含实施与验证清单 |
 | [08-build-and-verification.md](08-build-and-verification.md) | 如何构建、冒烟测试和检查 CPU/CUDA 一致性 |
+| [09-logging.md](09-logging.md) | 日志 API、CLI 日志参数、编辑器 Log 面板和新增功能时的日志 checklist |
 
 ## 按需求快速查找
 
@@ -32,6 +33,7 @@
 | 支持新的文件格式 | [新增场景导入器](04-scene-and-assets.md#新增场景导入器) | 新 loader、`load_scene()`、`CMakeLists.txt` |
 | 支持新的纹理格式 | [纹理 API](04-scene-and-assets.md#纹理加载与采样) | `include/lt/texture.h`、`src/texture.cpp` |
 | 新增 CLI 参数 | [CLI 扩展](06-cli-and-editor.md#新增命令行参数) | `src/cli/render_options.*`、`src/main.cpp` |
+| 新增日志或诊断点 | [日志系统](09-logging.md) | `include/lt/log.h`、`src/log.cpp`、相关加载器/后端/编辑器操作 |
 | 新增编辑器面板或控件 | [编辑器扩展](06-cli-and-editor.md#新增编辑器控件) | `src/editor_win32.cpp`、`src/editor/editor_state.h` |
 | 新增渲染选项 | [RenderSettings 传播链](03-rendering-pipeline.md#新增渲染设置时的传播链) | `include/lt/renderer.h`、CPU、CUDA、CLI、编辑器 |
 | 修改 BVH/求交 | [加速结构](03-rendering-pipeline.md#加速结构) | `src/scene/render_scene.cpp`、CPU/GPU intersection |
@@ -46,6 +48,7 @@
 - 编辑器修改状态后必须调用 `reset_accumulation()`，并传入正确的 `RenderDirty`。
 - `RenderScene` 是从 `Scene` 构建的加速数据。修改几何、三角灯列表或会影响 BVH 的数据时必须标记 `Geometry`。
 - 当前 NPR 只在 CPU 实现；启用 NPR 时 CLI 和编辑器都会回退到 CPU。
+- 日志系统只记录边界事件和诊断信息，不要进入 CPU 像素循环、sample 循环或 CUDA device code。
 - 当前原生 `.lt` 保存并不能完整保留 glTF/PBRT 导入的所有高级材质字段和 UV 数据。详见 [场景保存限制](04-scene-and-assets.md#保存限制)。
 
 ## 代码入口
@@ -57,4 +60,5 @@
 - 场景转换和 I/O：[`src/scene/`](../src/scene/)
 - 命令行：[`src/main.cpp`](../src/main.cpp)、[`src/cli/`](../src/cli/)
 - 编辑器：[`src/editor_win32.cpp`](../src/editor_win32.cpp)、[`src/editor/`](../src/editor/)
+- 日志：[`include/lt/log.h`](../include/lt/log.h)、[`src/log.cpp`](../src/log.cpp)
 - 示例场景：[`scenes/`](../scenes/)

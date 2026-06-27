@@ -15,6 +15,7 @@
 - `LT_ENABLE_CUDA`：尝试启用 CUDA；找不到编译器时仍会构建 CPU 版本。
 - `LT_BUILD_EDITOR`：是否构建编辑器。
 - `LT_FETCH_IMGUI`：是否通过 `FetchContent` 获取 Dear ImGui。
+- `LT_FETCH_SPDLOG`：系统未提供 spdlog 时是否通过 `FetchContent` 获取日志依赖。
 
 `lt_core` 的公开 include 目录是 `include/`。外部 CMake 目标链接 `lt_core` 后即可包含 `lt/scene.h`、`lt/renderer.h` 等头文件。
 
@@ -54,6 +55,7 @@ flowchart LR
 - `material.h`：材质基类、BRDF 派生类、NPR 配置。
 - `scene.h`：可编辑场景、渲染场景、加载保存和基础几何生成。
 - `renderer.h`：渲染设置、帧缓冲和渲染器接口。
+- `log.h`：同步日志配置、日志宏和编辑器/测试可订阅的 observer API。
 
 ### `src/scene`
 

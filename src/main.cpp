@@ -19,13 +19,31 @@ bool write_ppm(const std::string& path, const lt::Framebuffer& framebuffer) {
     return true;
 }
 
+struct LoggingScope {
+    ~LoggingScope() {
+        lt::flush_logs();
+        lt::shutdown_logging();
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
     lt::cli::RenderOptions options = lt::cli::parse_render_options(argc, argv);
+    lt::LogConfig log_config;
+    log_config.logger_name = "lt_render";
+    log_config.enable_console = options.log_console_level != lt::LogLevel::Off;
+    log_config.console_level = options.log_console_level;
+    log_config.enable_file = options.log_file_enabled && !options.log_file_path.empty();
+    log_config.file_level = options.log_file_level;
+    log_config.file_path = options.log_file_path;
+    lt::initialize_logging(log_config);
+    LoggingScope logging_scope;
+
+    LT_LOG_INFO("Starting render: scene='{}' output='{}'", options.scene_path, options.output_path);
     lt::SceneLoadResult loaded = lt::load_scene(options.scene_path);
     if (!loaded.error.empty()) {
-        std::cerr << loaded.error << "\nUsing fallback default scene.\n";
+        LT_LOG_WARN("{}; using fallback default scene", loaded.error);
     }
     lt::cli::apply_material_styles(options, loaded.scene, std::cerr);
 
@@ -33,10 +51,11 @@ int main(int argc, char** argv) {
     lt::CudaPathTracer cuda;
     lt::IRenderer* renderer = &cpu;
     if (options.prefer_cuda && lt::stylized_rendering_enabled(options.settings, loaded.scene)) {
-        std::cout << "Stylized rendering is currently implemented on CPU; using CPU renderer.\n";
+        LT_LOG_WARN("Stylized rendering is currently implemented on CPU; using CPU renderer");
     } else if (options.prefer_cuda && cuda.available()) {
         renderer = &cuda;
     }
+    LT_LOG_INFO("Using renderer: {}", renderer->name());
 
     lt::Framebuffer framebuffer;
     framebuffer.resize(options.settings.width, options.settings.height);
@@ -45,14 +64,21 @@ int main(int argc, char** argv) {
         options.settings.frame_index = frame;
         options.settings.dirty = frame == 0 ? lt::RenderDirty::All : lt::RenderDirty::None;
         renderer->render(loaded.scene, options.settings, framebuffer);
-        std::cout << "\r" << renderer->name() << " frame " << (frame + 1u) << "/" << frames << std::flush;
+        if (!options.quiet) {
+            std::cout << "\r" << renderer->name() << " frame " << (frame + 1u) << "/" << frames << std::flush;
+        }
     }
-    std::cout << "\n";
+    if (!options.quiet) {
+        std::cout << "\n" << std::flush;
+    }
 
     if (!write_ppm(options.output_path, framebuffer)) {
-        std::cerr << "Could not write " << options.output_path << "\n";
+        LT_LOG_ERROR("Could not write {}", options.output_path);
         return 1;
     }
-    std::cout << "Wrote " << options.output_path << "\n";
+    LT_LOG_INFO("Wrote {}", options.output_path);
+    if (!options.quiet) {
+        std::cout << "Wrote " << options.output_path << "\n";
+    }
     return 0;
 }

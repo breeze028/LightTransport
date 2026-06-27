@@ -1,4 +1,5 @@
 #include "scene_internal.h"
+#include "lt/log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -6,6 +7,7 @@
 #include <functional>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -143,8 +145,10 @@ bool is_url(const std::string& path) {
 
 SceneLoadResult load_url_scene(const std::string& url) {
 #if defined(_WIN32)
+    LT_LOG_INFO("Downloading scene URL '{}'", url);
     char temp_dir[MAX_PATH] = {};
     if (GetTempPathA(MAX_PATH, temp_dir) == 0) {
+        LT_LOG_ERROR("Could not find temporary directory for URL scene cache");
         return {make_default_scene(), "Could not find temporary directory for URL scene cache"};
     }
     std::string extension = lowercase_extension(url);
@@ -154,10 +158,13 @@ SceneLoadResult load_url_scene(const std::string& url) {
     const std::string cached = std::string(temp_dir) + "LightTransport_" + std::to_string(std::hash<std::string>{}(url)) + extension;
     const HRESULT result = URLDownloadToFileA(nullptr, url.c_str(), cached.c_str(), 0, nullptr);
     if (FAILED(result)) {
+        LT_LOG_ERROR("Could not download scene URL '{}'", url);
         return {make_default_scene(), "Could not download scene URL: " + url};
     }
+    LT_LOG_DEBUG("Downloaded scene URL '{}' to '{}'", url, cached);
     return load_scene(cached);
 #else
+    LT_LOG_ERROR("URL scene loading is only implemented on Windows builds: '{}'", url);
     return {make_default_scene(), "URL scene loading is only implemented on Windows builds"};
 #endif
 }
@@ -165,24 +172,44 @@ SceneLoadResult load_url_scene(const std::string& url) {
 } // namespace
 
 SceneLoadResult load_scene(const std::string& path) {
+    LT_LOG_INFO("Loading scene '{}'", path);
     if (is_url(path)) {
         return load_url_scene(path);
     }
 
     const std::string extension = lowercase_extension(path);
     if (extension == ".glb" || extension == ".gltf") {
-        return load_gltf_scene(path);
+        SceneLoadResult result = load_gltf_scene(path);
+        if (result.error.empty()) {
+            LT_LOG_INFO("Loaded glTF scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
+                path, result.scene.meshes.size(), result.scene.spheres.size(), result.scene.materials.size(), result.scene.textures.size());
+        } else {
+            LT_LOG_ERROR("Failed to load glTF scene '{}': {}", path, result.error);
+        }
+        return result;
     }
     if (extension == ".pbrt") {
-        return load_pbrt_scene(path);
+        SceneLoadResult result = load_pbrt_scene(path);
+        if (result.error.empty()) {
+            LT_LOG_INFO("Loaded PBRT scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
+                path, result.scene.meshes.size(), result.scene.spheres.size(), result.scene.materials.size(), result.scene.textures.size());
+        } else {
+            LT_LOG_ERROR("Failed to load PBRT scene '{}': {}", path, result.error);
+        }
+        return result;
     }
 
     std::ifstream file(path);
     if (!file) {
+        LT_LOG_ERROR("Could not open scene '{}'; using default scene fallback", path);
         return {make_default_scene(), "Could not open scene: " + path};
     }
 
     Scene scene;
+    const auto fail = [&](std::string error) {
+        LT_LOG_ERROR("Failed to load .lt scene '{}': {}", path, error);
+        return SceneLoadResult{scene, std::move(error)};
+    };
     const std::string scene_dir = parent_path(path);
     std::unordered_map<std::string, int> material_ids;
     std::vector<Vec3> legacy_material_emissions;
@@ -216,13 +243,13 @@ SceneLoadResult load_scene(const std::string& path) {
             std::string texture_path;
             input >> texture_name >> texture_path;
             if (!input) {
-                return {scene, "Invalid texture at line " + std::to_string(line_number)};
+                return fail("Invalid texture at line " + std::to_string(line_number));
             }
             Texture texture;
             std::string error;
             const std::string resolved_texture_path = join_path(scene_dir, texture_path);
             if (!load_texture_file(texture_name, resolved_texture_path, texture, error)) {
-                return {scene, error};
+                return fail(error);
             }
             texture.path = texture_path;
             scene.textures.push_back(std::make_shared<Texture>(std::move(texture)));
@@ -230,7 +257,7 @@ SceneLoadResult load_scene(const std::string& path) {
             std::string texture_name;
             input >> scene.environment.color.x >> scene.environment.color.y >> scene.environment.color.z >> scene.environment.strength;
             if (!input) {
-                return {scene, "Invalid environment at line " + std::to_string(line_number)};
+                return fail("Invalid environment at line " + std::to_string(line_number));
             }
             if (input >> texture_name) {
                 scene.environment.texture = find_texture(scene, texture_name);
@@ -247,7 +274,7 @@ SceneLoadResult load_scene(const std::string& path) {
             Vec3 legacy_emission;
             input >> material_name >> albedo.x >> albedo.y >> albedo.z;
             if (!input) {
-                return {scene, "Invalid material at line " + std::to_string(line_number)};
+                return fail("Invalid material at line " + std::to_string(line_number));
             }
 
             std::vector<std::string> remaining_tokens;
@@ -287,7 +314,7 @@ SceneLoadResult load_scene(const std::string& path) {
             input >> material_name >> style_name;
             const int index = material_id(material_ids, material_name);
             if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
-                return {scene, "Invalid npr material at line " + std::to_string(line_number)};
+                return fail("Invalid npr material at line " + std::to_string(line_number));
             }
             std::vector<std::string> npr_tokens{style_name};
             for (std::string token; input >> token;) {
@@ -299,7 +326,7 @@ SceneLoadResult load_scene(const std::string& path) {
             LightComponent light;
             input >> mesh_name >> light.color.x >> light.color.y >> light.color.z >> light.intensity;
             if (!input || light.intensity < 0.0f) {
-                return {scene, "Invalid light at line " + std::to_string(line_number)};
+                return fail("Invalid light at line " + std::to_string(line_number));
             }
             int double_sided = light.double_sided ? 1 : 0;
             if (input >> double_sided) {
@@ -313,7 +340,7 @@ SceneLoadResult load_scene(const std::string& path) {
             input >> sphere.name >> material_name >> sphere.center.x >> sphere.center.y >> sphere.center.z >> sphere.radius;
             sphere.material = material_id(material_ids, material_name);
             if (!input || sphere.material < 0 || sphere.radius <= 0.0f) {
-                return {scene, "Invalid sphere at line " + std::to_string(line_number)};
+                return fail("Invalid sphere at line " + std::to_string(line_number));
             }
             scene.spheres.push_back(sphere);
             scene.uses_builtin_default_meshes = false;
@@ -334,13 +361,13 @@ SceneLoadResult load_scene(const std::string& path) {
             }
             mesh.material = material_id(material_ids, material_name);
             if (!input || mesh.material < 0 || vertex_count < 0 || triangle_count < 0) {
-                return {scene, "Invalid mesh header at line " + std::to_string(line_number)};
+                return fail("Invalid mesh header at line " + std::to_string(line_number));
             }
 
             for (int i = 0; i < vertex_count; ++i) {
                 Vec3 vertex;
                 if (!(file >> vertex.x >> vertex.y >> vertex.z)) {
-                    return {scene, "Invalid mesh vertex data after line " + std::to_string(line_number)};
+                    return fail("Invalid mesh vertex data after line " + std::to_string(line_number));
                 }
                 mesh.vertices.push_back(vertex);
                 mesh.texcoords.push_back(scene_detail::default_uv(vertex));
@@ -349,26 +376,26 @@ SceneLoadResult load_scene(const std::string& path) {
             std::string first_index_token;
             if (triangle_count > 0) {
                 if (!(file >> first_index_token)) {
-                    return {scene, "Invalid mesh index data after line " + std::to_string(line_number)};
+                    return fail("Invalid mesh index data after line " + std::to_string(line_number));
                 }
                 if (first_index_token == "normals") {
                     int normal_count = 0;
                     if (!(file >> normal_count) || normal_count < 0) {
-                        return {scene, "Invalid mesh normal header after line " + std::to_string(line_number)};
+                        return fail("Invalid mesh normal header after line " + std::to_string(line_number));
                     }
                     mesh.normals.reserve(static_cast<size_t>(normal_count));
                     for (int i = 0; i < normal_count; ++i) {
                         Vec3 normal;
                         if (!(file >> normal.x >> normal.y >> normal.z)) {
-                            return {scene, "Invalid mesh normal data after line " + std::to_string(line_number)};
+                            return fail("Invalid mesh normal data after line " + std::to_string(line_number));
                         }
                         mesh.normals.push_back(normalize(normal));
                     }
                     if (!mesh.normals.empty() && mesh.normals.size() != mesh.vertices.size()) {
-                        return {scene, "Mesh normal count must match vertex count after line " + std::to_string(line_number)};
+                        return fail("Mesh normal count must match vertex count after line " + std::to_string(line_number));
                     }
                     if (!(file >> first_index_token)) {
-                        return {scene, "Invalid mesh index data after line " + std::to_string(line_number)};
+                        return fail("Invalid mesh index data after line " + std::to_string(line_number));
                     }
                 }
             }
@@ -380,13 +407,13 @@ SceneLoadResult load_scene(const std::string& path) {
                 if (i == 0) {
                     std::istringstream first_index(first_index_token);
                     if (!(first_index >> a) || !first_index.eof() || !(file >> b >> c)) {
-                        return {scene, "Invalid mesh index data after line " + std::to_string(line_number)};
+                        return fail("Invalid mesh index data after line " + std::to_string(line_number));
                     }
                 } else if (!(file >> a >> b >> c)) {
-                    return {scene, "Invalid mesh index data after line " + std::to_string(line_number)};
+                    return fail("Invalid mesh index data after line " + std::to_string(line_number));
                 }
                 if (a >= mesh.vertices.size() || b >= mesh.vertices.size() || c >= mesh.vertices.size()) {
-                    return {scene, "Mesh index out of range after line " + std::to_string(line_number)};
+                    return fail("Mesh index out of range after line " + std::to_string(line_number));
                 }
                 scene_detail::add_triangle(mesh, a, b, c);
             }
@@ -400,11 +427,12 @@ SceneLoadResult load_scene(const std::string& path) {
             scene.meshes.push_back(mesh);
             scene.uses_builtin_default_meshes = false;
         } else {
-            return {scene, "Unknown scene token '" + tag + "' at line " + std::to_string(line_number)};
+            return fail("Unknown scene token '" + tag + "' at line " + std::to_string(line_number));
         }
     }
 
     if (scene.meshes.empty() && scene.spheres.empty()) {
+        LT_LOG_WARN("Scene '{}' contains no geometry; using built-in default meshes", path);
         Scene defaults = make_default_scene();
         if (!saw_camera) {
             scene.camera = defaults.camera;
@@ -432,6 +460,8 @@ SceneLoadResult load_scene(const std::string& path) {
     if (!environment_texture_name.empty()) {
         scene.environment.texture = find_texture(scene, environment_texture_name);
     }
+    LT_LOG_INFO("Loaded .lt scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
+        path, scene.meshes.size(), scene.spheres.size(), scene.materials.size(), scene.textures.size());
     return {scene, {}};
 }
 
@@ -439,6 +469,7 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
     std::ofstream output(path);
     if (!output) {
         error = "Could not write scene: " + path;
+        LT_LOG_ERROR("Could not save scene '{}': {}", path, error);
         return false;
     }
 
@@ -529,6 +560,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
     output << '\n';
 
     if (scene.uses_builtin_default_meshes) {
+        LT_LOG_INFO("Saved scene '{}' (built-in default meshes, materials={}, textures={})",
+            path, scene.materials.size(), scene.textures.size());
         return true;
     }
 
@@ -572,6 +605,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             output << mesh.indices[i] << ' ' << mesh.indices[i + 1] << ' ' << mesh.indices[i + 2] << '\n';
         }
     }
+    LT_LOG_INFO("Saved scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
+        path, scene.meshes.size(), scene.spheres.size(), scene.materials.size(), scene.textures.size());
     return true;
 }
 

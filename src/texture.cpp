@@ -1,4 +1,5 @@
 #include "lt/texture.h"
+#include "lt/log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -951,34 +952,48 @@ bool load_exr_texture(const std::string& name, const std::string& path, Texture&
 
 bool load_texture_file(const std::string& name, const std::string& path, Texture& texture, std::string& error) {
     const std::string ext = lowercase_extension(path);
+    bool ok = false;
     if (ext == ".exr") {
-        return load_exr_texture(name, path, texture, error);
-    }
-    if (ext == ".hdr") {
-        return load_hdr_texture(name, path, texture, error);
-    }
-    if (ext == ".ppm") {
-        return load_ppm_texture(name, path, texture, error);
-    }
+        ok = load_exr_texture(name, path, texture, error);
+    } else if (ext == ".hdr") {
+        ok = load_hdr_texture(name, path, texture, error);
+    } else if (ext == ".ppm") {
+        ok = load_ppm_texture(name, path, texture, error);
+    } else {
 #if defined(_WIN32)
-    return load_wic_file(name, path, texture, error);
+        ok = load_wic_file(name, path, texture, error);
 #else
-    error = "Only PPM textures are supported on this platform: " + path;
-    return false;
+        error = "Only PPM textures are supported on this platform: " + path;
+        ok = false;
 #endif
+    }
+    if (ok) {
+        LT_LOG_DEBUG("Loaded texture '{}' from '{}' ({}x{})", name, path, texture.width, texture.height);
+    } else {
+        LT_LOG_WARN("Failed to load texture '{}' from '{}': {}", name, path, error);
+    }
+    return ok;
 }
 
 bool load_texture_memory(const std::string& name, const unsigned char* data, size_t size, Texture& texture, std::string& error) {
     if (!data || size == 0) {
         error = "Embedded texture is empty";
+        LT_LOG_WARN("Failed to load embedded texture '{}': {}", name, error);
         return false;
     }
+    bool ok = false;
 #if defined(_WIN32)
-    return load_wic_memory(name, data, size, texture, error);
+    ok = load_wic_memory(name, data, size, texture, error);
 #else
     error = "Embedded PNG/JPEG textures are only supported on Windows builds";
-    return false;
+    ok = false;
 #endif
+    if (ok) {
+        LT_LOG_DEBUG("Loaded embedded texture '{}' ({} bytes, {}x{})", name, size, texture.width, texture.height);
+    } else {
+        LT_LOG_WARN("Failed to load embedded texture '{}': {}", name, error);
+    }
+    return ok;
 }
 
 } // namespace lt

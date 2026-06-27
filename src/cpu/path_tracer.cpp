@@ -1,4 +1,5 @@
 #include "lt/renderer.h"
+#include "lt/log.h"
 
 #include <algorithm>
 #include <atomic>

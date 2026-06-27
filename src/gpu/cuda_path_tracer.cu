@@ -1,4 +1,5 @@
 #include "lt/renderer.h"
+#include "lt/log.h"
 
 #if LT_HAS_CUDA
 
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace lt {
@@ -19,6 +21,10 @@ namespace {
 #include "shading.cuh"
 #include "kernel.cuh"
 #include "scene_upload.cuh"
+
+const char* cuda_error_text(cudaError_t error) {
+    return error == cudaSuccess ? nullptr : cudaGetErrorString(error);
+}
 
 } // namespace
 
@@ -73,6 +79,27 @@ void CudaPathTracer::reset() {
     release_texture_objects(texture_arrays_, texture_objects_);
 }
 
+void CudaPathTracer::render_cpu_fallback(
+    const Scene& scene,
+    const RenderSettings& settings,
+    Framebuffer& framebuffer,
+    const char* reason,
+    const char* detail) {
+    std::string key = reason ? reason : "unknown CUDA failure";
+    if (detail && *detail) {
+        key += ": ";
+        key += detail;
+    }
+    if (std::find(reported_fallback_reasons_.begin(), reported_fallback_reasons_.end(), key) == reported_fallback_reasons_.end()) {
+        reported_fallback_reasons_.push_back(key);
+        LT_LOG_WARN("CUDA path tracer fallback to CPU: {}", key);
+    } else {
+        LT_LOG_DEBUG("CUDA path tracer fallback to CPU: {}", key);
+    }
+    CpuPathTracer fallback;
+    fallback.render(scene, settings, framebuffer);
+}
+
 void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) {
     framebuffer.resize(settings.width, settings.height);
     const size_t pixels = static_cast<size_t>(settings.width) * static_cast<size_t>(settings.height);
@@ -81,22 +108,20 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         reset();
     }
 
-    if (!device_accumulation_ && cudaMalloc(&device_accumulation_, pixels * sizeof(Vec3)) != cudaSuccess) {
+    cudaError_t cuda_error = cudaSuccess;
+    if (!device_accumulation_ && (cuda_error = cudaMalloc(&device_accumulation_, pixels * sizeof(Vec3))) != cudaSuccess) {
         reset();
-        CpuPathTracer fallback;
-        fallback.render(scene, settings, framebuffer);
+        render_cpu_fallback(scene, settings, framebuffer, "could not allocate accumulation buffer", cuda_error_text(cuda_error));
         return;
     }
-    if (!device_rgba_ && cudaMalloc(&device_rgba_, pixels * sizeof(uint32_t)) != cudaSuccess) {
+    if (!device_rgba_ && (cuda_error = cudaMalloc(&device_rgba_, pixels * sizeof(uint32_t))) != cudaSuccess) {
         reset();
-        CpuPathTracer fallback;
-        fallback.render(scene, settings, framebuffer);
+        render_cpu_fallback(scene, settings, framebuffer, "could not allocate RGBA buffer", cuda_error_text(cuda_error));
         return;
     }
-    if (!device_scene_ && cudaMalloc(&device_scene_, sizeof(GpuScene)) != cudaSuccess) {
+    if (!device_scene_ && (cuda_error = cudaMalloc(&device_scene_, sizeof(GpuScene))) != cudaSuccess) {
         reset();
-        CpuPathTracer fallback;
-        fallback.render(scene, settings, framebuffer);
+        render_cpu_fallback(scene, settings, framebuffer, "could not allocate scene buffer", cuda_error_text(cuda_error));
         return;
     }
     cached_pixels_ = pixels;
@@ -113,15 +138,13 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     if (full_upload) {
         PackedGpuScene packed;
         if (!pack_scene(scene, settings, packed)) {
-            CpuPathTracer fallback;
-            fallback.render(scene, settings, framebuffer);
+            render_cpu_fallback(scene, settings, framebuffer, "could not pack scene for CUDA");
             return;
         }
         const bool upload_textures = texture_objects_.size() != packed.textures.size() || has_dirty(settings.dirty, RenderDirty::Texture);
         if (upload_textures ? !upload_texture_objects(scene, packed, texture_arrays_, texture_objects_) : !apply_cached_texture_objects(packed, texture_objects_)) {
             reset();
-            CpuPathTracer fallback;
-            fallback.render(scene, settings, framebuffer);
+            render_cpu_fallback(scene, settings, framebuffer, upload_textures ? "could not upload CUDA texture objects" : "could not apply cached CUDA texture objects");
             return;
         }
         if (!upload_buffer(device_materials_, cached_materials_, packed.materials) ||
@@ -135,8 +158,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !upload_buffer(device_mesh_instance_indices_, cached_mesh_instance_indices_, packed.mesh_instance_indices) ||
             !upload_buffer(device_tlas_nodes_, cached_tlas_nodes_, packed.tlas_nodes)) {
             reset();
-            CpuPathTracer fallback;
-            fallback.render(scene, settings, framebuffer);
+            render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA scene buffers");
             return;
         }
         packed.scene.materials = static_cast<GpuMaterial*>(device_materials_);
@@ -149,36 +171,34 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(device_mesh_instances_);
         packed.scene.mesh_instance_indices = static_cast<int*>(device_mesh_instance_indices_);
         packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(device_tlas_nodes_);
-        if (cudaMemcpy(device_scene, &packed.scene, sizeof(GpuScene), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cuda_error = cudaMemcpy(device_scene, &packed.scene, sizeof(GpuScene), cudaMemcpyHostToDevice);
+        if (cuda_error != cudaSuccess) {
             reset();
-            CpuPathTracer fallback;
-            fallback.render(scene, settings, framebuffer);
+            render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA scene header", cuda_error_text(cuda_error));
             return;
         }
         scene_uploaded_ = true;
     } else {
         if (has_dirty(settings.dirty, RenderDirty::Camera) && !upload_camera(device_scene, scene.camera)) {
             reset();
-            CpuPathTracer fallback;
-            fallback.render(scene, settings, framebuffer);
+            render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA camera");
             return;
         }
         if (has_dirty(settings.dirty, RenderDirty::Environment)) {
             GpuScene environment_scene;
             if (!make_environment_gpu(scene, environment_scene) || !upload_environment(device_scene, environment_scene)) {
                 reset();
-                CpuPathTracer fallback;
-                fallback.render(scene, settings, framebuffer);
+                render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA environment");
                 return;
             }
         }
     }
 
     if (settings.frame_index == 0u || has_dirty(settings.dirty, RenderDirty::Render)) {
-        if (cudaMemset(device_accumulation, 0, pixels * sizeof(Vec3)) != cudaSuccess) {
+        cuda_error = cudaMemset(device_accumulation, 0, pixels * sizeof(Vec3));
+        if (cuda_error != cudaSuccess) {
             reset();
-            CpuPathTracer fallback;
-            fallback.render(scene, settings, framebuffer);
+            render_cpu_fallback(scene, settings, framebuffer, "could not clear CUDA accumulation buffer", cuda_error_text(cuda_error));
             return;
         }
     }
@@ -193,16 +213,14 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     const cudaError_t render_error = cudaDeviceSynchronize();
     if (render_error != cudaSuccess) {
         reset();
-        CpuPathTracer fallback;
-        fallback.render(scene, settings, framebuffer);
+        render_cpu_fallback(scene, settings, framebuffer, "CUDA kernel failed", cuda_error_text(render_error));
         return;
     }
     const cudaError_t rgba_error = cudaMemcpy(framebuffer.rgba.data(), device_rgba, pixels * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     if (rgba_error != cudaSuccess) {
         reset();
         framebuffer.clear();
-        CpuPathTracer fallback;
-        fallback.render(scene, settings, framebuffer);
+        render_cpu_fallback(scene, settings, framebuffer, "could not copy CUDA RGBA buffer", cuda_error_text(rgba_error));
     }
 }
 

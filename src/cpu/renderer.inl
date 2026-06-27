@@ -6,6 +6,13 @@ void CpuPathTracer::reset() {
 void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) {
     framebuffer.resize(settings.width, settings.height);
     if (!scene_uploaded_ || has_dirty(settings.dirty, RenderDirty::Geometry)) {
+        LT_LOG_DEBUG(
+            "CPU render scene rebuild: meshes={} spheres={} materials={} textures={} accel={}",
+            scene.meshes.size(),
+            scene.spheres.size(),
+            scene.materials.size(),
+            scene.textures.size(),
+            static_cast<int>(settings.acceleration_structure));
         cached_render_scene_ = build_render_scene(scene);
         scene_uploaded_ = true;
     }

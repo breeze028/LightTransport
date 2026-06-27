@@ -53,6 +53,20 @@ NPR：
 .\build\Release\lt_render.exe scenes\toon_material_test.lt build\smoke_npr.ppm --cpu --size 64 64 --style-samples 2 --style-depth 1
 ```
 
+日志：
+
+```powershell
+.\build\Release\lt_render.exe scenes\cornell.lt build\smoke_log.ppm --cpu --size 32 32 --frames 1 --quiet --log-file build\smoke.log
+Get-Content build\smoke.log -Tail 20
+```
+
+加载失败 fallback：
+
+```powershell
+.\build\Release\lt_render.exe scenes\missing.lt build\smoke_missing.ppm --cpu --size 16 16 --frames 1 --quiet --log-file build\missing.log
+Get-Content build\missing.log -Tail 20
+```
+
 解析球与 Mesh 混合由 `cornell.lt` 和 `toon_material_test.lt` 覆盖。
 
 ## 功能对应测试矩阵

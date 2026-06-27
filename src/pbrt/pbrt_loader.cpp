@@ -1,4 +1,5 @@
 #include "lt/scene.h"
+#include "lt/log.h"
 
 #include <algorithm>
 #include <array>
@@ -473,14 +474,23 @@ bool load_ply_mesh(const std::filesystem::path& path, Mesh& mesh, std::string& e
 class PbrtLoader {
 public:
     SceneLoadResult load(const std::string& path) {
+        LT_LOG_INFO("Loading PBRT scene '{}'", path);
         scene_.camera = {{0.0f, 1.0f, 4.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, 45.0f};
         scene_.environment.constant = true;
         scene_.materials.push_back(make_material("default", {0.8f, 0.8f, 0.8f}, BrdfModel::Principled, 0.5f, 0.0f));
         named_materials_["default"] = 0;
         state_.material = 0;
         parse_file(std::filesystem::absolute(path));
-        if (!error_.empty()) return {scene_, error_};
-        if (scene_.meshes.empty()) return {make_default_scene(), "PBRT scene contains no supported meshes: " + path};
+        if (!error_.empty()) {
+            LT_LOG_ERROR("Failed to load PBRT scene '{}': {}", path, error_);
+            return {scene_, error_};
+        }
+        if (scene_.meshes.empty()) {
+            LT_LOG_ERROR("PBRT scene '{}' contains no supported meshes", path);
+            return {make_default_scene(), "PBRT scene contains no supported meshes: " + path};
+        }
+        LT_LOG_INFO("Loaded PBRT scene '{}' (meshes={}, materials={}, textures={})",
+            path, scene_.meshes.size(), scene_.materials.size(), scene_.textures.size());
         return {scene_, {}};
     }
 
@@ -675,6 +685,8 @@ private:
         if (load_texture_file(name, texture_path.string(), texture, error)) {
             texture.path = filename;
             scene_.textures.push_back(std::make_shared<Texture>(std::move(texture)));
+        } else {
+            LT_LOG_WARN("PBRT texture '{}' was skipped: {}", texture_path.string(), error);
         }
     }
 
@@ -760,6 +772,8 @@ private:
                     scene_.textures.push_back(std::make_shared<Texture>(std::move(texture)));
                     scene_.environment.texture = scene_.textures.back();
                     scene_.environment.constant = false;
+                } else {
+                    LT_LOG_WARN("PBRT environment texture '{}' was skipped: {}", filename, error);
                 }
             }
         } else if (type == "point" || type == "spot" || type == "goniometric") {
