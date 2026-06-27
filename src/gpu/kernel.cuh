@@ -9,7 +9,7 @@ __global__ void render_kernel(const GpuScene* scene_ptr, RenderSettings settings
     uint32_t rng = make_pixel_seed(static_cast<uint32_t>(x), static_cast<uint32_t>(y), settings.frame_index);
     Vec3 sample{};
     for (int s = 0; s < settings.samples_per_pixel; ++s) {
-        sample = add(sample, trace_gpu(scene, camera_ray(scene.camera, x, y, settings.width, settings.height, rng), rng, settings));
+        sample = add(sample, trace_gpu_with_irradiance_probe_debug(scene, camera_ray(scene.camera, x, y, settings.width, settings.height, rng), rng, settings));
     }
     sample = divv(sample, static_cast<float>(settings.samples_per_pixel));
     accumulation[idx] = add(accumulation[idx], sample);

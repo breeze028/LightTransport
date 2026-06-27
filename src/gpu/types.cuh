@@ -74,6 +74,33 @@ struct GpuMeshInstance {
     int mesh = -1;
 };
 
+struct GpuIrradianceVolumeGrid {
+    Vec3 bounds_min;
+    Vec3 bounds_max;
+    int resolution = 0;
+    int sample_offset = 0;
+    int cell_offset = 0;
+    int cell_count = 0;
+};
+
+struct GpuIrradianceVolumeDebugProbe {
+    Vec3 position;
+    float radius = 0.05f;
+};
+
+struct GpuIrradianceVolume {
+    int direction_count = 0;
+    int grid_count = 0;
+    int irradiance_sample_count = 0;
+    int cell_count = 0;
+    int debug_probe_count = 0;
+    Vec3* directions = nullptr;
+    Vec3* irradiance = nullptr;
+    GpuIrradianceVolumeGrid* grids = nullptr;
+    int* cell_subgrid_indices = nullptr;
+    GpuIrradianceVolumeDebugProbe* debug_probes = nullptr;
+};
+
 struct GpuScene {
     Camera camera;
     int material_count = 0;
@@ -103,6 +130,7 @@ struct GpuScene {
     GpuMeshInstance* mesh_instances = nullptr;
     int* mesh_instance_indices = nullptr;
     GpuBvhNode* tlas_nodes = nullptr;
+    GpuIrradianceVolume irradiance_volume;
 };
 
 struct PackedGpuScene {

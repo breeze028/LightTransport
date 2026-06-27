@@ -490,6 +490,211 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
     return direct;
 }
 
+__device__ Vec3 estimate_direct_environment_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material, Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
+    const GpuMaterialSample sample = sample_material_gpu(scene, material, hit.normal, wo, hit.uv, hit.front_face, rng);
+    if (!isfinite(sample.pdf) || sample.pdf <= 0.0f || !finite_vec_gpu(sample.weight) || ddot(sample.weight, sample.weight) <= 0.0f) {
+        return {};
+    }
+    const float offset_side = ddot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;
+    const Ray env_ray{add(hit.position, mul(hit.normal, 0.001f * offset_side)), sample.direction};
+    GpuHit env_hit;
+    if (intersect_gpu(scene, env_ray, env_hit)) {
+        return {};
+    }
+    return clamp_sample_radiance_gpu(mul(sample.weight, environment_radiance_gpu(scene, sample.direction, settings)), 64.0f);
+}
+
+__device__ int irradiance_grid_sample_index_gpu(int resolution, int x, int y, int z) {
+    return (z * resolution + y) * resolution + x;
+}
+
+__device__ int irradiance_grid_cell_index_gpu(int resolution, int x, int y, int z) {
+    const int cells_per_axis = resolution - 1;
+    return (z * cells_per_axis + y) * cells_per_axis + x;
+}
+
+__device__ bool irradiance_aabb_valid_gpu(Vec3 bounds_min, Vec3 bounds_max) {
+    return isfinite(bounds_min.x) && isfinite(bounds_min.y) && isfinite(bounds_min.z) &&
+        isfinite(bounds_max.x) && isfinite(bounds_max.y) && isfinite(bounds_max.z) &&
+        bounds_max.x > bounds_min.x && bounds_max.y > bounds_min.y && bounds_max.z > bounds_min.z;
+}
+
+__device__ int nearest_irradiance_direction_gpu(const GpuIrradianceVolume& volume, Vec3 direction) {
+    direction = dnormalize(direction);
+    if (ddot(direction, direction) <= 0.0f || volume.direction_count <= 0 || !volume.directions) {
+        return -1;
+    }
+    int best = 0;
+    float best_dot = -kInfinity;
+    for (int i = 0; i < volume.direction_count; ++i) {
+        const float d = ddot(direction, volume.directions[i]);
+        if (d > best_dot) {
+            best_dot = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+__device__ Vec3 irradiance_sample_value_gpu(const GpuIrradianceVolume& volume, const GpuIrradianceVolumeGrid& grid, int direction_index, int x, int y, int z) {
+    if (direction_index < 0 || direction_index >= volume.direction_count || !volume.irradiance) {
+        return {};
+    }
+    const int local_sample = irradiance_grid_sample_index_gpu(grid.resolution, x, y, z);
+    const int sample_index = grid.sample_offset + local_sample;
+    if (sample_index < 0 || sample_index >= volume.irradiance_sample_count) {
+        return {};
+    }
+    return volume.irradiance[sample_index * volume.direction_count + direction_index];
+}
+
+__device__ Vec3 query_irradiance_grid_gpu(const GpuIrradianceVolume& volume, const GpuIrradianceVolumeGrid& grid, int direction_index, Vec3 position) {
+    if (grid.resolution < 2 || !irradiance_aabb_valid_gpu(grid.bounds_min, grid.bounds_max)) {
+        return {};
+    }
+
+    const Vec3 extent = sub(grid.bounds_max, grid.bounds_min);
+    const float sx = dclamp((position.x - grid.bounds_min.x) / fmaxf(1.0e-8f, extent.x), 0.0f, 1.0f) * static_cast<float>(grid.resolution - 1);
+    const float sy = dclamp((position.y - grid.bounds_min.y) / fmaxf(1.0e-8f, extent.y), 0.0f, 1.0f) * static_cast<float>(grid.resolution - 1);
+    const float sz = dclamp((position.z - grid.bounds_min.z) / fmaxf(1.0e-8f, extent.z), 0.0f, 1.0f) * static_cast<float>(grid.resolution - 1);
+    const int x0 = iclamp_gpu(static_cast<int>(floorf(sx)), 0, grid.resolution - 2);
+    const int y0 = iclamp_gpu(static_cast<int>(floorf(sy)), 0, grid.resolution - 2);
+    const int z0 = iclamp_gpu(static_cast<int>(floorf(sz)), 0, grid.resolution - 2);
+    const float fx = dclamp(sx - static_cast<float>(x0), 0.0f, 1.0f);
+    const float fy = dclamp(sy - static_cast<float>(y0), 0.0f, 1.0f);
+    const float fz = dclamp(sz - static_cast<float>(z0), 0.0f, 1.0f);
+
+    const Vec3 c000 = irradiance_sample_value_gpu(volume, grid, direction_index, x0, y0, z0);
+    const Vec3 c100 = irradiance_sample_value_gpu(volume, grid, direction_index, x0 + 1, y0, z0);
+    const Vec3 c010 = irradiance_sample_value_gpu(volume, grid, direction_index, x0, y0 + 1, z0);
+    const Vec3 c110 = irradiance_sample_value_gpu(volume, grid, direction_index, x0 + 1, y0 + 1, z0);
+    const Vec3 c001 = irradiance_sample_value_gpu(volume, grid, direction_index, x0, y0, z0 + 1);
+    const Vec3 c101 = irradiance_sample_value_gpu(volume, grid, direction_index, x0 + 1, y0, z0 + 1);
+    const Vec3 c011 = irradiance_sample_value_gpu(volume, grid, direction_index, x0, y0 + 1, z0 + 1);
+    const Vec3 c111 = irradiance_sample_value_gpu(volume, grid, direction_index, x0 + 1, y0 + 1, z0 + 1);
+    const Vec3 c00 = dlerp(c000, c100, fx);
+    const Vec3 c10 = dlerp(c010, c110, fx);
+    const Vec3 c01 = dlerp(c001, c101, fx);
+    const Vec3 c11 = dlerp(c011, c111, fx);
+    const Vec3 c0 = dlerp(c00, c10, fy);
+    const Vec3 c1 = dlerp(c01, c11, fy);
+    return dlerp(c0, c1, fz);
+}
+
+__device__ int query_irradiance_grid_index_gpu(const GpuIrradianceVolume& volume, Vec3 position) {
+    if (volume.grid_count <= 0 || !volume.grids) {
+        return -1;
+    }
+    int grid_index = 0;
+    for (int depth = 0; depth < 4; ++depth) {
+        const GpuIrradianceVolumeGrid grid = volume.grids[grid_index];
+        if (grid.resolution < 2 || grid.cell_count <= 0 || !volume.cell_subgrid_indices ||
+            !irradiance_aabb_valid_gpu(grid.bounds_min, grid.bounds_max)) {
+            return grid_index;
+        }
+        const Vec3 extent = sub(grid.bounds_max, grid.bounds_min);
+        const float sx = dclamp((position.x - grid.bounds_min.x) / fmaxf(1.0e-8f, extent.x), 0.0f, 1.0f) * static_cast<float>(grid.resolution - 1);
+        const float sy = dclamp((position.y - grid.bounds_min.y) / fmaxf(1.0e-8f, extent.y), 0.0f, 1.0f) * static_cast<float>(grid.resolution - 1);
+        const float sz = dclamp((position.z - grid.bounds_min.z) / fmaxf(1.0e-8f, extent.z), 0.0f, 1.0f) * static_cast<float>(grid.resolution - 1);
+        const int x = iclamp_gpu(static_cast<int>(floorf(sx)), 0, grid.resolution - 2);
+        const int y = iclamp_gpu(static_cast<int>(floorf(sy)), 0, grid.resolution - 2);
+        const int z = iclamp_gpu(static_cast<int>(floorf(sz)), 0, grid.resolution - 2);
+        const int local_cell = irradiance_grid_cell_index_gpu(grid.resolution, x, y, z);
+        if (local_cell < 0 || local_cell >= grid.cell_count) {
+            return grid_index;
+        }
+        const int subgrid_index = volume.cell_subgrid_indices[grid.cell_offset + local_cell];
+        if (subgrid_index < 0 || subgrid_index >= volume.grid_count || subgrid_index == grid_index) {
+            return grid_index;
+        }
+        grid_index = subgrid_index;
+    }
+    return grid_index;
+}
+
+__device__ Vec3 query_irradiance_volume_gpu(const GpuIrradianceVolume& volume, Vec3 position, Vec3 normal) {
+    const int direction_index = nearest_irradiance_direction_gpu(volume, normal);
+    const int grid_index = query_irradiance_grid_index_gpu(volume, position);
+    if (direction_index < 0 || grid_index < 0 || grid_index >= volume.grid_count) {
+        return {};
+    }
+    return query_irradiance_grid_gpu(volume, volume.grids[grid_index], direction_index, position);
+}
+
+__device__ bool material_uses_irradiance_volume_gi_gpu(const RenderSettings& settings, const GpuMaterial& material) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
+        return true;
+    }
+    return settings.irradiance_volume_principled_gi && material.brdf_model == static_cast<int>(BrdfModel::Principled);
+}
+
+__device__ Vec3 shade_material_from_irradiance_volume_gpu(
+    const GpuScene& scene,
+    const RenderSettings& settings,
+    const GpuMaterial& material,
+    const GpuHit& hit,
+    Vec3 wo,
+    uint32_t& rng) {
+    const Vec3 base_color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, hit.uv));
+    const float diffuse_scale = material.brdf_model == static_cast<int>(BrdfModel::Principled)
+        ? 1.0f - material_metallic_gpu(scene, material, hit.uv)
+        : 1.0f;
+    const Vec3 irradiance = query_irradiance_volume_gpu(scene.irradiance_volume, hit.position, hit.normal);
+    const Vec3 indirect = mul(mul(base_color, diffuse_scale), divv(irradiance, kPi));
+    const Vec3 direct_lights = estimate_direct_gpu(scene, hit, material, wo, rng, settings);
+    const Vec3 direct_environment = estimate_direct_environment_gpu(scene, hit, material, wo, rng, settings);
+    return add(add(direct_lights, direct_environment), indirect);
+}
+
+struct GpuIrradianceVolumeProbeHit {
+    float t = kInfinity;
+    Vec3 position;
+    Vec3 normal;
+};
+
+__device__ bool intersect_irradiance_debug_probe_sphere_gpu(const GpuIrradianceVolumeDebugProbe& probe, const Ray& ray, float radius_scale, GpuIrradianceVolumeProbeHit& hit) {
+    const float radius = fmaxf(1.0e-5f, probe.radius * fmaxf(0.0f, radius_scale));
+    const Vec3 oc = sub(ray.origin, probe.position);
+    const float a = ddot(ray.direction, ray.direction);
+    const float half_b = ddot(oc, ray.direction);
+    const float c = ddot(oc, oc) - radius * radius;
+    const float discriminant = half_b * half_b - a * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+    const float root = sqrtf(discriminant);
+    float t = (-half_b - root) / a;
+    if (t <= 0.001f || t >= hit.t) {
+        t = (-half_b + root) / a;
+        if (t <= 0.001f || t >= hit.t) {
+            return false;
+        }
+    }
+    hit.t = t;
+    hit.position = add(ray.origin, mul(ray.direction, t));
+    hit.normal = dnormalize(divv(sub(hit.position, probe.position), radius));
+    return true;
+}
+
+__device__ bool intersect_irradiance_debug_probes_gpu(const GpuIrradianceVolume& volume, const Ray& ray, float radius_scale, GpuIrradianceVolumeProbeHit& hit) {
+    if (radius_scale <= 0.0f || volume.debug_probe_count <= 0 || !volume.debug_probes) {
+        return false;
+    }
+    bool found = false;
+    for (int i = 0; i < volume.debug_probe_count; ++i) {
+        found = intersect_irradiance_debug_probe_sphere_gpu(volume.debug_probes[i], ray, radius_scale, hit) || found;
+    }
+    return found;
+}
+
+__device__ Vec3 shade_irradiance_debug_probe_gpu(const GpuIrradianceVolumeProbeHit& hit, Vec3 view_direction) {
+    const Vec3 view_light = dnormalize(Vec3{-0.35f, 0.55f, -0.75f});
+    const float lambert = fmaxf(0.0f, ddot(hit.normal, mul(view_light, -1.0f)));
+    const float rim = powf(dclamp(1.0f - fabsf(ddot(hit.normal, mul(view_direction, -1.0f))), 0.0f, 1.0f), 2.0f);
+    const float tone = dclamp(0.28f + lambert * 0.55f + rim * 0.18f, 0.0f, 1.0f);
+    return {tone, tone, tone};
+}
+
 __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const RenderSettings& settings) {
     Vec3 radiance{};
     Vec3 throughput{1.0f, 1.0f, 1.0f};
@@ -530,6 +735,12 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
             break;
         }
         const Vec3 wo = mul(ray.direction, -1.0f);
+        if (settings.use_irradiance_volume && material_uses_irradiance_volume_gi_gpu(settings, material)) {
+            radiance = add(radiance, clamp_sample_radiance_gpu(
+                mul(throughput, shade_material_from_irradiance_volume_gpu(scene, settings, material, hit, wo, rng)),
+                sample_clamp));
+            break;
+        }
         radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, estimate_direct_gpu(scene, hit, material, wo, rng, settings)), sample_clamp));
         if (bounce >= 3) {
             const float p = dclamp(fmaxf(throughput.x, fmaxf(throughput.y, throughput.z)), 0.05f, 0.95f);
@@ -552,3 +763,20 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
     return radiance;
 }
 
+__device__ Vec3 trace_gpu_with_irradiance_probe_debug(const GpuScene& scene, Ray ray, uint32_t& rng, const RenderSettings& settings) {
+    if (!settings.use_irradiance_volume || !settings.irradiance_volume_debug_probes ||
+        scene.irradiance_volume.debug_probe_count <= 0) {
+        return trace_gpu(scene, ray, rng, settings);
+    }
+
+    GpuIrradianceVolumeProbeHit probe_hit;
+    if (!intersect_irradiance_debug_probes_gpu(scene.irradiance_volume, ray, settings.irradiance_volume_debug_probe_radius_scale, probe_hit)) {
+        return trace_gpu(scene, ray, rng, settings);
+    }
+
+    GpuHit scene_hit;
+    if (intersect_gpu(scene, ray, scene_hit) && scene_hit.t < probe_hit.t) {
+        return trace_gpu(scene, ray, rng, settings);
+    }
+    return shade_irradiance_debug_probe_gpu(probe_hit, ray.direction);
+}

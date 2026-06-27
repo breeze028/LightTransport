@@ -28,7 +28,8 @@ enum class RenderDirty : uint32_t {
     Texture = 1u << 3u,
     Geometry = 1u << 4u,
     Environment = 1u << 5u,
-    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u),
+    IrradianceVolume = 1u << 6u,
+    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u) | (1u << 6u),
 };
 
 constexpr RenderDirty operator|(RenderDirty a, RenderDirty b) {
@@ -53,6 +54,19 @@ struct RenderSettings {
     AccelerationStructure acceleration_structure = AccelerationStructure::Auto;
     int stylized_samples = 8;
     int stylized_max_depth = 1;
+    bool use_irradiance_volume = false;
+    int irradiance_volume_grid_resolution = 7;
+    int irradiance_volume_subgrid_resolution = 3;
+    int irradiance_volume_direction_resolution = 9;
+    int irradiance_volume_bake_samples = 1;
+    int irradiance_volume_bake_bounces = 4;
+    float irradiance_volume_bounds_inset = 0.01f;
+    bool irradiance_volume_principled_gi = false;
+    bool irradiance_volume_debug_probes = false;
+    float irradiance_volume_debug_probe_radius_scale = 0.10f;
+    bool irradiance_volume_manual_bounds = false;
+    Vec3 irradiance_volume_bounds_min = {-1.0f, -1.0f, -1.0f};
+    Vec3 irradiance_volume_bounds_max = {1.0f, 1.0f, 1.0f};
     uint32_t frame_index = 0;
     RenderDirty dirty = RenderDirty::All;
 };
@@ -68,6 +82,10 @@ inline bool scene_has_npr_styles(const Scene& scene) {
 
 inline bool stylized_rendering_enabled(const RenderSettings& settings, const Scene& scene) {
     return settings.stylized_samples > 0 && settings.stylized_max_depth > 0 && scene_has_npr_styles(scene);
+}
+
+inline bool irradiance_volume_rendering_enabled(const RenderSettings& settings) {
+    return settings.use_irradiance_volume;
 }
 
 struct Framebuffer {
@@ -110,6 +128,7 @@ public:
 
 private:
     RenderScene cached_render_scene_;
+    std::shared_ptr<void> cached_irradiance_volume_;
     bool scene_uploaded_ = false;
 };
 
@@ -142,8 +161,15 @@ private:
     void* device_mesh_instances_ = nullptr;
     void* device_mesh_instance_indices_ = nullptr;
     void* device_tlas_nodes_ = nullptr;
+    void* device_irradiance_volume_directions_ = nullptr;
+    void* device_irradiance_volume_irradiance_ = nullptr;
+    void* device_irradiance_volume_grids_ = nullptr;
+    void* device_irradiance_volume_cells_ = nullptr;
+    void* device_irradiance_volume_debug_probes_ = nullptr;
     std::vector<void*> texture_arrays_;
     std::vector<uint64_t> texture_objects_;
+    RenderScene cached_render_scene_;
+    std::shared_ptr<void> cached_irradiance_volume_;
     size_t cached_pixels_ = 0;
     int cached_materials_ = 0;
     int cached_textures_ = 0;
@@ -155,7 +181,14 @@ private:
     int cached_mesh_instances_ = 0;
     int cached_mesh_instance_indices_ = 0;
     int cached_tlas_nodes_ = 0;
+    int cached_irradiance_volume_directions_ = 0;
+    int cached_irradiance_volume_irradiance_ = 0;
+    int cached_irradiance_volume_grids_ = 0;
+    int cached_irradiance_volume_cells_ = 0;
+    int cached_irradiance_volume_debug_probes_ = 0;
     bool scene_uploaded_ = false;
+    bool cached_render_scene_valid_ = false;
+    bool cached_irradiance_volume_enabled_ = false;
     std::vector<std::string> reported_fallback_reasons_;
 };
 

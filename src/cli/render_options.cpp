@@ -87,6 +87,44 @@ RenderOptions parse_render_options(int argc, char** argv) {
         } else if (argument == "--size" && i + 2 < argc) {
             options.settings.width = std::max(1, std::atoi(argv[++i]));
             options.settings.height = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--irradiance-volume") {
+            options.settings.use_irradiance_volume = true;
+        } else if (argument == "--no-irradiance-volume") {
+            options.settings.use_irradiance_volume = false;
+        } else if (argument == "--ivol-grid" && i + 1 < argc) {
+            options.settings.irradiance_volume_grid_resolution = std::max(2, std::atoi(argv[++i]));
+        } else if (argument == "--ivol-subgrid" && i + 1 < argc) {
+            options.settings.irradiance_volume_subgrid_resolution = std::max(2, std::atoi(argv[++i]));
+        } else if (argument == "--ivol-dir" && i + 1 < argc) {
+            options.settings.irradiance_volume_direction_resolution = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--ivol-bake-samples" && i + 1 < argc) {
+            options.settings.irradiance_volume_bake_samples = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--ivol-bake-bounces" && i + 1 < argc) {
+            options.settings.irradiance_volume_bake_bounces = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--ivol-bounds-inset" && i + 1 < argc) {
+            options.settings.irradiance_volume_bounds_inset = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 0.45f);
+        } else if (argument == "--ivol-principled-gi") {
+            options.settings.irradiance_volume_principled_gi = true;
+        } else if (argument == "--no-ivol-principled-gi") {
+            options.settings.irradiance_volume_principled_gi = false;
+        } else if (argument == "--ivol-debug-probes") {
+            options.settings.irradiance_volume_debug_probes = true;
+        } else if (argument == "--no-ivol-debug-probes") {
+            options.settings.irradiance_volume_debug_probes = false;
+        } else if (argument == "--ivol-probe-radius-scale" && i + 1 < argc) {
+            options.settings.irradiance_volume_debug_probe_radius_scale = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 2.0f);
+        } else if (argument == "--ivol-bounds" && i + 6 < argc) {
+            options.settings.irradiance_volume_manual_bounds = true;
+            options.settings.irradiance_volume_bounds_min = {
+                static_cast<float>(std::atof(argv[++i])),
+                static_cast<float>(std::atof(argv[++i])),
+                static_cast<float>(std::atof(argv[++i])),
+            };
+            options.settings.irradiance_volume_bounds_max = {
+                static_cast<float>(std::atof(argv[++i])),
+                static_cast<float>(std::atof(argv[++i])),
+                static_cast<float>(std::atof(argv[++i])),
+            };
         } else if (argument == "--style" && i + 1 < argc) {
             options.global_style = parse_npr_style(argv[++i]);
             options.global_style_set = true;

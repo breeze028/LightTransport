@@ -143,7 +143,9 @@ void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
 }
 
 void set_renderer(bool use_cuda) {
-    const bool can_use_cuda = use_cuda && g_editor.cuda.available() && !lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
+    const bool can_use_cuda = use_cuda &&
+        g_editor.cuda.available() &&
+        !lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
     lt::IRenderer* next = can_use_cuda ? static_cast<lt::IRenderer*>(&g_editor.cuda) : static_cast<lt::IRenderer*>(&g_editor.cpu);
     if (use_cuda && !can_use_cuda) {
         LT_LOG_WARN("CUDA renderer request fell back to CPU");
@@ -661,7 +663,9 @@ void launch_render_task() {
     lt::RenderSettings settings = g_editor.settings;
     lt::Framebuffer framebuffer = g_editor.framebuffer;
     const uint64_t generation = g_editor.render_generation;
-    lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene) ? static_cast<lt::IRenderer*>(&g_editor.cpu) : g_editor.renderer;
+    lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene)
+        ? static_cast<lt::IRenderer*>(&g_editor.cpu)
+        : g_editor.renderer;
     settings.frame_index = g_editor.frame_index;
     settings.dirty = g_editor.dirty;
     g_editor.dirty = lt::RenderDirty::None;
@@ -2202,7 +2206,8 @@ void draw_properties() {
                     set_renderer(false);
                 }
                 const bool cuda_available = g_editor.cuda.available();
-                const bool cuda_disabled = !cuda_available || lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
+                const bool cuda_disabled = !cuda_available ||
+                    lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
                 ImGui::BeginDisabled(cuda_disabled);
                 if (ImGui::Selectable("CUDA Path Tracer", using_cuda)) {
                     set_renderer(true);
@@ -2235,6 +2240,73 @@ void draw_properties() {
                 g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
                 reset_accumulation(lt::RenderDirty::Geometry);
             }
+            ImGui::SeparatorText("Irradiance Volume");
+            if (ImGui::Checkbox("Enable Irradiance Volume", &g_editor.settings.use_irradiance_volume)) {
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            ImGui::BeginDisabled(!g_editor.settings.use_irradiance_volume);
+            if (ImGui::DragInt("Volume Grid", &g_editor.settings.irradiance_volume_grid_resolution, 1.0f, 2, 16)) {
+                g_editor.settings.irradiance_volume_grid_resolution = std::clamp(g_editor.settings.irradiance_volume_grid_resolution, 2, 64);
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::DragInt("Subgrid", &g_editor.settings.irradiance_volume_subgrid_resolution, 1.0f, 2, 8)) {
+                g_editor.settings.irradiance_volume_subgrid_resolution = std::clamp(g_editor.settings.irradiance_volume_subgrid_resolution, 2, 32);
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::DragInt("Direction Grid", &g_editor.settings.irradiance_volume_direction_resolution, 1.0f, 1, 16)) {
+                g_editor.settings.irradiance_volume_direction_resolution = std::clamp(g_editor.settings.irradiance_volume_direction_resolution, 1, 32);
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::DragInt("Bake Samples", &g_editor.settings.irradiance_volume_bake_samples, 1.0f, 1, 16)) {
+                g_editor.settings.irradiance_volume_bake_samples = std::clamp(g_editor.settings.irradiance_volume_bake_samples, 1, 256);
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::DragInt("Bake Bounces", &g_editor.settings.irradiance_volume_bake_bounces, 1.0f, 1, 16)) {
+                g_editor.settings.irradiance_volume_bake_bounces = std::clamp(g_editor.settings.irradiance_volume_bake_bounces, 1, 32);
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::DragFloat("Bounds Inset", &g_editor.settings.irradiance_volume_bounds_inset, 0.002f, 0.0f, 0.45f, "%.3f")) {
+                g_editor.settings.irradiance_volume_bounds_inset = std::clamp(g_editor.settings.irradiance_volume_bounds_inset, 0.0f, 0.45f);
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::Checkbox("Principled GI", &g_editor.settings.irradiance_volume_principled_gi)) {
+                reset_accumulation();
+            }
+            if (ImGui::Checkbox("Debug Probes", &g_editor.settings.irradiance_volume_debug_probes)) {
+                if (g_editor.settings.irradiance_volume_debug_probes) {
+                    g_editor.settings.use_irradiance_volume = true;
+                }
+                reset_accumulation();
+            }
+            if (ImGui::DragFloat("Probe Radius", &g_editor.settings.irradiance_volume_debug_probe_radius_scale, 0.01f, 0.0f, 2.0f, "%.2f")) {
+                g_editor.settings.irradiance_volume_debug_probe_radius_scale =
+                    std::clamp(g_editor.settings.irradiance_volume_debug_probe_radius_scale, 0.0f, 2.0f);
+                reset_accumulation();
+            }
+            if (ImGui::Checkbox("Manual Bounds", &g_editor.settings.irradiance_volume_manual_bounds)) {
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            ImGui::BeginDisabled(!g_editor.settings.irradiance_volume_manual_bounds);
+            float bounds_min[3] = {
+                g_editor.settings.irradiance_volume_bounds_min.x,
+                g_editor.settings.irradiance_volume_bounds_min.y,
+                g_editor.settings.irradiance_volume_bounds_min.z,
+            };
+            if (ImGui::DragFloat3("Bounds Min", bounds_min, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
+                g_editor.settings.irradiance_volume_bounds_min = {bounds_min[0], bounds_min[1], bounds_min[2]};
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            float bounds_max[3] = {
+                g_editor.settings.irradiance_volume_bounds_max.x,
+                g_editor.settings.irradiance_volume_bounds_max.y,
+                g_editor.settings.irradiance_volume_bounds_max.z,
+            };
+            if (ImGui::DragFloat3("Bounds Max", bounds_max, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
+                g_editor.settings.irradiance_volume_bounds_max = {bounds_max[0], bounds_max[1], bounds_max[2]};
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
             ImGui::SeparatorText("NPR Sampling");
             if (ImGui::DragInt("Style Samples", &g_editor.settings.stylized_samples, 1.0f, 1, 128)) {
                 g_editor.settings.stylized_samples = std::clamp(g_editor.settings.stylized_samples, 1, 128);

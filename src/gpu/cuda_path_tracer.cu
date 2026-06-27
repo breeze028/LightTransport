@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -21,6 +22,93 @@ namespace {
 #include "shading.cuh"
 #include "kernel.cuh"
 #include "scene_upload.cuh"
+#include "../cpu/types.inl"
+#include "../cpu/intersection.inl"
+#include "../cpu/irradiance_volume.inl"
+#include "../cpu/shading.inl"
+#include "../cpu/irradiance_volume_bake.inl"
+
+struct PackedGpuIrradianceVolume {
+    GpuIrradianceVolume volume;
+    std::vector<Vec3> directions;
+    std::vector<Vec3> irradiance;
+    std::vector<GpuIrradianceVolumeGrid> grids;
+    std::vector<int> cell_subgrid_indices;
+    std::vector<GpuIrradianceVolumeDebugProbe> debug_probes;
+};
+
+int flatten_irradiance_grid(const IrradianceVolumeGrid& grid, int direction_count, PackedGpuIrradianceVolume& packed) {
+    if (!size_fits_int(packed.grids.size()) || !size_fits_int(packed.irradiance.size() / static_cast<size_t>(std::max(1, direction_count))) ||
+        !size_fits_int(packed.cell_subgrid_indices.size())) {
+        return -1;
+    }
+    const int grid_index = static_cast<int>(packed.grids.size());
+    GpuIrradianceVolumeGrid gpu_grid;
+    gpu_grid.bounds_min = grid.bounds.min;
+    gpu_grid.bounds_max = grid.bounds.max;
+    gpu_grid.resolution = grid.resolution;
+    gpu_grid.sample_offset = static_cast<int>(packed.irradiance.size() / static_cast<size_t>(std::max(1, direction_count)));
+    gpu_grid.cell_offset = static_cast<int>(packed.cell_subgrid_indices.size());
+    gpu_grid.cell_count = static_cast<int>(grid.cells.size());
+    packed.grids.push_back(gpu_grid);
+
+    if (direction_count > 0) {
+        for (const IrradianceVolumeSample& sample : grid.samples) {
+            for (int direction_index = 0; direction_index < direction_count; ++direction_index) {
+                const size_t index = static_cast<size_t>(direction_index);
+                packed.irradiance.push_back(index < sample.irradiance.size() ? sample.irradiance[index] : Vec3{});
+            }
+        }
+    }
+
+    const int cell_offset = gpu_grid.cell_offset;
+    packed.cell_subgrid_indices.resize(packed.cell_subgrid_indices.size() + grid.cells.size(), -1);
+    for (int cell_index = 0; cell_index < static_cast<int>(grid.cells.size()); ++cell_index) {
+        const IrradianceVolumeCell& cell = grid.cells[static_cast<size_t>(cell_index)];
+        if (!cell.subgrid) {
+            continue;
+        }
+        const int subgrid_index = flatten_irradiance_grid(*cell.subgrid, direction_count, packed);
+        if (subgrid_index < 0) {
+            return -1;
+        }
+        packed.cell_subgrid_indices[static_cast<size_t>(cell_offset + cell_index)] = subgrid_index;
+    }
+    return grid_index;
+}
+
+bool pack_irradiance_volume(const IrradianceVolume* volume, PackedGpuIrradianceVolume& packed) {
+    packed = {};
+    if (!volume || volume->directions.empty()) {
+        return true;
+    }
+    if (!size_fits_int(volume->directions.size()) || !size_fits_int(volume->debug_probes.size())) {
+        return false;
+    }
+    packed.directions = volume->directions;
+    packed.debug_probes.reserve(volume->debug_probes.size());
+    for (const IrradianceVolumeDebugProbe& probe : volume->debug_probes) {
+        packed.debug_probes.push_back({probe.position, probe.radius});
+    }
+
+    const int direction_count = static_cast<int>(packed.directions.size());
+    if (flatten_irradiance_grid(volume->grid, direction_count, packed) != 0) {
+        return false;
+    }
+    if (!size_fits_int(packed.grids.size()) || !size_fits_int(packed.cell_subgrid_indices.size()) ||
+        !size_fits_int(packed.irradiance.size() / static_cast<size_t>(std::max(1, direction_count)))) {
+        return false;
+    }
+
+    packed.volume.direction_count = direction_count;
+    packed.volume.grid_count = static_cast<int>(packed.grids.size());
+    packed.volume.irradiance_sample_count = direction_count > 0
+        ? static_cast<int>(packed.irradiance.size() / static_cast<size_t>(direction_count))
+        : 0;
+    packed.volume.cell_count = static_cast<int>(packed.cell_subgrid_indices.size());
+    packed.volume.debug_probe_count = static_cast<int>(packed.debug_probes.size());
+    return true;
+}
 
 const char* cuda_error_text(cudaError_t error) {
     return error == cudaSuccess ? nullptr : cudaGetErrorString(error);
@@ -51,6 +139,11 @@ void CudaPathTracer::reset() {
     cudaFree(device_mesh_instances_);
     cudaFree(device_mesh_instance_indices_);
     cudaFree(device_tlas_nodes_);
+    cudaFree(device_irradiance_volume_directions_);
+    cudaFree(device_irradiance_volume_irradiance_);
+    cudaFree(device_irradiance_volume_grids_);
+    cudaFree(device_irradiance_volume_cells_);
+    cudaFree(device_irradiance_volume_debug_probes_);
     device_accumulation_ = nullptr;
     device_rgba_ = nullptr;
     device_scene_ = nullptr;
@@ -64,6 +157,13 @@ void CudaPathTracer::reset() {
     device_mesh_instances_ = nullptr;
     device_mesh_instance_indices_ = nullptr;
     device_tlas_nodes_ = nullptr;
+    device_irradiance_volume_directions_ = nullptr;
+    device_irradiance_volume_irradiance_ = nullptr;
+    device_irradiance_volume_grids_ = nullptr;
+    device_irradiance_volume_cells_ = nullptr;
+    device_irradiance_volume_debug_probes_ = nullptr;
+    cached_render_scene_ = {};
+    cached_irradiance_volume_.reset();
     cached_pixels_ = 0;
     cached_materials_ = 0;
     cached_textures_ = 0;
@@ -75,7 +175,14 @@ void CudaPathTracer::reset() {
     cached_mesh_instances_ = 0;
     cached_mesh_instance_indices_ = 0;
     cached_tlas_nodes_ = 0;
+    cached_irradiance_volume_directions_ = 0;
+    cached_irradiance_volume_irradiance_ = 0;
+    cached_irradiance_volume_grids_ = 0;
+    cached_irradiance_volume_cells_ = 0;
+    cached_irradiance_volume_debug_probes_ = 0;
     scene_uploaded_ = false;
+    cached_render_scene_valid_ = false;
+    cached_irradiance_volume_enabled_ = false;
     release_texture_objects(texture_arrays_, texture_objects_);
 }
 
@@ -130,10 +237,58 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     uint32_t* device_rgba = static_cast<uint32_t*>(device_rgba_);
     GpuScene* device_scene = static_cast<GpuScene*>(device_scene_);
 
+    if (has_dirty(settings.dirty, RenderDirty::Geometry)) {
+        cached_render_scene_valid_ = false;
+    }
+
+    std::shared_ptr<IrradianceVolume> irradiance_volume;
+    bool irradiance_volume_rebuilt = false;
+    const bool irradiance_volume_enabled_changed = cached_irradiance_volume_enabled_ != settings.use_irradiance_volume;
+    if (irradiance_volume_rendering_enabled(settings)) {
+        if (!cached_render_scene_valid_) {
+            cached_render_scene_ = build_render_scene(scene);
+            cached_render_scene_valid_ = true;
+        }
+        const bool volume_dirty = has_dirty(settings.dirty, RenderDirty::IrradianceVolume) ||
+            has_dirty(settings.dirty, RenderDirty::Geometry) ||
+            has_dirty(settings.dirty, RenderDirty::Material) ||
+            has_dirty(settings.dirty, RenderDirty::Texture) ||
+            has_dirty(settings.dirty, RenderDirty::Environment);
+        if (!cached_irradiance_volume_ || volume_dirty) {
+            cached_irradiance_volume_ = build_irradiance_volume(cached_render_scene_, scene, settings);
+            irradiance_volume_rebuilt = true;
+        }
+        irradiance_volume = std::static_pointer_cast<IrradianceVolume>(cached_irradiance_volume_);
+    } else if (cached_irradiance_volume_) {
+        cached_irradiance_volume_.reset();
+        irradiance_volume_rebuilt = true;
+    }
+
     const bool full_upload = !scene_uploaded_ ||
         has_dirty(settings.dirty, RenderDirty::Geometry) ||
         has_dirty(settings.dirty, RenderDirty::Material) ||
         has_dirty(settings.dirty, RenderDirty::Texture);
+    const bool irradiance_volume_upload = full_upload || irradiance_volume_rebuilt || irradiance_volume_enabled_changed;
+    const auto upload_gpu_irradiance_volume = [&](const IrradianceVolume* volume, GpuIrradianceVolume& gpu_volume) {
+        PackedGpuIrradianceVolume packed;
+        if (!pack_irradiance_volume(volume, packed)) {
+            return false;
+        }
+        if (!upload_buffer(device_irradiance_volume_directions_, cached_irradiance_volume_directions_, packed.directions) ||
+            !upload_buffer(device_irradiance_volume_irradiance_, cached_irradiance_volume_irradiance_, packed.irradiance) ||
+            !upload_buffer(device_irradiance_volume_grids_, cached_irradiance_volume_grids_, packed.grids) ||
+            !upload_buffer(device_irradiance_volume_cells_, cached_irradiance_volume_cells_, packed.cell_subgrid_indices) ||
+            !upload_buffer(device_irradiance_volume_debug_probes_, cached_irradiance_volume_debug_probes_, packed.debug_probes)) {
+            return false;
+        }
+        gpu_volume = packed.volume;
+        gpu_volume.directions = static_cast<Vec3*>(device_irradiance_volume_directions_);
+        gpu_volume.irradiance = static_cast<Vec3*>(device_irradiance_volume_irradiance_);
+        gpu_volume.grids = static_cast<GpuIrradianceVolumeGrid*>(device_irradiance_volume_grids_);
+        gpu_volume.cell_subgrid_indices = static_cast<int*>(device_irradiance_volume_cells_);
+        gpu_volume.debug_probes = static_cast<GpuIrradianceVolumeDebugProbe*>(device_irradiance_volume_debug_probes_);
+        return true;
+    };
 
     if (full_upload) {
         PackedGpuScene packed;
@@ -171,6 +326,11 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(device_mesh_instances_);
         packed.scene.mesh_instance_indices = static_cast<int*>(device_mesh_instance_indices_);
         packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(device_tlas_nodes_);
+        if (!upload_gpu_irradiance_volume(irradiance_volume.get(), packed.scene.irradiance_volume)) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA irradiance volume");
+            return;
+        }
         cuda_error = cudaMemcpy(device_scene, &packed.scene, sizeof(GpuScene), cudaMemcpyHostToDevice);
         if (cuda_error != cudaSuccess) {
             reset();
@@ -178,6 +338,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             return;
         }
         scene_uploaded_ = true;
+        cached_irradiance_volume_enabled_ = settings.use_irradiance_volume;
     } else {
         if (has_dirty(settings.dirty, RenderDirty::Camera) && !upload_camera(device_scene, scene.camera)) {
             reset();
@@ -191,6 +352,16 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA environment");
                 return;
             }
+        }
+        if (irradiance_volume_upload) {
+            GpuIrradianceVolume gpu_volume;
+            if (!upload_gpu_irradiance_volume(irradiance_volume.get(), gpu_volume) ||
+                !upload_scene_field(device_scene, offsetof(GpuScene, irradiance_volume), gpu_volume)) {
+                reset();
+                render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA irradiance volume");
+                return;
+            }
+            cached_irradiance_volume_enabled_ = settings.use_irradiance_volume;
         }
     }
 

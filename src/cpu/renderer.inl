@@ -1,5 +1,6 @@
 void CpuPathTracer::reset() {
     cached_render_scene_ = {};
+    cached_irradiance_volume_.reset();
     scene_uploaded_ = false;
 }
 
@@ -17,6 +18,20 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
         scene_uploaded_ = true;
     }
     const RenderScene& render_scene = cached_render_scene_;
+    std::shared_ptr<IrradianceVolume> irradiance_volume;
+    if (irradiance_volume_rendering_enabled(settings)) {
+        const bool volume_dirty = has_dirty(settings.dirty, RenderDirty::IrradianceVolume) ||
+            has_dirty(settings.dirty, RenderDirty::Geometry) ||
+            has_dirty(settings.dirty, RenderDirty::Material) ||
+            has_dirty(settings.dirty, RenderDirty::Texture) ||
+            has_dirty(settings.dirty, RenderDirty::Environment);
+        if (!cached_irradiance_volume_ || volume_dirty) {
+            cached_irradiance_volume_ = build_irradiance_volume(render_scene, scene, settings);
+        }
+        irradiance_volume = std::static_pointer_cast<IrradianceVolume>(cached_irradiance_volume_);
+    } else if (cached_irradiance_volume_) {
+        cached_irradiance_volume_.reset();
+    }
 
     const unsigned int hardware_threads = std::thread::hardware_concurrency();
     const unsigned int thread_count = std::max(1u, hardware_threads > 1u ? hardware_threads - 1u : hardware_threads);
@@ -35,7 +50,13 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
                 Vec3 sample;
                 Rng rng(make_pixel_seed(static_cast<uint32_t>(x), static_cast<uint32_t>(y), settings.frame_index));
                 for (int s = 0; s < settings.samples_per_pixel; ++s) {
-                    sample += trace_path(render_scene, scene, make_camera_ray(scene.camera, x, y, settings, rng), rng, settings);
+                    sample += trace_path_with_irradiance_probe_debug(
+                        render_scene,
+                        scene,
+                        make_camera_ray(scene.camera, x, y, settings, rng),
+                        rng,
+                        settings,
+                        irradiance_volume.get());
                 }
                 sample = sample / static_cast<float>(settings.samples_per_pixel);
                 framebuffer.accumulation[idx] += sample;

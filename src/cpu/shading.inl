@@ -583,8 +583,59 @@ Vec3 trace_stylized_radiance(
     return stylize_here ? apply_npr_style(render_scene, scene, settings, *material, hit, wo, estimate) : estimate;
 }
 
-Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rng& rng, const RenderSettings& settings) {
-    if (stylized_rendering_enabled(settings, scene)) {
+Vec3 estimate_direct_environment(
+    const RenderScene& render_scene,
+    const Scene& scene,
+    const RenderSettings& settings,
+    const Material& material,
+    const Hit& hit,
+    Vec3 wo,
+    Rng& rng) {
+    const MaterialSample sample = material.sample(hit.normal, wo, hit.uv, hit.front_face, rng);
+    if (!std::isfinite(sample.pdf) || sample.pdf <= 0.0f || !is_finite(sample.weight) || dot(sample.weight, sample.weight) <= 0.0f) {
+        return {};
+    }
+    const float offset_side = dot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;
+    const Ray env_ray{hit.position + hit.normal * (0.001f * offset_side), sample.direction};
+    Hit env_hit;
+    if (intersect_scene(render_scene, env_ray, env_hit, settings.acceleration_structure)) {
+        return {};
+    }
+    return clamp_sample_radiance(sample.weight * environment_radiance(scene, sample.direction, settings), 64.0f);
+}
+
+Vec3 diffuse_gi_scale_for_irradiance_volume(const Material& material, Vec2 uv) {
+    if (const auto* principled = dynamic_cast<const PrincipledMaterial*>(&material)) {
+        return Vec3{1.0f - principled->metallic_at(uv)};
+    }
+    return Vec3{1.0f};
+}
+
+bool material_uses_irradiance_volume_gi(const RenderSettings& settings, const Material& material) {
+    if (material.model() == BrdfModel::Lambertian) {
+        return true;
+    }
+    return settings.irradiance_volume_principled_gi && material.model() == BrdfModel::Principled;
+}
+
+Vec3 shade_material_from_irradiance_volume(
+    const IrradianceVolume& volume,
+    const RenderScene& render_scene,
+    const Scene& scene,
+    const RenderSettings& settings,
+    const Material& material,
+    const Hit& hit,
+    Vec3 wo,
+    Rng& rng) {
+    const Vec3 irradiance = query_irradiance_volume(volume, hit.position, hit.normal);
+    const Vec3 indirect = material.base_color(hit.uv) * diffuse_gi_scale_for_irradiance_volume(material, hit.uv) * (irradiance / kPi);
+    const Vec3 direct_lights = estimate_direct_lighting(render_scene, scene, hit, material, wo, rng, settings);
+    const Vec3 direct_environment = estimate_direct_environment(render_scene, scene, settings, material, hit, wo, rng);
+    return material.emitted(hit.uv) + direct_lights + direct_environment + indirect;
+}
+
+Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rng& rng, const RenderSettings& settings, const IrradianceVolume* irradiance_volume = nullptr) {
+    if (!irradiance_volume_rendering_enabled(settings) && stylized_rendering_enabled(settings, scene)) {
         return trace_stylized_radiance(render_scene, scene, ray, rng, settings, {}, 0, {}, 0.0f, false);
     }
 
@@ -632,6 +683,23 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
             }
             break;
         }
+
+        if (irradiance_volume && material_uses_irradiance_volume_gi(settings, *material)) {
+            const Vec3 wo = -ray.direction;
+            radiance += clamp_sample_radiance(
+                throughput * shade_material_from_irradiance_volume(
+                    *irradiance_volume,
+                    render_scene,
+                    scene,
+                    settings,
+                    *material,
+                    hit,
+                    wo,
+                    rng),
+                sample_clamp);
+            break;
+        }
+
         const Vec3 wo = -ray.direction;
         radiance += clamp_sample_radiance(throughput * estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings), sample_clamp);
 
@@ -655,4 +723,31 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
         throughput = throughput * sample.weight;
     }
     return radiance;
+}
+
+Vec3 trace_path_with_irradiance_probe_debug(
+    const RenderScene& render_scene,
+    const Scene& scene,
+    Ray ray,
+    Rng& rng,
+    const RenderSettings& settings,
+    const IrradianceVolume* irradiance_volume) {
+    if (!irradiance_volume || !settings.irradiance_volume_debug_probes || irradiance_volume->debug_probes.empty()) {
+        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume);
+    }
+
+    IrradianceVolumeProbeHit probe_hit;
+    if (!intersect_irradiance_debug_probes(
+            *irradiance_volume,
+            ray,
+            settings.irradiance_volume_debug_probe_radius_scale,
+            probe_hit)) {
+        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume);
+    }
+
+    Hit scene_hit;
+    if (intersect_scene(render_scene, ray, scene_hit, settings.acceleration_structure) && scene_hit.t < probe_hit.t) {
+        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume);
+    }
+    return shade_irradiance_debug_probe(probe_hit, ray.direction);
 }
