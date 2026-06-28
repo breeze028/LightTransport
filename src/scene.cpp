@@ -5,6 +5,8 @@ namespace lt {
 Scene::Scene(const Scene& other)
     : camera(other.camera),
       environment(other.environment),
+      render_settings(other.render_settings),
+      has_render_settings(other.has_render_settings),
       uses_builtin_default_meshes(other.uses_builtin_default_meshes),
       meshes(other.meshes),
       spheres(other.spheres) {
@@ -21,6 +23,8 @@ Scene& Scene::operator=(const Scene& other) {
     }
     camera = other.camera;
     environment = other.environment;
+    render_settings = other.render_settings;
+    has_render_settings = other.has_render_settings;
     uses_builtin_default_meshes = other.uses_builtin_default_meshes;
     meshes = other.meshes;
     spheres = other.spheres;

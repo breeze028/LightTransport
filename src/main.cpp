@@ -1,5 +1,6 @@
 #include "cli/render_options.h"
 
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 
@@ -26,6 +27,20 @@ struct LoggingScope {
     }
 };
 
+template <size_t N>
+void copy_setting_text(char (&target)[N], const std::string& value) {
+    std::snprintf(target, N, "%s", value.c_str());
+}
+
+void set_irradiance_volume_cache_defaults(lt::RenderSettings& settings, const std::string& scene_path) {
+    if (settings.irradiance_volume_cache_key[0] == '\0') {
+        copy_setting_text(settings.irradiance_volume_cache_key, scene_path);
+    }
+    if (settings.irradiance_volume_cache_path[0] == '\0' && !scene_path.empty()) {
+        copy_setting_text(settings.irradiance_volume_cache_path, scene_path + ".ivol");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -46,6 +61,7 @@ int main(int argc, char** argv) {
         LT_LOG_WARN("{}; using fallback default scene", loaded.error);
     }
     lt::cli::apply_material_styles(options, loaded.scene, std::cerr);
+    set_irradiance_volume_cache_defaults(options.settings, options.scene_path);
 
     lt::CpuPathTracer cpu;
     lt::CudaPathTracer cuda;

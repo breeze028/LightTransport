@@ -3,8 +3,10 @@
 #include "lt/scene.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace lt {
@@ -18,6 +20,25 @@ enum class AccelerationStructure {
     Auto = 0,
     Flat = 1,
     TwoLevel = 2,
+};
+
+enum class IrradianceVolumeBakePhase : int {
+    Idle = 0,
+    LoadingCache = 1,
+    Baking = 2,
+    SavingCache = 3,
+    Complete = 4,
+    Failed = 5,
+};
+
+struct IrradianceVolumeBakeProgress {
+    std::atomic<int> phase{static_cast<int>(IrradianceVolumeBakePhase::Idle)};
+    std::atomic<uint64_t> total_samples{0};
+    std::atomic<uint64_t> completed_samples{0};
+    std::atomic<uint64_t> total_rays{0};
+    std::atomic<uint64_t> traced_rays{0};
+    std::atomic<int> direction_count{0};
+    std::atomic<double> elapsed_ms{0.0};
 };
 
 enum class RenderDirty : uint32_t {
@@ -64,6 +85,12 @@ struct RenderSettings {
     bool irradiance_volume_principled_gi = false;
     bool irradiance_volume_debug_probes = false;
     float irradiance_volume_debug_probe_radius_scale = 0.10f;
+    bool irradiance_volume_cache_enabled = true;
+    bool irradiance_volume_auto_update = true;
+    bool irradiance_volume_force_rebake = false;
+    char irradiance_volume_cache_path[1024] = {};
+    char irradiance_volume_cache_key[1024] = {};
+    IrradianceVolumeBakeProgress* irradiance_volume_bake_progress = nullptr;
     bool irradiance_volume_manual_bounds = false;
     Vec3 irradiance_volume_bounds_min = {-1.0f, -1.0f, -1.0f};
     Vec3 irradiance_volume_bounds_max = {1.0f, 1.0f, 1.0f};
@@ -107,6 +134,10 @@ struct Framebuffer {
     void clear() {
         std::fill(accumulation.begin(), accumulation.end(), Vec3{});
         std::fill(rgba.begin(), rgba.end(), 0xff000000u);
+    }
+
+    void clear_accumulation() {
+        std::fill(accumulation.begin(), accumulation.end(), Vec3{});
     }
 };
 

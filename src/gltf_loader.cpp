@@ -582,6 +582,34 @@ std::shared_ptr<Texture> scene_texture_for_gltf_texture(const Json& root, const 
     return scene.textures[static_cast<size_t>(scene_texture)];
 }
 
+std::string embedded_image_extension(const Json& image, const unsigned char* data, size_t size) {
+    std::string mime = image["mimeType"].string();
+    std::transform(mime.begin(), mime.end(), mime.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mime == "image/png") {
+        return ".png";
+    }
+    if (mime == "image/jpeg" || mime == "image/jpg") {
+        return ".jpg";
+    }
+    if (size >= 8 &&
+        data[0] == 0x89u && data[1] == 0x50u && data[2] == 0x4eu && data[3] == 0x47u &&
+        data[4] == 0x0du && data[5] == 0x0au && data[6] == 0x1au && data[7] == 0x0au) {
+        return ".png";
+    }
+    if (size >= 3 && data[0] == 0xffu && data[1] == 0xd8u && data[2] == 0xffu) {
+        return ".jpg";
+    }
+    if (size >= 4 && data[0] == 0x76u && data[1] == 0x2fu && data[2] == 0x31u && data[3] == 0x01u) {
+        return ".exr";
+    }
+    if (size >= 10 && std::memcmp(data, "#?RADIANCE", 10) == 0) {
+        return ".hdr";
+    }
+    return ".png";
+}
+
 void load_images(const Json& root, const std::string& scene_dir, const std::vector<std::vector<unsigned char>>& buffers, const std::vector<BufferView>& views, Scene& scene, std::vector<int>& image_to_texture) {
     image_to_texture.assign(root["images"].array().size(), -1);
     for (size_t i = 0; i < root["images"].array().size(); ++i) {
@@ -602,8 +630,13 @@ void load_images(const Json& root, const std::string& scene_dir, const std::vect
                 if (view.buffer >= 0 && view.buffer < static_cast<int>(buffers.size())) {
                     const std::vector<unsigned char>& buffer = buffers[static_cast<size_t>(view.buffer)];
                     if (view.offset + view.length <= buffer.size()) {
-                        ok = load_texture_memory(name, buffer.data() + view.offset, view.length, texture, error);
+                        const unsigned char* image_data = buffer.data() + view.offset;
+                        ok = load_texture_memory(name, image_data, view.length, texture, error);
                         texture.path = name;
+                        if (ok) {
+                            texture.encoded_bytes.assign(image_data, image_data + view.length);
+                            texture.encoded_extension = embedded_image_extension(image, image_data, view.length);
+                        }
                     }
                 }
             }

@@ -37,8 +37,10 @@ struct EditorState {
     IRenderer* renderer = &cpu;
     RenderDirty dirty = RenderDirty::All;
     std::string scene_path = "scenes/cornell.lt";
+    std::shared_ptr<IrradianceVolumeBakeProgress> irradiance_volume_bake_progress = std::make_shared<IrradianceVolumeBakeProgress>();
     uint32_t frame_index = 0;
     uint64_t render_generation = 1;
+    uint64_t content_generation = 1;
     SelectionKind selection_kind = SelectionKind::Mesh;
     int selected_mesh = 0;
     int selected_sphere = -1;
@@ -68,6 +70,7 @@ struct EditorState {
     float properties_width = 340.0f;
     float outliner_fraction = 0.38f;
     bool viewport_fullscreen = false;
+    bool hide_dirty_wireframes = false;
     bool show_log_panel = false;
     bool log_auto_scroll = true;
     LogLevel log_filter_level = LogLevel::Info;
@@ -78,6 +81,7 @@ struct EditorState {
 
 struct RenderResult {
     uint64_t generation = 0;
+    uint64_t content_generation = 0;
     uint32_t completed_frame = 0;
     double elapsed_ms = 0.0;
     Framebuffer framebuffer;

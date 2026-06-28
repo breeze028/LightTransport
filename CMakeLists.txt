@@ -6,6 +6,7 @@ option(LT_ENABLE_CUDA "Build the CUDA path tracing backend" ON)
 option(LT_BUILD_EDITOR "Build the realtime scene editor" ON)
 option(LT_FETCH_IMGUI "Fetch Dear ImGui when building the editor" ON)
 option(LT_FETCH_SPDLOG "Fetch spdlog when it is not provided by the system" ON)
+option(LT_FETCH_STB "Fetch stb header-only image utilities when they are not provided by the system" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +33,21 @@ else()
     set(LT_SPDLOG_TARGET spdlog::spdlog)
 endif()
 
+find_path(STB_INCLUDE_DIR stb_image_write.h)
+if(NOT STB_INCLUDE_DIR)
+    if(LT_FETCH_STB)
+        include(FetchContent)
+        FetchContent_Declare(
+            stb
+            URL https://github.com/nothings/stb/archive/refs/heads/master.zip
+        )
+        FetchContent_MakeAvailable(stb)
+        set(STB_INCLUDE_DIR ${stb_SOURCE_DIR})
+    else()
+        message(FATAL_ERROR "stb_image_write.h was not found. Enable LT_FETCH_STB or provide STB_INCLUDE_DIR.")
+    endif()
+endif()
+
 add_library(lt_core
     src/log.cpp
     src/cpu/path_tracer.cpp
@@ -47,6 +63,7 @@ add_library(lt_core
 )
 
 target_include_directories(lt_core PUBLIC include)
+target_include_directories(lt_core PRIVATE ${STB_INCLUDE_DIR})
 target_link_libraries(lt_core PUBLIC ${LT_SPDLOG_TARGET})
 
 if(WIN32)

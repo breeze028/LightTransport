@@ -1,12 +1,18 @@
 #include "render_options.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <ostream>
 #include <utility>
 
 namespace lt::cli {
 namespace {
+
+template <size_t N>
+void copy_setting_text(char (&target)[N], const std::string& value) {
+    std::snprintf(target, N, "%s", value.c_str());
+}
 
 void apply_style(const RenderOptions& options, std::shared_ptr<Material>& material, NprStyle style) {
     if (!material) {
@@ -113,6 +119,17 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.settings.irradiance_volume_debug_probes = false;
         } else if (argument == "--ivol-probe-radius-scale" && i + 1 < argc) {
             options.settings.irradiance_volume_debug_probe_radius_scale = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 2.0f);
+        } else if (argument == "--ivol-cache" && i + 1 < argc) {
+            options.settings.irradiance_volume_cache_enabled = true;
+            copy_setting_text(options.settings.irradiance_volume_cache_path, argv[++i]);
+        } else if (argument == "--no-ivol-cache") {
+            options.settings.irradiance_volume_cache_enabled = false;
+        } else if (argument == "--ivol-auto-update") {
+            options.settings.irradiance_volume_auto_update = true;
+        } else if (argument == "--no-ivol-auto-update") {
+            options.settings.irradiance_volume_auto_update = false;
+        } else if (argument == "--ivol-force-bake") {
+            options.settings.irradiance_volume_force_rebake = true;
         } else if (argument == "--ivol-bounds" && i + 6 < argc) {
             options.settings.irradiance_volume_manual_bounds = true;
             options.settings.irradiance_volume_bounds_min = {

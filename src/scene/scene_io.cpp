@@ -51,6 +51,100 @@ bool parse_vec3_tokens(const std::vector<std::string>& tokens, size_t offset, Ve
         parse_float_token(tokens[offset + 2], value.z);
 }
 
+Environment::Mapping parse_environment_mapping(const std::string& name) {
+    if (name == "equal_area" || name == "equalarea" || name == "octahedral") {
+        return Environment::Mapping::EqualArea;
+    }
+    return Environment::Mapping::Equirectangular;
+}
+
+const char* environment_mapping_name(Environment::Mapping mapping) {
+    switch (mapping) {
+    case Environment::Mapping::EqualArea: return "equal_area";
+    case Environment::Mapping::Equirectangular:
+    default:
+        return "equirectangular";
+    }
+}
+
+bool is_default_environment_basis(const Environment& environment) {
+    return environment.light_from_world_x.x == 1.0f && environment.light_from_world_x.y == 0.0f && environment.light_from_world_x.z == 0.0f &&
+        environment.light_from_world_y.x == 0.0f && environment.light_from_world_y.y == 1.0f && environment.light_from_world_y.z == 0.0f &&
+        environment.light_from_world_z.x == 0.0f && environment.light_from_world_z.y == 0.0f && environment.light_from_world_z.z == 1.0f;
+}
+
+AlphaMode parse_alpha_mode_name(const std::string& name) {
+    if (name == "mask" || name == "MASK") {
+        return AlphaMode::Mask;
+    }
+    if (name == "blend" || name == "BLEND") {
+        return AlphaMode::Blend;
+    }
+    return AlphaMode::Opaque;
+}
+
+const char* alpha_mode_name(AlphaMode mode) {
+    switch (mode) {
+    case AlphaMode::Mask: return "mask";
+    case AlphaMode::Blend: return "blend";
+    case AlphaMode::Opaque:
+    default:
+        return "opaque";
+    }
+}
+
+bool has_nonzero(Vec3 value) {
+    return value.x != 0.0f || value.y != 0.0f || value.z != 0.0f;
+}
+
+bool has_nondefault_material_properties(const Material& material) {
+    return material.alpha != 1.0f ||
+        material.alpha_cutoff != 0.5f ||
+        material.alpha_mode != AlphaMode::Opaque ||
+        material.double_sided ||
+        material.normal_scale != 1.0f ||
+        has_nonzero(material.emission);
+}
+
+bool assign_material_texture(Material& material, const std::string& slot, const std::shared_ptr<Texture>& texture) {
+    if (slot == "albedo" || slot == "base_color" || slot == "baseColor") {
+        material.albedo_texture = texture;
+        return true;
+    }
+    if (slot == "normal") {
+        material.normal_texture = texture;
+        return true;
+    }
+    if (slot == "emission" || slot == "emissive") {
+        material.emission_texture = texture;
+        return true;
+    }
+    auto* principled = dynamic_cast<PrincipledMaterial*>(&material);
+    if (!principled) {
+        return false;
+    }
+    if (slot == "metallic_roughness" || slot == "metallicRoughness") {
+        principled->metallic_roughness_texture = texture;
+    } else if (slot == "sheen_color") {
+        principled->sheen_color_texture = texture;
+    } else if (slot == "sheen_roughness") {
+        principled->sheen_roughness_texture = texture;
+    } else if (slot == "clearcoat") {
+        principled->clearcoat_texture = texture;
+    } else if (slot == "clearcoat_roughness") {
+        principled->clearcoat_roughness_texture = texture;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void write_material_texture(std::ostream& output, const Material& material, const char* slot, const std::shared_ptr<Texture>& texture) {
+    if (texture) {
+        output << "material_texture " << material.name << ' ' << slot << ' ' << texture->name << '\n';
+    }
+}
+
 void parse_npr_settings(const std::vector<std::string>& tokens, NprSettings& npr) {
     if (tokens.empty()) {
         return;
@@ -268,6 +362,76 @@ SceneLoadResult load_scene(const std::string& path) {
                 scene.environment.constant = true;
                 environment_texture_name.clear();
             }
+        } else if (tag == "environment_mapping") {
+            std::string mapping_name;
+            input >> mapping_name;
+            if (!input) {
+                return fail("Invalid environment_mapping at line " + std::to_string(line_number));
+            }
+            scene.environment.mapping = parse_environment_mapping(mapping_name);
+        } else if (tag == "environment_basis") {
+            input >> scene.environment.light_from_world_x.x >> scene.environment.light_from_world_x.y >> scene.environment.light_from_world_x.z;
+            input >> scene.environment.light_from_world_y.x >> scene.environment.light_from_world_y.y >> scene.environment.light_from_world_y.z;
+            input >> scene.environment.light_from_world_z.x >> scene.environment.light_from_world_z.y >> scene.environment.light_from_world_z.z;
+            if (!input) {
+                return fail("Invalid environment_basis at line " + std::to_string(line_number));
+            }
+        } else if (tag == "npr_sampling") {
+            input >> scene.render_settings.stylized_samples >> scene.render_settings.stylized_max_depth;
+            if (!input) {
+                return fail("Invalid npr_sampling at line " + std::to_string(line_number));
+            }
+            scene.render_settings.stylized_samples = std::clamp(scene.render_settings.stylized_samples, 1, 128);
+            scene.render_settings.stylized_max_depth = std::clamp(scene.render_settings.stylized_max_depth, 0, 32);
+            scene.has_render_settings = true;
+        } else if (tag == "irradiance_volume") {
+            int enabled = scene.render_settings.use_irradiance_volume ? 1 : 0;
+            int principled_gi = scene.render_settings.irradiance_volume_principled_gi ? 1 : 0;
+            int debug_probes = scene.render_settings.irradiance_volume_debug_probes ? 1 : 0;
+            int cache_enabled = scene.render_settings.irradiance_volume_cache_enabled ? 1 : 0;
+            int auto_update = scene.render_settings.irradiance_volume_auto_update ? 1 : 0;
+            int manual_bounds = scene.render_settings.irradiance_volume_manual_bounds ? 1 : 0;
+            input >> enabled
+                >> scene.render_settings.irradiance_volume_grid_resolution
+                >> scene.render_settings.irradiance_volume_subgrid_resolution
+                >> scene.render_settings.irradiance_volume_direction_resolution
+                >> scene.render_settings.irradiance_volume_bake_samples
+                >> scene.render_settings.irradiance_volume_bake_bounces
+                >> scene.render_settings.irradiance_volume_bounds_inset
+                >> principled_gi
+                >> debug_probes
+                >> scene.render_settings.irradiance_volume_debug_probe_radius_scale
+                >> cache_enabled
+                >> auto_update
+                >> manual_bounds;
+            if (!input) {
+                return fail("Invalid irradiance_volume at line " + std::to_string(line_number));
+            }
+            scene.render_settings.use_irradiance_volume = enabled != 0;
+            scene.render_settings.irradiance_volume_grid_resolution = std::clamp(scene.render_settings.irradiance_volume_grid_resolution, 2, 64);
+            scene.render_settings.irradiance_volume_subgrid_resolution = std::clamp(scene.render_settings.irradiance_volume_subgrid_resolution, 2, 32);
+            scene.render_settings.irradiance_volume_direction_resolution = std::clamp(scene.render_settings.irradiance_volume_direction_resolution, 1, 32);
+            scene.render_settings.irradiance_volume_bake_samples = std::clamp(scene.render_settings.irradiance_volume_bake_samples, 1, 256);
+            scene.render_settings.irradiance_volume_bake_bounces = std::clamp(scene.render_settings.irradiance_volume_bake_bounces, 1, 32);
+            scene.render_settings.irradiance_volume_bounds_inset = std::clamp(scene.render_settings.irradiance_volume_bounds_inset, 0.0f, 0.45f);
+            scene.render_settings.irradiance_volume_principled_gi = principled_gi != 0;
+            scene.render_settings.irradiance_volume_debug_probes = debug_probes != 0;
+            scene.render_settings.irradiance_volume_debug_probe_radius_scale = std::clamp(scene.render_settings.irradiance_volume_debug_probe_radius_scale, 0.0f, 2.0f);
+            scene.render_settings.irradiance_volume_cache_enabled = cache_enabled != 0;
+            scene.render_settings.irradiance_volume_auto_update = auto_update != 0;
+            scene.render_settings.irradiance_volume_manual_bounds = manual_bounds != 0;
+            scene.has_render_settings = true;
+        } else if (tag == "irradiance_volume_bounds") {
+            input >> scene.render_settings.irradiance_volume_bounds_min.x
+                >> scene.render_settings.irradiance_volume_bounds_min.y
+                >> scene.render_settings.irradiance_volume_bounds_min.z
+                >> scene.render_settings.irradiance_volume_bounds_max.x
+                >> scene.render_settings.irradiance_volume_bounds_max.y
+                >> scene.render_settings.irradiance_volume_bounds_max.z;
+            if (!input) {
+                return fail("Invalid irradiance_volume_bounds at line " + std::to_string(line_number));
+            }
+            scene.has_render_settings = true;
         } else if (tag == "material") {
             std::string material_name;
             Vec3 albedo;
@@ -308,6 +472,89 @@ SceneLoadResult load_scene(const std::string& path) {
             scene.materials.push_back(material);
             material_texture_names.push_back(texture_name);
             legacy_material_emissions.push_back(legacy_emission);
+        } else if (tag == "material_properties") {
+            std::string material_name;
+            std::string alpha_mode;
+            int double_sided = 0;
+            input >> material_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid material_properties material at line " + std::to_string(line_number));
+            }
+            Material& material = *scene.materials[static_cast<size_t>(index)];
+            input >> material.alpha
+                >> material.alpha_cutoff
+                >> alpha_mode
+                >> double_sided
+                >> material.normal_scale
+                >> material.emission.x
+                >> material.emission.y
+                >> material.emission.z;
+            if (!input) {
+                return fail("Invalid material_properties at line " + std::to_string(line_number));
+            }
+            material.alpha = std::clamp(material.alpha, 0.0f, 1.0f);
+            material.alpha_cutoff = std::clamp(material.alpha_cutoff, 0.0f, 1.0f);
+            material.alpha_mode = parse_alpha_mode_name(alpha_mode);
+            material.double_sided = double_sided != 0;
+            material.normal_scale = std::max(0.0f, material.normal_scale);
+        } else if (tag == "material_texture") {
+            std::string material_name;
+            std::string slot;
+            std::string texture_name;
+            input >> material_name >> slot >> texture_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid material_texture at line " + std::to_string(line_number));
+            }
+            std::shared_ptr<Texture> texture;
+            if (texture_name != "none") {
+                texture = find_texture(scene, texture_name);
+                if (!texture) {
+                    return fail("Unknown material_texture texture '" + texture_name + "' at line " + std::to_string(line_number));
+                }
+            }
+            if (!assign_material_texture(*scene.materials[static_cast<size_t>(index)], slot, texture)) {
+                return fail("Unknown material_texture slot '" + slot + "' at line " + std::to_string(line_number));
+            }
+        } else if (tag == "principled_properties") {
+            std::string material_name;
+            input >> material_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid principled_properties material at line " + std::to_string(line_number));
+            }
+            auto* principled = dynamic_cast<PrincipledMaterial*>(scene.materials[static_cast<size_t>(index)].get());
+            if (!principled) {
+                return fail("principled_properties used on non-principled material at line " + std::to_string(line_number));
+            }
+            input >> principled->sheen_color.x
+                >> principled->sheen_color.y
+                >> principled->sheen_color.z
+                >> principled->sheen_roughness
+                >> principled->clearcoat
+                >> principled->clearcoat_roughness;
+            if (!input) {
+                return fail("Invalid principled_properties at line " + std::to_string(line_number));
+            }
+            principled->sheen_roughness = std::clamp(principled->sheen_roughness, 0.0f, 1.0f);
+            principled->clearcoat = std::clamp(principled->clearcoat, 0.0f, 1.0f);
+            principled->clearcoat_roughness = std::clamp(principled->clearcoat_roughness, 0.0f, 1.0f);
+        } else if (tag == "dielectric_properties") {
+            std::string material_name;
+            input >> material_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid dielectric_properties material at line " + std::to_string(line_number));
+            }
+            auto* dielectric = dynamic_cast<DielectricMaterial*>(scene.materials[static_cast<size_t>(index)].get());
+            if (!dielectric) {
+                return fail("dielectric_properties used on non-dielectric material at line " + std::to_string(line_number));
+            }
+            input >> dielectric->transmission_tint.x >> dielectric->transmission_tint.y >> dielectric->transmission_tint.z;
+            if (!input) {
+                return fail("Invalid dielectric_properties at line " + std::to_string(line_number));
+            }
         } else if (tag == "npr") {
             std::string material_name;
             std::string style_name;
@@ -378,21 +625,41 @@ SceneLoadResult load_scene(const std::string& path) {
                 if (!(file >> first_index_token)) {
                     return fail("Invalid mesh index data after line " + std::to_string(line_number));
                 }
-                if (first_index_token == "normals") {
-                    int normal_count = 0;
-                    if (!(file >> normal_count) || normal_count < 0) {
-                        return fail("Invalid mesh normal header after line " + std::to_string(line_number));
-                    }
-                    mesh.normals.reserve(static_cast<size_t>(normal_count));
-                    for (int i = 0; i < normal_count; ++i) {
-                        Vec3 normal;
-                        if (!(file >> normal.x >> normal.y >> normal.z)) {
-                            return fail("Invalid mesh normal data after line " + std::to_string(line_number));
+                while (first_index_token == "normals" || first_index_token == "texcoords") {
+                    if (first_index_token == "normals") {
+                        int normal_count = 0;
+                        if (!(file >> normal_count) || normal_count < 0) {
+                            return fail("Invalid mesh normal header after line " + std::to_string(line_number));
                         }
-                        mesh.normals.push_back(normalize(normal));
-                    }
-                    if (!mesh.normals.empty() && mesh.normals.size() != mesh.vertices.size()) {
-                        return fail("Mesh normal count must match vertex count after line " + std::to_string(line_number));
+                        mesh.normals.clear();
+                        mesh.normals.reserve(static_cast<size_t>(normal_count));
+                        for (int i = 0; i < normal_count; ++i) {
+                            Vec3 normal;
+                            if (!(file >> normal.x >> normal.y >> normal.z)) {
+                                return fail("Invalid mesh normal data after line " + std::to_string(line_number));
+                            }
+                            mesh.normals.push_back(normalize(normal));
+                        }
+                        if (!mesh.normals.empty() && mesh.normals.size() != mesh.vertices.size()) {
+                            return fail("Mesh normal count must match vertex count after line " + std::to_string(line_number));
+                        }
+                    } else {
+                        int texcoord_count = 0;
+                        if (!(file >> texcoord_count) || texcoord_count < 0) {
+                            return fail("Invalid mesh texcoord header after line " + std::to_string(line_number));
+                        }
+                        mesh.texcoords.clear();
+                        mesh.texcoords.reserve(static_cast<size_t>(texcoord_count));
+                        for (int i = 0; i < texcoord_count; ++i) {
+                            Vec2 uv;
+                            if (!(file >> uv.x >> uv.y)) {
+                                return fail("Invalid mesh texcoord data after line " + std::to_string(line_number));
+                            }
+                            mesh.texcoords.push_back(uv);
+                        }
+                        if (!mesh.texcoords.empty() && mesh.texcoords.size() != mesh.vertices.size()) {
+                            return fail("Mesh texcoord count must match vertex count after line " + std::to_string(line_number));
+                        }
                     }
                     if (!(file >> first_index_token)) {
                         return fail("Invalid mesh index data after line " + std::to_string(line_number));
@@ -499,7 +766,48 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         if (scene.environment.texture) {
             output << ' ' << scene.environment.texture->name;
         }
-        output << "\n\n";
+        output << '\n';
+        if (scene.environment.mapping != Environment::Mapping::Equirectangular) {
+            output << "environment_mapping " << environment_mapping_name(scene.environment.mapping) << '\n';
+        }
+        if (!is_default_environment_basis(scene.environment)) {
+            output << "environment_basis "
+                << scene.environment.light_from_world_x.x << ' ' << scene.environment.light_from_world_x.y << ' ' << scene.environment.light_from_world_x.z << ' '
+                << scene.environment.light_from_world_y.x << ' ' << scene.environment.light_from_world_y.y << ' ' << scene.environment.light_from_world_y.z << ' '
+                << scene.environment.light_from_world_z.x << ' ' << scene.environment.light_from_world_z.y << ' ' << scene.environment.light_from_world_z.z << '\n';
+        }
+        output << '\n';
+    }
+
+    if (scene.has_render_settings) {
+        const SceneRenderSettings& settings = scene.render_settings;
+        output << "npr_sampling "
+            << settings.stylized_samples << ' '
+            << settings.stylized_max_depth << '\n';
+        output << "irradiance_volume "
+            << (settings.use_irradiance_volume ? 1 : 0) << ' '
+            << settings.irradiance_volume_grid_resolution << ' '
+            << settings.irradiance_volume_subgrid_resolution << ' '
+            << settings.irradiance_volume_direction_resolution << ' '
+            << settings.irradiance_volume_bake_samples << ' '
+            << settings.irradiance_volume_bake_bounces << ' '
+            << settings.irradiance_volume_bounds_inset << ' '
+            << (settings.irradiance_volume_principled_gi ? 1 : 0) << ' '
+            << (settings.irradiance_volume_debug_probes ? 1 : 0) << ' '
+            << settings.irradiance_volume_debug_probe_radius_scale << ' '
+            << (settings.irradiance_volume_cache_enabled ? 1 : 0) << ' '
+            << (settings.irradiance_volume_auto_update ? 1 : 0) << ' '
+            << (settings.irradiance_volume_manual_bounds ? 1 : 0) << '\n';
+        if (settings.irradiance_volume_manual_bounds) {
+            output << "irradiance_volume_bounds "
+                << settings.irradiance_volume_bounds_min.x << ' '
+                << settings.irradiance_volume_bounds_min.y << ' '
+                << settings.irradiance_volume_bounds_min.z << ' '
+                << settings.irradiance_volume_bounds_max.x << ' '
+                << settings.irradiance_volume_bounds_max.y << ' '
+                << settings.irradiance_volume_bounds_max.z << '\n';
+        }
+        output << '\n';
     }
 
     for (const std::shared_ptr<Material>& material : scene.materials) {
@@ -522,6 +830,54 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         }
         output << '\n';
     }
+
+    for (const std::shared_ptr<Material>& material : scene.materials) {
+        if (!material) {
+            continue;
+        }
+        if (has_nondefault_material_properties(*material)) {
+            output << "material_properties " << material->name << ' '
+                << material->alpha << ' '
+                << material->alpha_cutoff << ' '
+                << alpha_mode_name(material->alpha_mode) << ' '
+                << (material->double_sided ? 1 : 0) << ' '
+                << material->normal_scale << ' '
+                << material->emission.x << ' '
+                << material->emission.y << ' '
+                << material->emission.z << '\n';
+        }
+        write_material_texture(output, *material, "normal", material->normal_texture);
+        write_material_texture(output, *material, "emission", material->emission_texture);
+        if (const auto* principled = dynamic_cast<const PrincipledMaterial*>(material.get())) {
+            if (has_nonzero(principled->sheen_color) ||
+                principled->sheen_roughness != 0.0f ||
+                principled->clearcoat != 0.0f ||
+                principled->clearcoat_roughness != 0.0f) {
+                output << "principled_properties " << material->name << ' '
+                    << principled->sheen_color.x << ' '
+                    << principled->sheen_color.y << ' '
+                    << principled->sheen_color.z << ' '
+                    << principled->sheen_roughness << ' '
+                    << principled->clearcoat << ' '
+                    << principled->clearcoat_roughness << '\n';
+            }
+            write_material_texture(output, *material, "metallic_roughness", principled->metallic_roughness_texture);
+            write_material_texture(output, *material, "sheen_color", principled->sheen_color_texture);
+            write_material_texture(output, *material, "sheen_roughness", principled->sheen_roughness_texture);
+            write_material_texture(output, *material, "clearcoat", principled->clearcoat_texture);
+            write_material_texture(output, *material, "clearcoat_roughness", principled->clearcoat_roughness_texture);
+        } else if (const auto* dielectric = dynamic_cast<const DielectricMaterial*>(material.get())) {
+            if (dielectric->transmission_tint.x != 1.0f ||
+                dielectric->transmission_tint.y != 1.0f ||
+                dielectric->transmission_tint.z != 1.0f) {
+                output << "dielectric_properties " << material->name << ' '
+                    << dielectric->transmission_tint.x << ' '
+                    << dielectric->transmission_tint.y << ' '
+                    << dielectric->transmission_tint.z << '\n';
+            }
+        }
+    }
+    output << '\n';
 
     for (const std::shared_ptr<Material>& material : scene.materials) {
         if (!material || material->npr.style == NprStyle::None) {
@@ -599,6 +955,12 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             output << "normals " << mesh.normals.size() << '\n';
             for (Vec3 normal : mesh.normals) {
                 output << normal.x << ' ' << normal.y << ' ' << normal.z << '\n';
+            }
+        }
+        if (mesh.texcoords.size() == mesh.vertices.size()) {
+            output << "texcoords " << mesh.texcoords.size() << '\n';
+            for (Vec2 uv : mesh.texcoords) {
+                output << uv.x << ' ' << uv.y << '\n';
             }
         }
         for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {

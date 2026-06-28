@@ -25,12 +25,17 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
             has_dirty(settings.dirty, RenderDirty::Material) ||
             has_dirty(settings.dirty, RenderDirty::Texture) ||
             has_dirty(settings.dirty, RenderDirty::Environment);
-        if (!cached_irradiance_volume_ || volume_dirty) {
-            cached_irradiance_volume_ = build_irradiance_volume(render_scene, scene, settings);
-        }
-        irradiance_volume = std::static_pointer_cast<IrradianceVolume>(cached_irradiance_volume_);
+        bool volume_rebuilt = false;
+        irradiance_volume = update_irradiance_volume(
+            cached_irradiance_volume_,
+            render_scene,
+            scene,
+            settings,
+            volume_dirty,
+            volume_rebuilt);
     } else if (cached_irradiance_volume_) {
         cached_irradiance_volume_.reset();
+        set_irradiance_volume_progress_phase(settings, IrradianceVolumeBakePhase::Idle);
     }
 
     const unsigned int hardware_threads = std::thread::hardware_concurrency();

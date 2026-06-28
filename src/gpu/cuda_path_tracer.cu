@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <string>
@@ -254,14 +258,17 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             has_dirty(settings.dirty, RenderDirty::Material) ||
             has_dirty(settings.dirty, RenderDirty::Texture) ||
             has_dirty(settings.dirty, RenderDirty::Environment);
-        if (!cached_irradiance_volume_ || volume_dirty) {
-            cached_irradiance_volume_ = build_irradiance_volume(cached_render_scene_, scene, settings);
-            irradiance_volume_rebuilt = true;
-        }
-        irradiance_volume = std::static_pointer_cast<IrradianceVolume>(cached_irradiance_volume_);
+        irradiance_volume = update_irradiance_volume(
+            cached_irradiance_volume_,
+            cached_render_scene_,
+            scene,
+            settings,
+            volume_dirty,
+            irradiance_volume_rebuilt);
     } else if (cached_irradiance_volume_) {
         cached_irradiance_volume_.reset();
         irradiance_volume_rebuilt = true;
+        set_irradiance_volume_progress_phase(settings, IrradianceVolumeBakePhase::Idle);
     }
 
     const bool full_upload = !scene_uploaded_ ||

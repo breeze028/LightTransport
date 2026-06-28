@@ -11,7 +11,7 @@ namespace lt {
 
 struct LightComponent {
     bool enabled = false;
-    bool double_sided = true;
+    bool double_sided = false;
     Vec3 color = {1.0f, 1.0f, 1.0f};
     float intensity = 1.0f;
 };
@@ -57,6 +57,26 @@ struct Environment {
     Vec3 light_from_world_z = {0.0f, 0.0f, 1.0f};
 };
 
+struct SceneRenderSettings {
+    int stylized_samples = 8;
+    int stylized_max_depth = 1;
+    bool use_irradiance_volume = false;
+    int irradiance_volume_grid_resolution = 7;
+    int irradiance_volume_subgrid_resolution = 3;
+    int irradiance_volume_direction_resolution = 9;
+    int irradiance_volume_bake_samples = 1;
+    int irradiance_volume_bake_bounces = 4;
+    float irradiance_volume_bounds_inset = 0.01f;
+    bool irradiance_volume_principled_gi = false;
+    bool irradiance_volume_debug_probes = false;
+    float irradiance_volume_debug_probe_radius_scale = 0.10f;
+    bool irradiance_volume_cache_enabled = true;
+    bool irradiance_volume_auto_update = true;
+    bool irradiance_volume_manual_bounds = false;
+    Vec3 irradiance_volume_bounds_min = {-1.0f, -1.0f, -1.0f};
+    Vec3 irradiance_volume_bounds_max = {1.0f, 1.0f, 1.0f};
+};
+
 struct Scene {
     Scene() = default;
     Scene(const Scene& other);
@@ -66,6 +86,8 @@ struct Scene {
 
     Camera camera;
     Environment environment;
+    SceneRenderSettings render_settings;
+    bool has_render_settings = false;
     bool uses_builtin_default_meshes = false;
     std::vector<std::shared_ptr<Material>> materials;
     std::vector<std::shared_ptr<Texture>> textures;

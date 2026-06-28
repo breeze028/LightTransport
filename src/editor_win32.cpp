@@ -19,6 +19,7 @@
 #include <ctime>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <future>
 #include <iterator>
@@ -26,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
@@ -35,6 +37,9 @@ namespace {
 using namespace lt::editor;
 
 void upload_preview_texture();
+void apply_scene_render_settings(const lt::Scene& scene);
+void discard_pending_render_task();
+void reset_renderer_caches();
 
 lt::LogObserverHandle g_editor_log_observer = 0;
 constexpr size_t kMaxEditorLogs = 2000;
@@ -137,9 +142,15 @@ struct EditorLoggingScope {
 void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
     g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
     ++g_editor.render_generation;
+    if (lt::has_dirty(dirty, lt::RenderDirty::Material) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Texture) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Geometry) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Environment) ||
+        lt::has_dirty(dirty, lt::RenderDirty::IrradianceVolume)) {
+        ++g_editor.content_generation;
+    }
     g_editor.frame_index = 0;
-    g_editor.framebuffer.clear();
-    upload_preview_texture();
+    g_editor.framebuffer.clear_accumulation();
 }
 
 void set_renderer(bool use_cuda) {
@@ -211,9 +222,25 @@ void invalidate_mesh_bounds_cache() {
     g_pick_cache.render_scene = {};
 }
 
+void discard_pending_render_task() {
+    if (!g_render_future.valid()) {
+        return;
+    }
+    g_render_future.wait();
+    (void)g_render_future.get();
+}
+
+void reset_renderer_caches() {
+    discard_pending_render_task();
+    g_editor.cpu.reset();
+    g_editor.cuda.reset();
+}
+
 void set_scene(lt::Scene scene, const std::string& path) {
+    reset_renderer_caches();
     g_editor.scene = std::move(scene);
     g_editor.scene_path = path;
+    apply_scene_render_settings(g_editor.scene);
     invalidate_mesh_bounds_cache();
     if (!g_editor.scene.meshes.empty()) {
         select_mesh(0);
@@ -342,6 +369,292 @@ std::string lowercase_extension(const std::string& path) {
     return ext;
 }
 
+template <size_t N>
+void copy_setting_text(char (&target)[N], const std::string& value) {
+    std::snprintf(target, N, "%s", value.c_str());
+}
+
+bool is_url_path(const std::string& path) {
+    return path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
+}
+
+std::string default_irradiance_volume_cache_path() {
+    if (g_editor.scene_path.empty()) {
+        return "cache/irradiance_volume/untitled.ivol";
+    }
+    if (is_url_path(g_editor.scene_path)) {
+        std::string safe = g_editor.scene_path;
+        for (char& c : safe) {
+            if (!std::isalnum(static_cast<unsigned char>(c))) {
+                c = '_';
+            }
+        }
+        return (std::filesystem::path("cache") / "irradiance_volume" / (safe + ".ivol")).string();
+    }
+    return g_editor.scene_path + ".ivol";
+}
+
+std::string ensure_lt_extension(const std::string& path) {
+    if (lowercase_extension(path) == ".lt") {
+        return path;
+    }
+    std::filesystem::path scene_path(path);
+    scene_path.replace_extension(".lt");
+    return scene_path.string();
+}
+
+bool same_scene_file(const std::string& left, const std::string& right) {
+    if (left.empty() || right.empty() || is_url_path(left) || is_url_path(right)) {
+        return false;
+    }
+    std::error_code error;
+    std::filesystem::path left_path = std::filesystem::absolute(left, error);
+    if (error) {
+        return false;
+    }
+    left_path = left_path.lexically_normal();
+    std::filesystem::path right_path = std::filesystem::absolute(right, error);
+    if (error) {
+        return false;
+    }
+    right_path = right_path.lexically_normal();
+#if defined(_WIN32)
+    std::string left_text = left_path.string();
+    std::string right_text = right_path.string();
+    std::transform(left_text.begin(), left_text.end(), left_text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(right_text.begin(), right_text.end(), right_text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return left_text == right_text;
+#else
+    return left_path == right_path;
+#endif
+}
+
+std::string sanitize_asset_name(std::string name) {
+    if (name.empty()) {
+        name = "texture";
+    }
+    for (char& c : name) {
+        const unsigned char value = static_cast<unsigned char>(c);
+        if (!std::isalnum(value) && c != '-' && c != '_') {
+            c = '_';
+        }
+    }
+    if (name.empty()) {
+        return "texture";
+    }
+    return name;
+}
+
+std::string normalized_extension(std::string extension, const char* fallback = ".png") {
+    if (extension.empty()) {
+        return fallback;
+    }
+    if (extension.front() != '.') {
+        extension.insert(extension.begin(), '.');
+    }
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (extension == ".jpeg") {
+        return ".jpg";
+    }
+    return extension;
+}
+
+bool texture_needs_hdr_sidecar(const lt::Texture& texture) {
+    return std::any_of(texture.pixels.begin(), texture.pixels.end(), [](lt::Vec3 value) {
+        return value.x < 0.0f || value.x > 1.0f ||
+            value.y < 0.0f || value.y > 1.0f ||
+            value.z < 0.0f || value.z > 1.0f;
+    });
+}
+
+std::filesystem::path resolve_texture_path_for_scene(const std::string& texture_path, const std::string& source_scene_path) {
+    std::filesystem::path path(texture_path);
+    if (path.is_absolute() || source_scene_path.empty() || is_url_path(source_scene_path)) {
+        return path;
+    }
+    return std::filesystem::path(source_scene_path).parent_path() / path;
+}
+
+std::string path_relative_to_scene(const std::filesystem::path& asset_path, const std::filesystem::path& scene_path) {
+    const std::filesystem::path scene_dir = scene_path.parent_path();
+    std::error_code error;
+    const std::filesystem::path absolute_asset = std::filesystem::absolute(asset_path, error);
+    if (error) {
+        return asset_path.string();
+    }
+    const std::filesystem::path absolute_scene_dir = std::filesystem::absolute(scene_dir.empty() ? std::filesystem::path(".") : scene_dir, error);
+    if (error) {
+        return absolute_asset.string();
+    }
+    const std::filesystem::path relative = std::filesystem::relative(absolute_asset, absolute_scene_dir, error);
+    return error ? absolute_asset.string() : relative.generic_string();
+}
+
+std::filesystem::path unique_asset_path(
+    const std::filesystem::path& assets_dir,
+    const std::string& base_name,
+    const std::string& extension,
+    std::unordered_set<std::string>& used_names) {
+    const std::string safe_base = sanitize_asset_name(base_name);
+    const std::string safe_extension = normalized_extension(extension);
+    for (int suffix = 0; suffix < 100000; ++suffix) {
+        const std::string filename = suffix == 0
+            ? safe_base + safe_extension
+            : safe_base + "_" + std::to_string(suffix) + safe_extension;
+        if (used_names.insert(filename).second) {
+            return assets_dir / filename;
+        }
+    }
+    return assets_dir / (safe_base + "_" + std::to_string(used_names.size()) + safe_extension);
+}
+
+bool write_bytes_file(const std::filesystem::path& path, const std::vector<unsigned char>& bytes, std::string& error) {
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+        error = "Could not write texture asset: " + path.string();
+        return false;
+    }
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!output) {
+        error = "Could not finish writing texture asset: " + path.string();
+        return false;
+    }
+    return true;
+}
+
+bool export_texture_sidecar(
+    lt::Scene& scene,
+    const std::shared_ptr<lt::Texture>& texture,
+    const std::string& target_scene_path,
+    std::unordered_set<std::string>& used_asset_names,
+    std::string& error) {
+    if (!texture) {
+        return true;
+    }
+    const std::filesystem::path target_scene(target_scene_path);
+    const std::string scene_stem = target_scene.stem().string().empty() ? "scene" : sanitize_asset_name(target_scene.stem().string());
+    const std::filesystem::path assets_dir = target_scene.parent_path() / (scene_stem + "_assets");
+    std::error_code fs_error;
+    std::filesystem::create_directories(assets_dir, fs_error);
+    if (fs_error) {
+        error = "Could not create texture asset directory: " + assets_dir.string();
+        return false;
+    }
+
+    std::string extension;
+    if (!texture->encoded_bytes.empty()) {
+        extension = normalized_extension(texture->encoded_extension);
+    } else {
+        const bool prefer_hdr = scene.environment.texture == texture || texture_needs_hdr_sidecar(*texture);
+        extension = prefer_hdr ? ".hdr" : ".png";
+    }
+
+    const std::filesystem::path asset_path = unique_asset_path(assets_dir, texture->name, extension, used_asset_names);
+    if (!texture->encoded_bytes.empty()) {
+        if (!write_bytes_file(asset_path, texture->encoded_bytes, error)) {
+            return false;
+        }
+    } else if (extension == ".hdr") {
+        if (!lt::write_texture_hdr(*texture, asset_path.string(), error)) {
+            return false;
+        }
+    } else if (!lt::write_texture_png(*texture, asset_path.string(), error)) {
+        return false;
+    }
+    texture->path = path_relative_to_scene(asset_path, target_scene);
+    return true;
+}
+
+bool rewrite_texture_paths_for_save_as(lt::Scene& scene, const std::string& source_scene_path, const std::string& target_scene_path, std::string& error) {
+    std::unordered_set<std::string> used_asset_names;
+    const std::filesystem::path target_scene(target_scene_path);
+    for (const std::shared_ptr<lt::Texture>& texture : scene.textures) {
+        if (!texture) {
+            continue;
+        }
+        if (!texture->encoded_bytes.empty()) {
+            if (!export_texture_sidecar(scene, texture, target_scene_path, used_asset_names, error)) {
+                return false;
+            }
+            continue;
+        }
+        if (!texture->path.empty() && !is_url_path(texture->path)) {
+            const std::filesystem::path source_texture = resolve_texture_path_for_scene(texture->path, source_scene_path);
+            std::error_code exists_error;
+            if (std::filesystem::exists(source_texture, exists_error) && !exists_error) {
+                texture->path = path_relative_to_scene(source_texture, target_scene);
+                continue;
+            }
+        }
+        if (!texture->pixels.empty()) {
+            if (!export_texture_sidecar(scene, texture, target_scene_path, used_asset_names, error)) {
+                return false;
+            }
+            continue;
+        }
+        error = "Texture has no usable file path or pixels: " + texture->name;
+        return false;
+    }
+    return true;
+}
+
+lt::SceneRenderSettings capture_scene_render_settings() {
+    lt::SceneRenderSettings settings;
+    settings.stylized_samples = g_editor.settings.stylized_samples;
+    settings.stylized_max_depth = g_editor.settings.stylized_max_depth;
+    settings.use_irradiance_volume = g_editor.settings.use_irradiance_volume;
+    settings.irradiance_volume_grid_resolution = g_editor.settings.irradiance_volume_grid_resolution;
+    settings.irradiance_volume_subgrid_resolution = g_editor.settings.irradiance_volume_subgrid_resolution;
+    settings.irradiance_volume_direction_resolution = g_editor.settings.irradiance_volume_direction_resolution;
+    settings.irradiance_volume_bake_samples = g_editor.settings.irradiance_volume_bake_samples;
+    settings.irradiance_volume_bake_bounces = g_editor.settings.irradiance_volume_bake_bounces;
+    settings.irradiance_volume_bounds_inset = g_editor.settings.irradiance_volume_bounds_inset;
+    settings.irradiance_volume_principled_gi = g_editor.settings.irradiance_volume_principled_gi;
+    settings.irradiance_volume_debug_probes = g_editor.settings.irradiance_volume_debug_probes;
+    settings.irradiance_volume_debug_probe_radius_scale = g_editor.settings.irradiance_volume_debug_probe_radius_scale;
+    settings.irradiance_volume_cache_enabled = g_editor.settings.irradiance_volume_cache_enabled;
+    settings.irradiance_volume_auto_update = g_editor.settings.irradiance_volume_auto_update;
+    settings.irradiance_volume_manual_bounds = g_editor.settings.irradiance_volume_manual_bounds;
+    settings.irradiance_volume_bounds_min = g_editor.settings.irradiance_volume_bounds_min;
+    settings.irradiance_volume_bounds_max = g_editor.settings.irradiance_volume_bounds_max;
+    return settings;
+}
+
+void sync_editor_settings_to_scene(lt::Scene& scene) {
+    scene.render_settings = capture_scene_render_settings();
+    scene.has_render_settings = true;
+}
+
+void apply_scene_render_settings(const lt::Scene& scene) {
+    if (!scene.has_render_settings) {
+        return;
+    }
+    const lt::SceneRenderSettings& settings = scene.render_settings;
+    g_editor.settings.stylized_samples = settings.stylized_samples;
+    g_editor.settings.stylized_max_depth = settings.stylized_max_depth;
+    g_editor.settings.use_irradiance_volume = settings.use_irradiance_volume;
+    g_editor.settings.irradiance_volume_grid_resolution = settings.irradiance_volume_grid_resolution;
+    g_editor.settings.irradiance_volume_subgrid_resolution = settings.irradiance_volume_subgrid_resolution;
+    g_editor.settings.irradiance_volume_direction_resolution = settings.irradiance_volume_direction_resolution;
+    g_editor.settings.irradiance_volume_bake_samples = settings.irradiance_volume_bake_samples;
+    g_editor.settings.irradiance_volume_bake_bounces = settings.irradiance_volume_bake_bounces;
+    g_editor.settings.irradiance_volume_bounds_inset = settings.irradiance_volume_bounds_inset;
+    g_editor.settings.irradiance_volume_principled_gi = settings.irradiance_volume_principled_gi;
+    g_editor.settings.irradiance_volume_debug_probes = settings.irradiance_volume_debug_probes;
+    g_editor.settings.irradiance_volume_debug_probe_radius_scale = settings.irradiance_volume_debug_probe_radius_scale;
+    g_editor.settings.irradiance_volume_cache_enabled = settings.irradiance_volume_cache_enabled;
+    g_editor.settings.irradiance_volume_auto_update = settings.irradiance_volume_auto_update;
+    g_editor.settings.irradiance_volume_manual_bounds = settings.irradiance_volume_manual_bounds;
+    g_editor.settings.irradiance_volume_bounds_min = settings.irradiance_volume_bounds_min;
+    g_editor.settings.irradiance_volume_bounds_max = settings.irradiance_volume_bounds_max;
+}
+
 void load_texture_dialog(lt::Material& material) {
     wchar_t filename[MAX_PATH] = {};
     OPENFILENAMEW ofn{};
@@ -401,23 +714,94 @@ void load_environment_texture_dialog() {
     reset_accumulation(lt::RenderDirty::Texture | lt::RenderDirty::Environment);
 }
 
+void restore_texture_paths(const std::vector<std::pair<std::shared_ptr<lt::Texture>, std::string>>& original_paths) {
+    for (const auto& original : original_paths) {
+        if (original.first) {
+            original.first->path = original.second;
+        }
+    }
+}
+
+bool save_scene_to_path(const std::string& requested_path, bool rewrite_assets) {
+    const std::string target_path = ensure_lt_extension(requested_path);
+    sync_editor_settings_to_scene(g_editor.scene);
+
+    std::vector<std::pair<std::shared_ptr<lt::Texture>, std::string>> original_paths;
+    if (rewrite_assets) {
+        original_paths.reserve(g_editor.scene.textures.size());
+        for (const std::shared_ptr<lt::Texture>& texture : g_editor.scene.textures) {
+            if (texture) {
+                original_paths.push_back({texture, texture->path});
+            }
+        }
+    }
+
+    std::string error;
+    if (rewrite_assets && !rewrite_texture_paths_for_save_as(g_editor.scene, g_editor.scene_path, target_path, error)) {
+        restore_texture_paths(original_paths);
+        LT_LOG_ERROR("Save As asset export failed '{}': {}", target_path, error);
+        MessageBoxW(g_hwnd, widen(error).c_str(), L"Save As failed", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    if (!lt::save_scene(g_editor.scene, target_path, error)) {
+        if (rewrite_assets) {
+            restore_texture_paths(original_paths);
+        }
+        LT_LOG_ERROR("Save failed '{}': {}", target_path, error);
+        MessageBoxW(g_hwnd, widen(error).c_str(), L"Save failed", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    g_editor.scene_path = target_path;
+    if (rewrite_assets) {
+        reset_renderer_caches();
+        reset_accumulation(lt::RenderDirty::All);
+    }
+    LT_LOG_INFO("Saved scene '{}'", g_editor.scene_path);
+    return true;
+}
+
+bool save_scene_as_dialog() {
+    wchar_t filename[MAX_PATH] = {};
+    std::filesystem::path suggested = is_url_path(g_editor.scene_path) || g_editor.scene_path.empty()
+        ? std::filesystem::path("scene.lt")
+        : std::filesystem::path(g_editor.scene_path);
+    suggested.replace_extension(".lt");
+    const std::wstring initial = widen(suggested.string());
+    const size_t count = std::min<size_t>(initial.size(), MAX_PATH - 1u);
+    for (size_t i = 0; i < count; ++i) {
+        filename[i] = initial[i];
+    }
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"LightTransport scenes (*.lt)\0*.lt\0All files (*.*)\0*.*\0";
+    ofn.lpstrDefExt = L"lt";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameW(&ofn)) {
+        return false;
+    }
+    const std::string target_path = ensure_lt_extension(narrow(filename));
+    const bool source_is_lt = lowercase_extension(g_editor.scene_path) == ".lt";
+    const bool rewrite_assets = !source_is_lt || !same_scene_file(g_editor.scene_path, target_path);
+    return save_scene_to_path(target_path, rewrite_assets);
+}
+
 void save_scene() {
     if (lowercase_extension(g_editor.scene_path) != ".lt") {
-        LT_LOG_INFO("Save skipped for imported scene '{}'", g_editor.scene_path);
-        MessageBoxW(g_hwnd, L"Imported glTF/GLB scenes can be edited, but saving back to that format is not supported yet. Save is limited to .lt scene files.", L"Save skipped", MB_OK | MB_ICONINFORMATION);
+        LT_LOG_INFO("Save requested for imported scene '{}'; opening Save As", g_editor.scene_path);
+        save_scene_as_dialog();
         return;
     }
     const std::wstring message = L"Save changes to this scene?\n\n" + widen(g_editor.scene_path);
     if (MessageBoxW(g_hwnd, message.c_str(), L"Confirm Save", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
-    std::string error;
-    if (!lt::save_scene(g_editor.scene, g_editor.scene_path, error)) {
-        LT_LOG_ERROR("Save failed '{}': {}", g_editor.scene_path, error);
-        MessageBoxW(g_hwnd, widen(error).c_str(), L"Save failed", MB_OK | MB_ICONERROR);
-    } else {
-        LT_LOG_INFO("Saved scene '{}'", g_editor.scene_path);
-    }
+    save_scene_to_path(g_editor.scene_path, false);
 }
 
 int default_material(const char* preferred) {
@@ -558,7 +942,7 @@ void add_area_light_mesh() {
         {0.35f, 0.0f, 0.35f},
         {-0.35f, 0.0f, 0.35f});
     light.translation = spawn_position(1.2f);
-    light.light = {true, true, {1.0f, 0.888889f, 0.666667f}, 9.0f};
+    light.light = {true, false, {1.0f, 0.888889f, 0.666667f}, 9.0f};
     g_editor.scene.meshes.push_back(std::move(light));
     g_editor.scene.uses_builtin_default_meshes = false;
     invalidate_mesh_bounds_cache();
@@ -650,9 +1034,20 @@ void upload_preview_texture() {
 void poll_render_result() {
     if (!g_render_future.valid() || g_render_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
     RenderResult result = g_render_future.get();
-    if (result.generation != g_editor.render_generation) return;
-    g_editor.framebuffer = std::move(result.framebuffer);
-    g_editor.frame_index = result.completed_frame + 1u;
+    const bool current_result = result.generation == g_editor.render_generation;
+    const bool compatible_stale_result =
+        result.content_generation == g_editor.content_generation &&
+        result.framebuffer.width == g_editor.framebuffer.width &&
+        result.framebuffer.height == g_editor.framebuffer.height;
+    if (!current_result && !compatible_stale_result) return;
+    if (current_result) {
+        g_editor.framebuffer = std::move(result.framebuffer);
+        g_editor.frame_index = result.completed_frame + 1u;
+    } else {
+        g_editor.framebuffer.rgba = std::move(result.framebuffer.rgba);
+        g_editor.framebuffer.clear_accumulation();
+        g_editor.frame_index = 0;
+    }
     g_editor.last_sample_ms = result.elapsed_ms;
     upload_preview_texture();
 }
@@ -663,22 +1058,30 @@ void launch_render_task() {
     lt::RenderSettings settings = g_editor.settings;
     lt::Framebuffer framebuffer = g_editor.framebuffer;
     const uint64_t generation = g_editor.render_generation;
+    const uint64_t content_generation = g_editor.content_generation;
+    copy_setting_text(settings.irradiance_volume_cache_key, g_editor.scene_path);
+    copy_setting_text(settings.irradiance_volume_cache_path, default_irradiance_volume_cache_path());
+    settings.irradiance_volume_bake_progress = g_editor.irradiance_volume_bake_progress.get();
+    const bool consume_force_rebake = settings.irradiance_volume_force_rebake;
     lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene)
         ? static_cast<lt::IRenderer*>(&g_editor.cpu)
         : g_editor.renderer;
     settings.frame_index = g_editor.frame_index;
     settings.dirty = g_editor.dirty;
     g_editor.dirty = lt::RenderDirty::None;
-    g_render_future = std::async(std::launch::async, [scene = std::move(scene), settings, framebuffer = std::move(framebuffer), generation, renderer]() mutable {
+    g_render_future = std::async(std::launch::async, [scene = std::move(scene), settings, framebuffer = std::move(framebuffer), generation, content_generation, renderer]() mutable {
         const auto begin = std::chrono::steady_clock::now();
         renderer->render(scene, settings, framebuffer);
         const auto end = std::chrono::steady_clock::now();
         const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
-        return RenderResult{generation, settings.frame_index, elapsed_ms, std::move(framebuffer)};
+        return RenderResult{generation, content_generation, settings.frame_index, elapsed_ms, std::move(framebuffer)};
     });
+    if (consume_force_rebake) {
+        g_editor.settings.irradiance_volume_force_rebake = false;
+    }
 }
 
-void render_preview_if_needed() {
+void prepare_render_preview() {
     const int width = std::max(64, static_cast<int>(g_editor.viewport_size.x));
     const int height = std::max(64, static_cast<int>(g_editor.viewport_size.y));
     if (width != g_editor.settings.width || height != g_editor.settings.height) {
@@ -689,7 +1092,6 @@ void render_preview_if_needed() {
     }
     recreate_preview_texture(width, height);
     poll_render_result();
-    launch_render_task();
 }
 
 ViewTransform make_view_transform(bool apply_camera_handedness = true) {
@@ -846,7 +1248,6 @@ void move_camera(float right_delta, float up_delta, float forward_delta) {
     const lt::Vec3 delta = view.right * right_delta + view.up * up_delta + view.forward * forward_delta;
     camera.position += delta;
     camera.target += delta;
-    reset_accumulation(lt::RenderDirty::Camera);
 }
 
 void rotate_camera(float yaw, float pitch) {
@@ -859,7 +1260,6 @@ void rotate_camera(float yaw, float pitch) {
     current_yaw += yaw * rotate_sign;
     current_pitch = std::clamp(current_pitch + pitch, -1.45f, 1.45f);
     camera.target = camera.position + lt::Vec3{std::sin(current_yaw) * std::cos(current_pitch), std::sin(current_pitch), std::cos(current_yaw) * std::cos(current_pitch)} * radius;
-    reset_accumulation(lt::RenderDirty::Camera);
 }
 
 lt::Vec3 handle_axis(GizmoHandle handle) {
@@ -1809,6 +2209,7 @@ float draw_top_bar() {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open", "O")) open_scene_dialog();
         if (ImGui::MenuItem("Save", "Ctrl+S")) save_scene();
+        if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) save_scene_as_dialog();
         if (ImGui::MenuItem("Exit", "Esc")) PostQuitMessage(0);
         ImGui::EndMenu();
     }
@@ -1922,7 +2323,7 @@ void draw_properties() {
                 }, &g_editor.scene, static_cast<int>(g_editor.scene.materials.size()))) reset_accumulation(lt::RenderDirty::Geometry);
                 if (ImGui::Checkbox("Light", &mesh.light.enabled)) {
                     if (mesh.light.enabled) {
-                        mesh.light.double_sided = true;
+                        mesh.light.double_sided = false;
                         if (lt::dot(mesh.light.color, mesh.light.color) <= 0.0f) {
                             mesh.light.color = {1.0f, 0.888889f, 0.666667f};
                         }
@@ -2234,6 +2635,7 @@ void draw_properties() {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
             }
+            ImGui::Checkbox("Hide Dirty Wireframes", &g_editor.hide_dirty_wireframes);
             const char* accel_modes[] = {"Auto", "Flat BVH", "Two-level BVH"};
             int accel_mode = static_cast<int>(g_editor.settings.acceleration_structure);
             if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
@@ -2245,6 +2647,18 @@ void draw_properties() {
                 reset_accumulation(lt::RenderDirty::IrradianceVolume);
             }
             ImGui::BeginDisabled(!g_editor.settings.use_irradiance_volume);
+            if (ImGui::Checkbox("Disk Cache", &g_editor.settings.irradiance_volume_cache_enabled)) {
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::Checkbox("Auto Update", &g_editor.settings.irradiance_volume_auto_update)) {
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            if (ImGui::Button("Update Volume")) {
+                g_editor.settings.irradiance_volume_force_rebake = true;
+                reset_accumulation(lt::RenderDirty::IrradianceVolume);
+            }
+            const std::string cache_path = default_irradiance_volume_cache_path();
+            ImGui::TextWrapped("Cache: %s", cache_path.c_str());
             if (ImGui::DragInt("Volume Grid", &g_editor.settings.irradiance_volume_grid_resolution, 1.0f, 2, 16)) {
                 g_editor.settings.irradiance_volume_grid_resolution = std::clamp(g_editor.settings.irradiance_volume_grid_resolution, 2, 64);
                 reset_accumulation(lt::RenderDirty::IrradianceVolume);
@@ -2359,15 +2773,28 @@ void handle_viewport_input() {
     if (!g_editor.viewport_hovered && !g_editor.viewport_focused) return;
     if (g_editor.gizmo_dragging) return;
     const float step = io.KeyShift ? 0.18f : 0.06f;
-    if (ImGui::IsKeyDown(ImGuiKey_W)) move_camera(0.0f, 0.0f, step);
-    if (ImGui::IsKeyDown(ImGuiKey_S)) move_camera(0.0f, 0.0f, -step);
-    if (ImGui::IsKeyDown(ImGuiKey_A)) move_camera(-step, 0.0f, 0.0f);
-    if (ImGui::IsKeyDown(ImGuiKey_D)) move_camera(step, 0.0f, 0.0f);
-    if (ImGui::IsKeyDown(ImGuiKey_Q)) move_camera(0.0f, -step, 0.0f);
-    if (ImGui::IsKeyDown(ImGuiKey_E)) move_camera(0.0f, step, 0.0f);
+    float right_delta = 0.0f;
+    float up_delta = 0.0f;
+    float forward_delta = 0.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_W)) forward_delta += step;
+    if (ImGui::IsKeyDown(ImGuiKey_S)) forward_delta -= step;
+    if (ImGui::IsKeyDown(ImGuiKey_A)) right_delta -= step;
+    if (ImGui::IsKeyDown(ImGuiKey_D)) right_delta += step;
+    if (ImGui::IsKeyDown(ImGuiKey_Q)) up_delta -= step;
+    if (ImGui::IsKeyDown(ImGuiKey_E)) up_delta += step;
+    bool camera_changed = right_delta != 0.0f || up_delta != 0.0f || forward_delta != 0.0f;
+    if (camera_changed) {
+        move_camera(right_delta, up_delta, forward_delta);
+    }
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
         const ImVec2 delta = io.MouseDelta;
-        rotate_camera(delta.x * -0.004f, delta.y * -0.004f);
+        if (delta.x != 0.0f || delta.y != 0.0f) {
+            rotate_camera(delta.x * -0.004f, delta.y * -0.004f);
+            camera_changed = true;
+        }
+    }
+    if (camera_changed) {
+        reset_accumulation(lt::RenderDirty::Camera);
     }
 }
 
@@ -2382,7 +2809,7 @@ void draw_viewport() {
     available.x = std::max(64.0f, available.x);
     available.y = std::max(64.0f, available.y);
     g_editor.viewport_size = available;
-    render_preview_if_needed();
+    prepare_render_preview();
     if (g_preview.srv) {
         g_editor.viewport_image_min = ImGui::GetCursorScreenPos();
         ImGui::Image(reinterpret_cast<ImTextureID>(g_preview.srv), available);
@@ -2400,7 +2827,7 @@ void draw_viewport() {
         }
     }
     handle_gizmo_drag();
-    if (g_editor.frame_index == 0) {
+    if (g_editor.frame_index == 0 && !g_editor.hide_dirty_wireframes) {
         draw_scene_reference_outlines(ImGui::GetWindowDrawList());
     }
     draw_gizmo_overlay();
@@ -2539,6 +2966,67 @@ void draw_loading_overlay() {
     ImGui::PopStyleVar();
 }
 
+void draw_irradiance_volume_bake_overlay() {
+    if (scene_load_in_progress() || !g_editor.irradiance_volume_bake_progress) {
+        return;
+    }
+    lt::IrradianceVolumeBakeProgress& progress = *g_editor.irradiance_volume_bake_progress;
+    const auto phase = static_cast<lt::IrradianceVolumeBakePhase>(progress.phase.load(std::memory_order_relaxed));
+    if (phase != lt::IrradianceVolumeBakePhase::LoadingCache &&
+        phase != lt::IrradianceVolumeBakePhase::Baking &&
+        phase != lt::IrradianceVolumeBakePhase::SavingCache) {
+        return;
+    }
+
+    const char* title = "Baking irradiance volume";
+    if (phase == lt::IrradianceVolumeBakePhase::LoadingCache) {
+        title = "Loading irradiance volume";
+    } else if (phase == lt::IrradianceVolumeBakePhase::SavingCache) {
+        title = "Saving irradiance volume";
+    }
+    const uint64_t total_samples = progress.total_samples.load(std::memory_order_relaxed);
+    const uint64_t completed_samples = progress.completed_samples.load(std::memory_order_relaxed);
+    const uint64_t total_rays = progress.total_rays.load(std::memory_order_relaxed);
+    const uint64_t traced_rays = progress.traced_rays.load(std::memory_order_relaxed);
+    const int direction_count = progress.direction_count.load(std::memory_order_relaxed);
+    const double elapsed_ms = progress.elapsed_ms.load(std::memory_order_relaxed);
+
+    const auto now = std::chrono::steady_clock::now();
+    const double animated = std::fmod(std::chrono::duration<double>(now.time_since_epoch()).count() * 0.45, 1.0);
+    float fraction = static_cast<float>(animated);
+    if (phase == lt::IrradianceVolumeBakePhase::Baking && total_samples > 0) {
+        fraction = std::clamp(static_cast<float>(completed_samples) / static_cast<float>(total_samples), 0.0f, 1.0f);
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos({viewport->Pos.x + viewport->Size.x - 340.0f, viewport->Pos.y + 44.0f}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({312.0f, 108.0f}, ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.11f, 0.12f, 0.94f));
+    if (ImGui::Begin("IrradianceVolumeBakeOverlay", nullptr, flags)) {
+        ImGui::TextUnformatted(title);
+        ImGui::ProgressBar(fraction, {-1.0f, 8.0f}, "");
+        ImGui::TextDisabled(
+            "Samples %llu / %llu  dirs %d",
+            static_cast<unsigned long long>(completed_samples),
+            static_cast<unsigned long long>(total_samples),
+            direction_count);
+        if (total_rays > 0) {
+            ImGui::TextDisabled(
+                "Rays %llu / %llu",
+                static_cast<unsigned long long>(traced_rays),
+                static_cast<unsigned long long>(total_rays));
+        } else if (elapsed_ms > 0.0) {
+            ImGui::TextDisabled("%.1f ms", elapsed_ms);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
 void draw_log_panel() {
     if (!g_editor.show_log_panel) {
         return;
@@ -2610,7 +3098,9 @@ void draw_ui() {
         draw_viewport();
         draw_status_bar();
         draw_loading_overlay();
+        draw_irradiance_volume_bake_overlay();
         draw_log_panel();
+        launch_render_task();
         return;
     }
     ImGui::SetNextWindowPos({layout_pos.x, layout_pos.y + top}, ImGuiCond_Always);
@@ -2628,13 +3118,16 @@ void draw_ui() {
     draw_layout_splitters(layout_pos, layout_size, top, content_height, viewport_width, outliner_height);
     draw_status_bar();
     draw_loading_overlay();
+    draw_irradiance_volume_bake_overlay();
     draw_log_panel();
+    launch_render_task();
 }
 
 void handle_global_shortcuts() {
     ImGuiIO& io = ImGui::GetIO();
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) PostQuitMessage(0);
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene();
+    if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene_as_dialog();
+    else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R)) reset_accumulation();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) duplicate_selected();
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) delete_selected();

@@ -4,11 +4,22 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <unordered_map>
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4244 4267 4996)
+#endif
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -994,6 +1005,54 @@ bool load_texture_memory(const std::string& name, const unsigned char* data, siz
         LT_LOG_WARN("Failed to load embedded texture '{}': {}", name, error);
     }
     return ok;
+}
+
+bool write_texture_png(const Texture& texture, const std::string& path, std::string& error) {
+    if (texture.width <= 0 || texture.height <= 0 || texture.pixels.empty()) {
+        error = "Texture has no pixels to write: " + path;
+        return false;
+    }
+    const bool has_alpha = texture.alpha.size() == texture.pixels.size() &&
+        std::any_of(texture.alpha.begin(), texture.alpha.end(), [](float value) {
+            return value < 0.999f;
+        });
+    const int channels = has_alpha ? 4 : 3;
+    std::vector<unsigned char> bytes(static_cast<size_t>(texture.width) * static_cast<size_t>(texture.height) * static_cast<size_t>(channels));
+    const auto to_byte = [](float value) {
+        return static_cast<unsigned char>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+    };
+    for (size_t i = 0; i < texture.pixels.size(); ++i) {
+        const size_t base = i * static_cast<size_t>(channels);
+        bytes[base + 0u] = to_byte(texture.pixels[i].x);
+        bytes[base + 1u] = to_byte(texture.pixels[i].y);
+        bytes[base + 2u] = to_byte(texture.pixels[i].z);
+        if (has_alpha) {
+            bytes[base + 3u] = to_byte(texture.alpha[i]);
+        }
+    }
+    if (stbi_write_png(path.c_str(), texture.width, texture.height, channels, bytes.data(), texture.width * channels) == 0) {
+        error = "Could not write PNG texture: " + path;
+        return false;
+    }
+    return true;
+}
+
+bool write_texture_hdr(const Texture& texture, const std::string& path, std::string& error) {
+    if (texture.width <= 0 || texture.height <= 0 || texture.pixels.empty()) {
+        error = "Texture has no pixels to write: " + path;
+        return false;
+    }
+    std::vector<float> pixels(static_cast<size_t>(texture.width) * static_cast<size_t>(texture.height) * 3u);
+    for (size_t i = 0; i < texture.pixels.size(); ++i) {
+        pixels[i * 3u + 0u] = texture.pixels[i].x;
+        pixels[i * 3u + 1u] = texture.pixels[i].y;
+        pixels[i * 3u + 2u] = texture.pixels[i].z;
+    }
+    if (stbi_write_hdr(path.c_str(), texture.width, texture.height, 3, pixels.data()) == 0) {
+        error = "Could not write HDR texture: " + path;
+        return false;
+    }
+    return true;
 }
 
 } // namespace lt

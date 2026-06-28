@@ -19,6 +19,8 @@ struct Texture {
     std::string path;
     int width = 0;
     int height = 0;
+    std::vector<unsigned char> encoded_bytes;
+    std::string encoded_extension;
     std::vector<Vec3> pixels;
     std::vector<float> alpha;
     std::vector<int> mip_widths;
@@ -37,5 +39,7 @@ bool load_hdr_texture(const std::string& name, const std::string& path, Texture&
 bool load_exr_texture(const std::string& name, const std::string& path, Texture& texture, std::string& error);
 bool load_texture_file(const std::string& name, const std::string& path, Texture& texture, std::string& error);
 bool load_texture_memory(const std::string& name, const unsigned char* data, size_t size, Texture& texture, std::string& error);
+bool write_texture_png(const Texture& texture, const std::string& path, std::string& error);
+bool write_texture_hdr(const Texture& texture, const std::string& path, std::string& error);
 
 } // namespace lt
