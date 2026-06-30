@@ -6,7 +6,7 @@
 
 | 功能类型 | 数据模型 | CPU | CUDA | I/O/导入 | CLI | 编辑器 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 新材质字段 | `material.h` | `material.cpp`/shading | types + pack + shading | `.lt`/glTF/PBRT | 可选 | Material tab |
+| 新材质字段 | `material.h` | `material.cpp`/shading | types + pack + shading | `.lt`/glTF/PBRT/FBX | 可选 | Material tab |
 | 新 BRDF | `BrdfModel` + class | evaluate/pdf/sample | 三个设备函数 | parse/save/import | 可选 | BRDF Combo |
 | 新 NPR | `NprStyle` + settings | `shading.inl` | 当前可不支持 | npr parse/save | style options | NPR controls |
 | 新几何 | `scene.h` | build + intersect | pack + intersect | scene/importer | 可选 | selection/UI |
@@ -15,6 +15,8 @@
 | 新文件格式 | Scene API | 无 | 无 | loader + dispatch | 无 | Open filter |
 | 新输出格式 | 可选 image API | 无 | 无 | writer | main | 可选 |
 | 新日志/诊断点 | `lt/log.h` | 边界事件 | host fallback | loader warning/error | log options | Log 面板 |
+| 辐照度体积参数 | `RenderSettings` + `SceneRenderSettings` | bake + lookup | types + upload + lookup | `.ivol` 缓存文件 | ivol options | IV panel + bake |
+| 纹理角色/色彩空间 | `texture.h` | 无 | 无 | loader 标记 | 无 | 纹理列表显示 |
 
 ## 新增一种 BRDF
 
@@ -106,7 +108,7 @@ GPU：
 
 ## 新增灯光类型
 
-当前直接光只采样三角灯。新增点光/方向光时建议显式建立统一 Light 数据，而不是继续伪装成 Mesh。
+当前直接光采样三角灯和方向光。新增点光/spot 时建议显式建立统一 Light 数据，而不是继续伪装成 Mesh。
 
 需要设计：
 
@@ -115,9 +117,38 @@ GPU：
 - 灯选择 PMF。
 - BSDF 路径命中灯时的 MIS 处理。
 - CPU/GPU 一致布局。
-- `.lt`、glTF/PBRT 和编辑器表示。
+- `.lt`、glTF/PBRT/FBX 和编辑器表示。
 
 若先做最小实现，可像 PBRT importer 一样把点光转为小型发光球 Mesh，但它不是数学意义上的 delta point light，会受半径和三角化影响。
+
+方向光是现有 delta 方向光实现的参考：`DirectionalLight` 存储在 `Scene` 向量中，CPU 和 CUDA 的 `estimate_direct_lighting()` 独立遍历并累加无障碍贡献，打包为 `GpuDirectionalLight`。
+
+## 新增 FBX 导入功能
+
+给 FBX loader 增加新材质通道或几何特性：
+
+- [ ] 在 `src/fbx_loader.cpp` 中增加 ufbx 材质通道读取（如 pbr.clearcoat）。
+- [ ] 若增加纹理通道，使用 `set_material_input()` 并指定正确的 `MaterialInputChannel`、`TextureRole` 和 `TextureColorSpace`。
+- [ ] 同时支持 FBX PBR 扩展和传统 FBX 材质回退。
+- [ ] 若需要新命名约定纹理，更新 `load_convention_texture()` 的 suffix 逻辑。
+- [ ] 添加 `.pyscene` 侧车解析支持（若新参数需要调整）。
+- [ ] 测试嵌入纹理和外部纹理路径。
+- [ ] 验证 BC5/ATI2 DDS 法线的跳过逻辑仍正确。
+
+## 新增辐照度体积功能
+
+修改辐照度体积烘焙或查找：
+
+- [ ] `src/cpu/irradiance_volume.inl`：八叉树构建和查找逻辑。
+- [ ] `src/cpu/irradiance_volume_bake.inl`：烘焙线程和积分。
+- [ ] `src/gpu/types.cuh`：`GpuIrradianceVolume` 相关类型。
+- [ ] `src/gpu/cuda_path_tracer.cu`：buffer 上传/释放和 device 指针。
+- [ ] `src/gpu/shading.cuh`：设备端查找。
+- [ ] `include/lt/renderer.h`：`RenderSettings` 和 `RenderDirty` 字段。
+- [ ] `include/lt/scene.h`：`SceneRenderSettings` 和 per-object 排除字段。
+- [ ] CLI：`src/cli/render_options.cpp` 的 `--ivol-*` 参数。
+- [ ] 编辑器：`draw_irradiance_volume_panel()`、`start_irradiance_volume_bake()`。
+- [ ] `.ivol` 缓存格式版本控制和向前兼容。
 
 ## 修改光源采样策略
 
@@ -226,11 +257,14 @@ GPU：
 ## 提交前的功能完整性检查
 
 - [ ] 默认值不会改变旧场景结果。
-- [ ] Scene copy 不丢字段。
+- [ ] Scene copy 不丢字段（含 `directional_lights` 和 `render_settings`）。
 - [ ] `.lt` 读写对称，或明确标注不支持保存。
 - [ ] CPU 有实现。
 - [ ] CUDA 有实现或可靠 fallback。
+- [ ] 新导入格式（FBX/PyScene）正确处理坐标系和单位。
+- [ ] 新材质（StandardSurface）的 MaterialInput 纹理在 `Scene::textures` 中已注册。
 - [ ] CLI 和编辑器都能触达功能。
 - [ ] dirty 正确，修改后不会混入旧累积帧。
 - [ ] 小场景、空场景、无灯场景能运行。
+- [ ] 辐照度体积烘焙在有/无缓存、手动/自动边界情况下都能完成。
 - [ ] 文档和示例同步。

@@ -23,7 +23,7 @@
 
 ```mermaid
 flowchart LR
-    Input[".lt / glTF / PBRT / 程序构造"] --> Scene["Scene：可编辑数据"]
+    Input[".lt / glTF / PBRT / FBX / PyScene / 程序构造"] --> Scene["Scene：可编辑数据"]
     Scene --> Build["build_render_scene()"]
     Build --> RenderScene["RenderScene：三角形、球、BVH、灯列表"]
     Scene --> CPU["CpuPathTracer"]
@@ -35,6 +35,9 @@ flowchart LR
     GPU --> FB
     FB --> CLI["PPM 输出"]
     FB --> Editor["D3D11 预览纹理"]
+    Scene --> IV["IrradianceVolume\n(bake & lookup)"]
+    IV --> CPU
+    IV --> GPU
 ```
 
 项目刻意分成两类场景数据：
@@ -51,17 +54,18 @@ flowchart LR
 公开 API：
 
 - `math.h`：向量、射线、随机数、颜色编码。
-- `texture.h`：纹理数据、采样和文件加载。
-- `material.h`：材质基类、BRDF 派生类、NPR 配置。
-- `scene.h`：可编辑场景、渲染场景、加载保存和基础几何生成。
-- `renderer.h`：渲染设置、帧缓冲和渲染器接口。
+- `texture.h`：纹理数据、采样、文件加载和导出（PNG/HDR）。
+- `material.h`：材质基类、BRDF 派生类（含 StandardSurface）、NPR 配置、材质输入通道。
+- `scene.h`：可编辑场景、渲染场景、方向光、加载保存和基础几何生成。
+- `renderer.h`：渲染设置、帧缓冲、辐照度体积烘焙（IrradianceVolumeBakePhase/Progress）和渲染器接口。
 - `log.h`：同步日志配置、日志宏和编辑器/测试可订阅的 observer API。
+- `materialx_adapter.h`：MaterialX/OpenImageIO/OpenColorIO 依赖状态查询。
 
 ### `src/scene`
 
 - `scene_geometry.cpp`：基础几何生成、默认场景和材质查找。
 - `render_scene.cpp`：把 `Scene` 展开为世界空间图元并构建 BVH。
-- `scene_io.cpp`：统一加载入口、原生 `.lt` 读取和保存。
+- `scene_io.cpp`：统一加载入口、原生 `.lt` 读取和保存、格式分派（包括 `.fbx` 和 `.pyscene`）。
 - `scene_internal.h`：只供场景实现使用的辅助函数。
 
 ### `src/cpu`
@@ -71,8 +75,10 @@ flowchart LR
 - `types.inl`：CPU 命中信息 `Hit`。
 - `camera.inl`：主相机射线。
 - `intersection.inl`：球、三角形、AABB、BVH/TLAS 求交。
-- `shading.inl`：环境、直接光、MIS、BRDF 路径和 NPR。
+- `shading.inl`：环境、直接光（三角灯和方向光）、MIS、BRDF 路径、NPR 和辐照度体积查找。
 - `renderer.inl`：多线程逐行渲染、累积和 RGBA 输出。
+- `irradiance_volume.inl`：辐照度体积八叉树构建与查找逻辑。
+- `irradiance_volume_bake.inl`：辐照度体积烘焙线程，向各探针方向追踪间接光。
 
 这些 `.inl` 不是公共头文件；它们是 CPU 后端的内部实现拆分。
 
@@ -91,7 +97,9 @@ flowchart LR
 ### 导入、CLI 和编辑器
 
 - `src/gltf_loader.cpp`：静态 glTF 2.0 导入。
-- `src/pbrt/pbrt_loader.cpp`：PBRT 文本、PLY 和部分材质/灯光导入。
+- `src/fbx_loader.cpp`：通过 ufbx 库导入 FBX 和 `.pyscene` 侧车文件。
+- `src/pbrt/pbrt_loader.cpp`：PBRT 文本、PLY 和部分材质/灯光导入（含方向光）。
+- `src/materialx_adapter.cpp`：MaterialX/OpenImageIO/OpenColorIO 依赖检测。
 - `src/cli/render_options.*`：命令行解析和材质风格覆盖。
 - `src/main.cpp`：离线渲染入口。
 - `src/editor/editor_state.*`：编辑器全局状态和异步任务数据。
@@ -105,7 +113,7 @@ flowchart LR
 - `materials`：`std::vector<std::shared_ptr<Material>>`
 - `textures`：`std::vector<std::shared_ptr<Texture>>`
 - 材质中的纹理字段也持有 `shared_ptr<Texture>`
-- `meshes` 和 `spheres` 按值存储
+- `meshes`、`spheres` 和 `directional_lights` 按值存储
 
 复制 `Scene` 时：
 
@@ -149,5 +157,16 @@ CPU 使用多态 `Material` API；CUDA 使用 `GpuMaterial` 中的整数模型 I
 | CPU 和 CUDA | 公共数据 + CPU + GPU 类型 + 打包 + CUDA 实现 |
 | 可保存和可编辑 | 再加 `.lt` I/O、CLI/编辑器 UI |
 | 可从 glTF/PBRT 导入 | 再改相应导入器 |
+| 可从 FBX 导入 | 使用 ufbx 导入 `load_fbx_scene()`，材质优先 StandardSurface |
 
-NPR 是当前“仅 CPU 实验”的例子：`stylized_rendering_enabled()` 为真时，CLI 和编辑器会主动选择 CPU。
+NPR 和辐照度体积烘焙是当前”仅 CPU”的例子：`stylized_rendering_enabled()` 和 `irradiance_volume_bake` 为真时，CLI 和编辑器会主动选择 CPU。方向光是 CPU/CUDA 双端均支持的功能。
+
+## 辐照度体积（Irradiance Volume）
+
+场景可以附带一个辐照度体积，用于加速间接漫反射光照。它由以下组件组成：
+
+- **烘焙**（`src/cpu/irradiance_volume_bake.inl`）：从场景边界构建稀疏八叉树，向每个激活探针的半球方向发射光线，预计算间接 irradiance。烘焙是 CPU-only 的渐进过程。
+- **运行时查找**（`src/cpu/irradiance_volume.inl` 和 `src/gpu/shading.cuh`）：路径追踪中遇到漫反射表面时，查询辐照度体积替代或补充间接光。CPU 和 CUDA 均支持运行时查找。
+- **缓存**：支持将烘焙结果保存为 `.ivol` 文件并在后续加载，可跨会话复用。
+
+相关数据结构包括 `SceneRenderSettings` 中的辐照度体积参数、`RenderSettings` 中的运行时开关，以及 `RenderDirty::IrradianceVolume` 和控制变换更新的 `RenderDirty::Transform`。

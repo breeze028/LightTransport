@@ -80,9 +80,12 @@ struct Ray {
 
 - `name`：场景内名称。
 - `path`：资源路径；保存 `.lt` 时原样输出。
+- `role`：纹理用途（`Unknown`、`Color`、`Data`、`Normal`、`Emission`、`Environment`），导入时由 `apply_texture_role()` 设置。
+- `color_space`：导入色彩空间指定（`Auto`、`SceneLinear`、`SRGB`、`Raw`）。
 - `width`、`height`
 - `pixels`：线性 RGB，大小应为 `width * height`。
 - `alpha`：可选 alpha，缺失时采样返回 1。
+- `encoded_bytes`、`encoded_extension`：原始编码数据，用于后续重新编码（如 PNG/HDR 导出）。
 - `mip_widths`、`mip_heights`、`mip_pixels`：CPU mip 链。
 
 主要方法：
@@ -107,16 +110,40 @@ struct Ray {
 - `load_texture_file()`：按扩展名分派。
 - `load_texture_memory()`：嵌入图像，当前依赖 Windows WIC。
 
+角色管理：
+
+- `apply_texture_role(texture, role, color_space)`：根据导入上下文设置纹理的色彩空间和角色标记。例如基础色纹理标记 `Color` + `SRGB`，法线纹理标记 `Normal` + `Raw`。
+
+导出函数：
+
+- `write_texture_png(texture, path, error)`：将纹理编码为 8-bit PNG。
+- `write_texture_hdr(texture, path, error)`：将纹理编码为 Radiance HDR RGBE。
+
 直接程序构造 Texture 时，填完像素后应调用 `build_mips()`，否则环境 LOD 只能使用基础层。
+
+### MaterialX 适配器 API：`lt/materialx_adapter.h`
+
+`material_system_status()` 返回 `MaterialSystemStatus` 结构体，指示编译时可用的外部库：
+
+- `materialx_available`：是否链接了 MaterialX。
+- `openimageio_available`：是否链接了 OpenImageIO（提供更广泛的纹理格式解码）。
+- `opencolorio_available`：是否链接了 OpenColorIO（提供基于角色的色彩空间转换）。
+- `surface_model`：当前使用的表面模型标识（`"OpenPBR-compatible standard_surface"`）。
+- `texture_pipeline`：当前纹理管线能力描述。
+
+这些标志由 CMake 编译定义控制：`LT_HAS_MATERIALX`、`LT_HAS_OPENIMAGEIO`、`LT_HAS_OPENCOLORIO`。
 
 ## 材质 API：`lt/material.h`
 
 ### 枚举
 
-- `BrdfModel`：`Lambertian`、`Principled`、`Mirror`、`Dielectric`、`Conductor`
+- `BrdfModel`：`Lambertian`、`Principled`、`Mirror`、`Dielectric`、`Conductor`、`StandardSurface`
 - `AlphaMode`：`Opaque`、`Mask`、`Blend`
 - `NprStyle`：`None`、`ColorMap`、`XToon`、`CrossHatching`
 - `XToonDetailMode`：常量、深度、轮廓、高光属性
+- `MaterialInputChannel`：`RGB`、`R`、`G`、`B`、`A`——从纹理采样指定通道
+- `TextureRole`：`Unknown`、`Color`、`Data`、`Normal`、`Emission`、`Environment`
+- `TextureColorSpace`：`Auto`、`SceneLinear`、`SRGB`、`Raw`
 
 枚举值会直接转换为 GPU 整数。插入或重排枚举时必须同步 CUDA 代码，并注意旧场景/缓存兼容性。
 
@@ -129,6 +156,7 @@ struct Ray {
 - `base_color(uv)`：`albedo * albedo_texture`。
 - `opacity(uv)`：`alpha * texture alpha`，夹紧到 `[0,1]`。
 - `emitted(uv)`：`emission * emission_texture`。
+- `transmission(uv)`：返回传输系数（默认 0），供 Dielectric/StandardSurface 复写。
 
 派生类必须实现：
 
@@ -153,6 +181,30 @@ virtual std::shared_ptr<Material> clone() const = 0;
 
 `front_face` 目前主要供 Dielectric 判断折射率方向。
 
+### `StandardSurfaceMaterial`
+
+`BrdfModel::StandardSurface` 是 OpenPBR 兼容的材质模型，比 Principled 提供更多参数和基于 MaterialInput 的纹理管线：
+
+主要参数：`roughness`、`metalness`、`specular_weight`、`specular_ior`、`transmission_weight`、`transmission_color`、`coat_weight`、`coat_roughness`、`sheen_color`/`sheen_weight`/`sheen_roughness`、`subsurface_weight`/`subsurface_color`、`volume_density`/`volume_color`、`thin_walled`。
+
+每个纹理通道（base_color、roughness、metalness、specular_weight、transmission、opacity、emission、coat、coat_roughness、sheen_color、sheen_roughness）使用 `MaterialInput` 而非裸 Texture shared_ptr。
+
+### `MaterialInput` 与 `TextureTransform`
+
+```cpp
+struct MaterialInput {
+    std::shared_ptr<Texture> texture;
+    Vec3 color_factor = {1.0f, 1.0f, 1.0f};
+    float scalar_factor = 1.0f;
+    MaterialInputChannel channel = MaterialInputChannel::RGB;
+    TextureColorSpace color_space = TextureColorSpace::Auto;
+    TextureRole role = TextureRole::Unknown;
+    TextureTransform transform;
+};
+```
+
+`MaterialInput` 封装纹理、颜色/标量因子、采样通道、色彩空间和 UV 变换，由基于角色的纹理管线使用。导入时（如 FBX）通过 `set_material_input()` 填充。`TextureTransform` 包含 `offset`、`scale`、`rotation`（弧度）和 `uv_set` 索引。
+
 工厂和字符串转换：
 
 - `make_material()`：根据 `BrdfModel` 构造内置材质。
@@ -173,18 +225,26 @@ virtual std::shared_ptr<Material> clone() const = 0;
 
 实际面光源辐射为 `color * intensity`。
 
+`DirectionalLight`：
+
+- `direction`：世界空间光源方向。
+- `color` 和 `intensity`：颜色和强度倍率。
+
+方向光在 CPU shader 和 CUDA 渲染中作为额外的直接光源，参与 `estimate_direct_lighting()`。它们不附着在 Mesh 上，而是存储在 `Scene::directional_lights` 向量中。
+
 `Mesh`：
 
 - 顶点、法线、UV 和三角形索引
 - `material` 是 `Scene::materials` 下标
 - `translation`、`rotation`、`scale`
 - 可选 `LightComponent`
+- `exclude_from_irradiance_volume_bake`：烘焙时跳过该 Mesh
 
 `rotation` 使用弧度，按 X、Y、Z 顺序应用。索引必须每三个组成一个三角形。
 
-`Sphere` 是解析球，包含名称、材质下标、中心和半径。它走独立球求交路径，不会在 `build_render_scene()` 中三角化。
+`Sphere` 是解析球，包含名称、材质下标、中心和半径。它走独立球求交路径，不会在 `build_render_scene()` 中三角化。同样支持 `exclude_from_irradiance_volume_bake`。
 
-`Camera` 使用 position/target/up/FOV。`right_sign` 用于处理 PBRT 相机手性，普通调用保持默认 1。
+`Camera` 使用 position/target/up/FOV。`right_sign` 用于处理 PBRT 相机手性，普通调用保持默认 1。`up` 向量在非默认相机朝向时需要正确设置。
 
 `Environment` 支持：
 
@@ -193,7 +253,9 @@ virtual std::shared_ptr<Material> clone() const = 0;
 - `Equirectangular` 与 `EqualArea` 映射。
 - 三个 `light_from_world_*` 基向量，用于旋转环境贴图。
 
-`Scene` 保存所有上述对象。复制 Scene 会克隆材质，但共享纹理，详见[架构文档](01-architecture.md#核心对象的所有权)。
+`SceneRenderSettings`：可嵌入 Scene 的渲染设置，包含 NPR 参数和辐照度体积参数。当 Scene 通过编辑器或导入器携带这些设置时，`Scene::has_render_settings` 为 true。它独立于每次渲染的 `RenderSettings`，是场景数据的一部分。
+
+`Scene` 保存所有上述对象。复制 Scene 会克隆材质，但共享纹理，详见[架构文档](01-architecture.md#核心对象的所有权)。Scene 中新增的 `directional_lights` 向量按值存储，在 `save_scene()` 和 `load_scene()` 中读写。
 
 ### 渲染场景类型
 
@@ -210,13 +272,15 @@ virtual std::shared_ptr<Material> clone() const = 0;
 ### 场景函数
 
 - `make_default_scene()`：程序生成 Cornell 风格测试场景。
-- `load_scene(path)`：按 URL/扩展名分派，其他扩展名按 `.lt` 解析。
+- `load_scene(path)`：按 URL/扩展名分派，支持 `.lt`、`.gltf`/`.glb`、`.pbrt`、`.fbx`、`.pyscene`；其他扩展名按 `.lt` 解析。
 - `load_gltf_scene(path)`
 - `load_pbrt_scene(path)`
+- `load_fbx_scene(path)`：通过 ufbx 导入 FBX（含嵌入纹理、相机、灯光）；同时查找 `.pyscene` 侧车文件应用材质和环境微调。
+- `load_pyscene_scene(path)`：读取 `.pyscene` 文本文件，解析 `importScene()` 指向的 FBX，并应用环境图、emissive 倍率和材质调整。
 - `save_scene(scene, path, error)`：写原生 `.lt`。
 - `find_material(scene, name)`：精确名称查找，失败返回 -1。
 - `build_render_scene(scene)`：世界空间展开并构建加速结构。
-- `make_cube_mesh()`、`make_uv_sphere_mesh()`、`make_quad_mesh()`：基础 mesh 生成。
+- `make_cube_mesh()`、`make_uv_sphere_mesh()`、`make_quad_mesh()`：基础 mesh 生成。`make_quad_mesh` 接受 4 个 Vec3 角点位置。
 
 `SceneLoadResult::error` 非空并不意味着 `scene` 为空。当前许多失败路径会返回默认场景，调用方必须根据产品需求决定是回退还是中止。
 
@@ -233,10 +297,28 @@ virtual std::shared_ptr<Material> clone() const = 0;
 | `acceleration_structure` | Auto、Flat 或 TwoLevel |
 | `stylized_samples` | 每个 NPR 顶点的内部估计样本数 |
 | `stylized_max_depth` | 一条路径最多风格化多少个表面 |
+| `use_irradiance_volume` | 是否在路径追踪中查询辐照度体积间接光 |
+| `irradiance_volume_grid_resolution` | 顶层八叉树分辨率 |
+| `irradiance_volume_subgrid_resolution` | 子网格分辨率 |
+| `irradiance_volume_direction_resolution` | 每探针半球采样方向数 |
+| `irradiance_volume_bake_samples` | 烘焙时每方向样本数 |
+| `irradiance_volume_bake_bounces` | 烘焙间接光最大弹射次数 |
+| `irradiance_volume_bounds_inset` | 自动边界收缩量 |
+| `irradiance_volume_principled_gi` | 烘焙时用 Principled 而非 Lambert 求值间接光 |
+| `irradiance_volume_debug_probes` | 在渲染中可视化探针球 |
+| `irradiance_volume_debug_probe_radius_scale` | 调试探针球半径缩放 |
+| `irradiance_volume_cache_enabled` | 启用缓存读写 |
+| `irradiance_volume_auto_update` | 编辑器自动重新烘焙 |
+| `irradiance_volume_force_rebake` | 强制跳过缓存重新烘焙 |
+| `irradiance_volume_cache_path` | 缓存文件路径（默认 `<scene>.ivol`） |
+| `irradiance_volume_cache_key` | 缓存 key（默认 scene path） |
+| `irradiance_volume_bake_progress` | 指向烘焙进度的原子指针 |
+| `irradiance_volume_manual_bounds` | 使用手动烘焙边界 |
+| `irradiance_volume_bounds_min` / `_max` | 手动烘焙边界 |
 | `frame_index` | 当前累积帧，从 0 开始 |
 | `dirty` | 数据和累积失效标记 |
 
-`scene_has_npr_styles()` 与 `stylized_rendering_enabled()` 是后端选择可直接复用的辅助函数。
+`scene_has_npr_styles()`、`stylized_rendering_enabled()` 和 `irradiance_volume_rendering_enabled()` 是后端选择可直接复用的辅助函数。
 
 ### `RenderDirty`
 
@@ -246,6 +328,7 @@ virtual std::shared_ptr<Material> clone() const = 0;
 
 - `resize(w,h)`：尺寸变化时重新分配并清空；相同尺寸不清空。
 - `clear()`：清空 HDR 累积和 RGBA。
+- `clear_accumulation()`：仅清空 HDR 累积，保留 RGBA（用于需要清累积但不丢显示结果的场景）。
 - `accumulation`：线性 HDR 累积和，不是平均值。
 - `rgba`：显示用 gamma 编码 `0xAARRGGBB`。
 

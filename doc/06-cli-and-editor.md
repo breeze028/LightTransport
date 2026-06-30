@@ -35,6 +35,21 @@ lt_render [scene_path] [output_path] [options...]
 | `--hatch-paper R G B` | 纸色 |
 | `--hatch-passthrough` | 非线条区域保留原 radiance |
 | `--hatch-shadow-only` | 仅阴影区域画线 |
+| `--irradiance-volume` / `--no-irradiance-volume` | 启用/禁用辐照度体积间接光 |
+| `--ivol-grid N` | 顶层八叉树分辨率（默认 7） |
+| `--ivol-subgrid N` | 子网格分辨率（默认 3） |
+| `--ivol-dir N` | 每探针方向数（默认 9） |
+| `--ivol-bake-samples N` | 烘焙每方向样本数（默认 1） |
+| `--ivol-bake-bounces N` | 烘焙间接光弹射次数（默认 4） |
+| `--ivol-bounds-inset F` | 自动边界收缩量（默认 0.01） |
+| `--ivol-principled-gi` / `--no-ivol-principled-gi` | 烘焙时使用 Principled 还是 Lambert GI |
+| `--ivol-debug-probes` / `--no-ivol-debug-probes` | 可视化探针球 |
+| `--ivol-probe-radius-scale F` | 调试探针半径缩放（默认 0.10） |
+| `--ivol-cache PATH` | 设置缓存文件路径并启用缓存 |
+| `--no-ivol-cache` | 禁用缓存读写 |
+| `--ivol-auto-update` / `--no-ivol-auto-update` | 自动重新烘焙（编辑器用） |
+| `--ivol-force-bake` | 忽略已有缓存，强制重新烘焙 |
+| `--ivol-bounds min_x min_y min_z max_x max_y max_z` | 手动设置烘焙边界 |
 | `--log-level trace|debug|info|warn|error|critical|off` | 同时设置控制台和文件日志等级 |
 | `--log-file PATH` | 指定并启用日志文件 |
 | `--no-log-file` | 关闭文件日志 |
@@ -54,11 +69,13 @@ lt_render [scene_path] [output_path] [options...]
 `src/main.cpp`：
 
 1. `parse_render_options()`。
-2. `load_scene()`。
-3. `apply_material_styles()`。
-4. 选择 CPU/CUDA；NPR 强制 CPU。
-5. 从 frame 0 渲染到 `--frames - 1`。
-6. `write_ppm()` 写 ASCII P3。
+2. 初始化日志。
+3. `load_scene()`。
+4. `apply_material_styles()`。
+5. 设置辐照度体积缓存默认值（cache key 为场景路径，cache path 为 `<scene>.ivol`）。
+6. 选择 CPU/CUDA；NPR 和辐照度体积烘焙强制 CPU。
+7. 从 frame 0 渲染到 `--frames - 1`。
+8. `write_ppm()` 写 ASCII P3。
 
 场景加载错误当前只打印警告并继续使用返回的 fallback Scene。
 
@@ -139,6 +156,7 @@ lt_render [scene_path] [output_path] [options...]
 | 拾取 | `pick_object()` |
 | gizmo | `handle_gizmo_drag()`、`draw_gizmo_overlay()` |
 | NPR UI | `draw_npr_controls()` |
+| 辐照度体积面板 | `draw_irradiance_volume_panel()`、`start_irradiance_volume_bake()` |
 | 顶部菜单 | `draw_top_bar()` |
 | 日志面板 | `draw_log_panel()`、`drain_editor_logs()`、`EditorState::logs` |
 | Outliner | `draw_outliner()` |
@@ -167,7 +185,9 @@ if (ImGui::DragFloat("Aperture", &g_editor.scene.camera.aperture,
 - 改材质参数用 `Material`。
 - 改纹理像素/资源用 `Texture`，通常也带 `Material` 或 `Environment`。
 - 改顶点、索引、transform、sphere、mesh light 或影响灯列表的数据用 `Geometry`。
+- 仅改 transform（位置、旋转、缩放）但不影响 BVH 结构时可用 `Transform`；否则用 `Geometry`。
 - 改环境颜色/强度/方向用 `Environment`。
+- 改辐照度体积参数或触发烘焙用 `IrradianceVolume`。
 - 新增/删除 Mesh 后调用 `invalidate_mesh_bounds_cache()`，因为拾取与轮廓缓存依赖 Scene。
 - 对 `.lt` 可保存对象修改时，将 `uses_builtin_default_meshes` 置 false，避免保存器省略内置 Mesh。
 - 后台线程需要记录诊断信息时，只调用 `LT_LOG_*`；不要直接操作 ImGui。日志 observer 会先进入 pending queue，再由主线程绘制 Log 面板。
@@ -195,5 +215,19 @@ if (ImGui::DragFloat("Aperture", &g_editor.scene.camera.aperture,
 
 - `cuda.available()`。
 - 当前 Scene 未启用 NPR。
+- 辐照度体积烘焙未在进行中（运行时查找 CUDA 支持）。
 
 状态栏显示的是实际有效后端。新增 CPU-only 功能时应建立统一能力检查，而不是只在一个 UI 控件里禁用 CUDA，否则 CLI 和编辑器可能行为不一致。
+
+### 编辑器辐照度体积面板
+
+编辑器在 Render 面板中提供辐照度体积控件的完整集合，包括：
+
+- 启用/禁用开关。
+- 八叉树、方向和烘焙参数。
+- 手动边界控件（`use_manual_bounds`）。
+- 缓存路径和 key 输入框。
+- 自动更新、强制烘焙和调试探针选项。
+- "Bake Now" 按钮触发后台烘焙任务，进度显示在状态栏。
+
+烘焙在 `EditorState` 管理的后台线程中运行。主循环通过 `poll_irradiance_volume_bake()` 检查进度并更新 UI。完成后自动触发累积重置和渲染刷新。

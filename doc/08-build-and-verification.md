@@ -25,6 +25,14 @@ cmake --build build-cpu
 
 不要在同一 build 目录混用 Visual Studio 和 Ninja generator。
 
+FBX 导入需要 ufbx 库（通过 FetchContent 自动获取）。MaterialX、OpenImageIO 和 OpenColorIO 是可选的集成，通过以下 CMake 选项控制：
+
+- `LT_HAS_MATERIALX`
+- `LT_HAS_OPENIMAGEIO`
+- `LT_HAS_OPENCOLORIO`
+
+这些编译定义在 `materialx_adapter.cpp` 中由 CMake 设置，可通过 `material_system_status()` 查询。
+
 ## 基础冒烟测试
 
 以下命令以 Visual Studio Release 目录为例。
@@ -69,21 +77,44 @@ Get-Content build\missing.log -Tail 20
 
 解析球与 Mesh 混合由 `cornell.lt` 和 `toon_material_test.lt` 覆盖。
 
+FBX 基础：
+
+```powershell
+.\build\Release\lt_render.exe scenes\test.fbx build\smoke_fbx.ppm --cpu --size 64 64 --spp 1 --frames 1
+```
+
+辐照度体积：
+
+```powershell
+.\build\Release\lt_render.exe scenes\cornell.lt build\smoke_ivol.ppm --cpu --size 64 64 --spp 1 --frames 1 --irradiance-volume --ivol-bake-samples 1 --ivol-bake-bounces 2 --no-ivol-cache
+```
+
+方向光：
+
+```powershell
+.\build\Release\lt_render.exe scenes\pbrt\directional_test.pbrt build\smoke_dir.ppm --cpu --size 64 64 --spp 1 --frames 1
+```
+
 ## 功能对应测试矩阵
 
 | 改动 | 最少测试 |
 | --- | --- |
 | BRDF | CPU/CUDA、MIS 开关、不同 bounce、极端参数 |
-| 纹理 | CPU/CUDA、无 mip/有 mip、alpha、环境 |
+| StandardSurface | CPU/CUDA、各 lobe 独立和组合、transmission 路径 |
+| 纹理 | CPU/CUDA、无 mip/有 mip、alpha、环境、角色/色彩空间标记 |
 | 法线贴图 | 有效 UV 和退化 UV |
 | 几何/求交 | Flat/TwoLevel/Auto，单 Mesh 和多 Mesh |
-| 灯光 | 单面/双面、材质 emission、Mesh light、无灯 |
-| Scene I/O | load、save、reload、非法 token |
+| 灯光 | 单面/双面、材质 emission、Mesh light、方向光、无灯 |
+| Scene I/O | load、save、reload、非法 token、方向光读写 |
 | glTF | 外部资源、GLB 嵌入资源、多个 primitive |
-| PBRT | Include、PLY、实例、环境 |
-| CLI | 默认值、缺失参数、非法值 |
-| 编辑器 | 修改后清累积、异步结果不过期覆盖 |
+| PBRT | Include、PLY、实例、环境、方向光 |
+| FBX | 嵌入/外部纹理、BPR 材质、传统材质回退、相机导入、灯光转换 |
+| PyScene | 材质微调（roughness/metallic/ior/transmission）、环境贴图、emissive 倍率 |
+| CLI | 默认值、缺失参数、非法值、辐照度体积参数 |
+| 编辑器 | 修改后清累积、异步结果不过期覆盖、辐照度体积烘焙进度 |
 | NPR | 每种 style、style depth、CPU fallback |
+| 辐照度体积 | 烘焙完成、运行时查找、缓存读写、手动/自动边界、调试探针 |
+| MaterialInput | 各通道正确映射、UV 变换应用、色彩空间标记 |
 
 ## CPU/CUDA 对比
 
@@ -123,5 +154,7 @@ Get-Content build\missing.log -Tail 20
 - 文档中的文件路径仍存在。
 - 新枚举、字段和命令行参数已加入相应表格。
 - `.lt` 语法与 `scene_io.cpp` 的读取和保存一致。
-- CPU-only 或平台限制已写明。
+- 新导入格式（FBX/PyScene）有独立文档节。
+- CPU-only 或平台限制已写明（辐照度体积烘焙、NPR）。
 - 示例命令能在当前构建目录运行。
+- MaterialInput 管线和 StandardSurface 的使用场景已文档化。

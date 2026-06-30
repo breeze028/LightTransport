@@ -77,9 +77,11 @@ CPU 主循环在 `src/cpu/shading.inl::trace_path()`：
 3. 应用法线贴图。
 4. 命中发光三角形时，根据路径类型和 MIS 累加 emission。
 5. 从三角形灯列表均匀选一个灯，进行 next-event estimation。
-6. 从材质采样下一方向。
-7. 第 4 个 bounce 起使用 Russian roulette。
-8. 更新 throughput，继续追踪。
+6. 遍历所有方向光，对无障碍方向累加贡献。
+7. 从材质采样下一方向。
+8. 若启用辐照度体积，在间接弹射阶段查询 irradiance 替代递归追踪（否则走常规间接光）。
+9. 第 4 个 bounce 起使用 Russian roulette。
+10. 更新 throughput，继续追踪。
 
 单样本 radiance 会被夹紧：相机首段上限 64，后续上限 8。这是当前降低 firefly 的偏差策略；做无偏参考渲染时需要显式调整或移除 CPU/GPU 两端的 clamp。
 
@@ -98,6 +100,18 @@ CPU 主循环在 `src/cpu/shading.inl::trace_path()`：
 - `build_render_scene()`。
 - CPU `estimate_direct_lighting()` 与 `light_pdf_solid_angle()`。
 - GPU 打包、`GpuScene` 和对应设备函数。
+
+### 方向光
+
+`Scene::directional_lights` 存储无限远方向光源。它们不通过三角灯列表采样，而是在 `estimate_direct_lighting()` 中作为 delta 光源被独立处理：
+
+- **CPU**：`src/cpu/shading.inl` 中的 `estimate_direct_lighting()` 遍历所有方向光，对每个方向光发射一条无障碍阴影射线。方向光 PDF 为 1（delta），不参与 MIS。
+- **GPU**：`src/gpu/shading.cuh` 中对应循环遍历 `GpuScene::directional_lights`。
+- **打包**：`src/gpu/scene_upload.cuh` 将 `DirectionalLight` 转为 `GpuDirectionalLight`。
+- **I/O**：`.lt` 格式使用 `directional_light direction_x direction_y direction_z r g b intensity` 指令。PBRT 导入器从 `LightSource "distant"` 生成方向光。
+- **编辑器**：属性面板可编辑方向光参数。
+
+方向光目前只在直接光照阶段贡献，不在环境光积分中作用。
 
 ### MIS
 
@@ -137,6 +151,39 @@ Delta 材质命中灯不做常规 MIS，直接累加。
 
 该路径目前只有 CPU 实现。新增 GPU NPR 前，不应删除 CLI/编辑器的 CPU fallback。
 
+## 辐照度体积（Irradiance Volume）
+
+辐照度体积为场景中的漫反射间接光照提供加速查找。它在路径追踪的间接弹射阶段替代或补充完整的递归光线追踪。
+
+### 烘焙流程
+
+烘焙（`src/cpu/irradiance_volume_bake.inl::bake_irradiance_volume()`）是 CPU-only 的渐进过程：
+
+1. 从场景 AABB 构建稀疏八叉树（基于 `grid_resolution × subgrid_resolution`）。
+2. 对每个激活探针位置，向半球方向（由 `direction_resolution` 确定）发射 `bake_samples` 条光线。
+3. 对每条光线追踪 `bake_bounces` 次弹射累积间接 irradiance。
+4. 烘焙进度通过 `IrradianceVolumeBakeProgress` 原子字段报告（`phase`、`total_samples`、`completed_samples` 等），阶段包括 `LoadingCache`、`Baking`、`SavingCache`、`Complete` 和 `Failed`。
+5. 完成后可选保存为 `.ivol` 缓存文件，后续可通过 `LoadingCache` 阶段加载。
+
+### 运行时查找
+
+路径追踪在 `trace_path()` 的间接弹射阶段检查 `use_irradiance_volume`：
+
+- **CPU**：`src/cpu/irradiance_volume.inl::sample_irradiance_volume()` 在命中点查找包含探针，返回三线性插值的半球 irradiance。
+- **GPU**：`src/gpu/shading.cuh` 中的设备端实现同理，`GpuScene` 持有上传的八叉树和 irradiance 缓冲。
+- 查找结果替代该弹射的递归间接光估计，大幅降低噪点，但以烘焙预计算为代价。
+
+### 关键文件
+
+- `src/cpu/irradiance_volume.inl`：八叉树构建和运行时查找。
+- `src/cpu/irradiance_volume_bake.inl`：烘焙线程和积分逻辑。
+- `src/gpu/types.cuh`：`GpuIrradianceVolume` 相关类型。
+- `src/gpu/cuda_path_tracer.cu`：体积 buffer 上传和生命周期。
+
+### 编辑器集成
+
+编辑器通过属性面板控制所有辐照度体积参数，包括手动边界、缓存路径、自动更新和调试探针可视化。烘焙在后台线程运行，进度显示在状态栏。`RenderDirty::IrradianceVolume` 触发体积重建或重新上传；`RenderDirty::Transform` 处理不影响 BVH 树结构的 transform 更新。
+
 ## 脏标记与缓存
 
 | 标记 | 语义 | CPU 行为 | CUDA 行为 |
@@ -147,6 +194,8 @@ Delta 材质命中灯不做常规 MIS，直接累加。
 | `Texture` | 纹理变化 | 直接读共享纹理 | 重建 CUDA texture objects 并完整上传 |
 | `Geometry` | 几何、变换、灯列表或 BVH 变化 | 重建 `RenderScene` | 完整 pack/upload |
 | `Environment` | 环境参数变化 | 直接读取 | 局部上传环境字段 |
+| `IrradianceVolume` | 辐照度体积参数或缓存变化 | 标记烘焙/查找缓存失效 | 重新上传辐照度体积缓冲 |
+| `Transform` | Mesh/Sphere transform 变化（不影响 BVH 结构） | 需要视情况重建 RenderScene | 重新上传位置相关缓冲 |
 
 重要细节：
 
