@@ -243,11 +243,7 @@ void set_scene(lt::Scene scene, const std::string& path) {
     g_editor.scene_path = path;
     apply_scene_render_settings(g_editor.scene);
     invalidate_mesh_bounds_cache();
-    if (!g_editor.scene.meshes.empty()) {
-        select_mesh(0);
-    } else {
-        select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
-    }
+    select_mesh(-1);
     LT_LOG_INFO("Editor scene set to '{}' (meshes={}, spheres={}, materials={}, textures={})",
         g_editor.scene_path,
         g_editor.scene.meshes.size(),
@@ -2960,7 +2956,7 @@ void draw_viewport() {
         }
     }
     handle_gizmo_drag();
-    if (!g_editor.hide_dirty_wireframes) {
+    if (!g_editor.hide_dirty_wireframes && g_editor.dirty != lt::RenderDirty::None) {
         draw_scene_reference_outlines(ImGui::GetWindowDrawList());
     }
     draw_gizmo_overlay();
@@ -3337,11 +3333,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     LT_LOG_INFO("Starting LightTransport Editor with scene '{}'", g_editor.scene_path);
     g_editor.settings.samples_per_pixel = 1;
     g_editor.settings.max_bounces = 5;
-    if (!g_editor.scene.meshes.empty()) {
-        select_mesh(0);
-    } else {
-        select_sphere(g_editor.scene.spheres.empty() ? -1 : 0);
-    }
 #if LT_HAS_CUDA
     if (g_editor.cuda.available()) {
         g_editor.renderer = &g_editor.cuda;
