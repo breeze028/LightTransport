@@ -139,6 +139,7 @@ void CudaPathTracer::reset() {
     cudaFree(device_spheres_);
     cudaFree(device_triangle_indices_);
     cudaFree(device_light_indices_);
+    cudaFree(device_directional_lights_);
     cudaFree(device_bvh_nodes_);
     cudaFree(device_mesh_instances_);
     cudaFree(device_mesh_instance_indices_);
@@ -157,6 +158,7 @@ void CudaPathTracer::reset() {
     device_spheres_ = nullptr;
     device_triangle_indices_ = nullptr;
     device_light_indices_ = nullptr;
+    device_directional_lights_ = nullptr;
     device_bvh_nodes_ = nullptr;
     device_mesh_instances_ = nullptr;
     device_mesh_instance_indices_ = nullptr;
@@ -175,6 +177,7 @@ void CudaPathTracer::reset() {
     cached_spheres_ = 0;
     cached_triangle_indices_ = 0;
     cached_lights_ = 0;
+    cached_directional_lights_ = 0;
     cached_bvh_nodes_ = 0;
     cached_mesh_instances_ = 0;
     cached_mesh_instance_indices_ = 0;
@@ -315,6 +318,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !upload_buffer(device_spheres_, cached_spheres_, packed.spheres) ||
             !upload_buffer(device_triangle_indices_, cached_triangle_indices_, packed.triangle_indices) ||
             !upload_buffer(device_light_indices_, cached_lights_, packed.light_indices) ||
+            !upload_buffer(device_directional_lights_, cached_directional_lights_, packed.directional_lights) ||
             !upload_buffer(device_bvh_nodes_, cached_bvh_nodes_, packed.bvh_nodes) ||
             !upload_buffer(device_mesh_instances_, cached_mesh_instances_, packed.mesh_instances) ||
             !upload_buffer(device_mesh_instance_indices_, cached_mesh_instance_indices_, packed.mesh_instance_indices) ||
@@ -329,6 +333,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.spheres = static_cast<GpuSphere*>(device_spheres_);
         packed.scene.triangle_indices = static_cast<int*>(device_triangle_indices_);
         packed.scene.light_indices = static_cast<int*>(device_light_indices_);
+        packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(device_directional_lights_);
         packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(device_bvh_nodes_);
         packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(device_mesh_instances_);
         packed.scene.mesh_instance_indices = static_cast<int*>(device_mesh_instance_indices_);

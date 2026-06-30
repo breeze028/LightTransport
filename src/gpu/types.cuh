@@ -31,6 +31,12 @@ struct GpuTexture {
     cudaTextureObject_t object = 0;
 };
 
+struct GpuDirectionalLight {
+    Vec3 direction;
+    Vec3 color;
+    float intensity = 0.0f;
+};
+
 struct GpuTriangle {
     Vec3 v0;
     Vec3 v1;
@@ -111,6 +117,7 @@ struct GpuScene {
     int mesh_instance_count = 0;
     int use_two_level = 0;
     int light_count = 0;
+    int directional_light_count = 0;
     int texture_count = 0;
     int environment_texture = -1;
     Vec3 environment_color = {1.0f, 1.0f, 1.0f};
@@ -126,6 +133,7 @@ struct GpuScene {
     GpuSphere* spheres = nullptr;
     int* triangle_indices = nullptr;
     int* light_indices = nullptr;
+    GpuDirectionalLight* directional_lights = nullptr;
     GpuBvhNode* bvh_nodes = nullptr;
     GpuMeshInstance* mesh_instances = nullptr;
     int* mesh_instance_indices = nullptr;
@@ -141,6 +149,7 @@ struct PackedGpuScene {
     std::vector<GpuSphere> spheres;
     std::vector<int> triangle_indices;
     std::vector<int> light_indices;
+    std::vector<GpuDirectionalLight> directional_lights;
     std::vector<GpuBvhNode> bvh_nodes;
     std::vector<GpuMeshInstance> mesh_instances;
     std::vector<int> mesh_instance_indices;

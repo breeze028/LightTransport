@@ -489,8 +489,8 @@ public:
             LT_LOG_ERROR("PBRT scene '{}' contains no supported meshes", path);
             return {make_default_scene(), "PBRT scene contains no supported meshes: " + path};
         }
-        LT_LOG_INFO("Loaded PBRT scene '{}' (meshes={}, materials={}, textures={})",
-            path, scene_.meshes.size(), scene_.materials.size(), scene_.textures.size());
+        LT_LOG_INFO("Loaded PBRT scene '{}' (meshes={}, materials={}, textures={}, directional_lights={})",
+            path, scene_.meshes.size(), scene_.materials.size(), scene_.textures.size(), scene_.directional_lights.size());
         return {scene_, {}};
     }
 
@@ -776,6 +776,20 @@ private:
                     LT_LOG_WARN("PBRT environment texture '{}' was skipped: {}", filename, error);
                 }
             }
+        } else if (type == "distant") {
+            const Vec3 l = vec3_param(params, "L", {1.0f, 1.0f, 1.0f});
+            const float scale_value = std::max(0.0f, float_param(params, "scale", 1.0f));
+            const float intensity = std::max({l.x, l.y, l.z}) * scale_value;
+            if (intensity <= 0.0f) return;
+            const Vec3 from = transform_point(state_.transform, vec3_param(params, "from", {0.0f, 0.0f, 0.0f}));
+            const Vec3 to = transform_point(state_.transform, vec3_param(params, "to", {0.0f, 0.0f, 1.0f}));
+            const Vec3 direction = normalize(from - to);
+            if (dot(direction, direction) <= 0.0f) return;
+            DirectionalLight light;
+            light.direction = direction;
+            light.intensity = intensity;
+            light.color = l / std::max(1.0e-6f, std::max({l.x, l.y, l.z}));
+            scene_.directional_lights.push_back(light);
         } else if (type == "point" || type == "spot" || type == "goniometric") {
             const Vec3 color = vec3_param(params, "I", vec3_param(params, "L", {1.0f, 1.0f, 1.0f}));
             const float scale_value = std::max(0.0f, float_param(params, "scale", 1.0f));

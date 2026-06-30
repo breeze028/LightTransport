@@ -285,8 +285,8 @@ SceneLoadResult load_scene(const std::string& path) {
     if (extension == ".pbrt") {
         SceneLoadResult result = load_pbrt_scene(path);
         if (result.error.empty()) {
-            LT_LOG_INFO("Loaded PBRT scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
-                path, result.scene.meshes.size(), result.scene.spheres.size(), result.scene.materials.size(), result.scene.textures.size());
+            LT_LOG_INFO("Loaded PBRT scene '{}' (meshes={}, spheres={}, materials={}, textures={}, directional_lights={})",
+                path, result.scene.meshes.size(), result.scene.spheres.size(), result.scene.materials.size(), result.scene.textures.size(), result.scene.directional_lights.size());
         } else {
             LT_LOG_ERROR("Failed to load PBRT scene '{}': {}", path, result.error);
         }
@@ -375,6 +375,18 @@ SceneLoadResult load_scene(const std::string& path) {
             input >> scene.environment.light_from_world_z.x >> scene.environment.light_from_world_z.y >> scene.environment.light_from_world_z.z;
             if (!input) {
                 return fail("Invalid environment_basis at line " + std::to_string(line_number));
+            }
+        } else if (tag == "directional_light") {
+            DirectionalLight light;
+            input >> light.direction.x >> light.direction.y >> light.direction.z
+                >> light.color.x >> light.color.y >> light.color.z
+                >> light.intensity;
+            if (!input || light.intensity < 0.0f) {
+                return fail("Invalid directional_light at line " + std::to_string(line_number));
+            }
+            light.direction = normalize(light.direction);
+            if (dot(light.direction, light.direction) > 0.0f && light.intensity > 0.0f) {
+                scene.directional_lights.push_back(light);
             }
         } else if (tag == "npr_sampling") {
             input >> scene.render_settings.stylized_samples >> scene.render_settings.stylized_max_depth;
@@ -727,8 +739,8 @@ SceneLoadResult load_scene(const std::string& path) {
     if (!environment_texture_name.empty()) {
         scene.environment.texture = find_texture(scene, environment_texture_name);
     }
-    LT_LOG_INFO("Loaded .lt scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
-        path, scene.meshes.size(), scene.spheres.size(), scene.materials.size(), scene.textures.size());
+    LT_LOG_INFO("Loaded .lt scene '{}' (meshes={}, spheres={}, materials={}, textures={}, directional_lights={})",
+        path, scene.meshes.size(), scene.spheres.size(), scene.materials.size(), scene.textures.size(), scene.directional_lights.size());
     return {scene, {}};
 }
 
@@ -776,6 +788,19 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
                 << scene.environment.light_from_world_y.x << ' ' << scene.environment.light_from_world_y.y << ' ' << scene.environment.light_from_world_y.z << ' '
                 << scene.environment.light_from_world_z.x << ' ' << scene.environment.light_from_world_z.y << ' ' << scene.environment.light_from_world_z.z << '\n';
         }
+        output << '\n';
+    }
+
+    for (const DirectionalLight& light : scene.directional_lights) {
+        if (dot(light.direction, light.direction) <= 0.0f || light.intensity <= 0.0f) {
+            continue;
+        }
+        output << "directional_light "
+            << light.direction.x << ' ' << light.direction.y << ' ' << light.direction.z << ' '
+            << light.color.x << ' ' << light.color.y << ' ' << light.color.z << ' '
+            << light.intensity << '\n';
+    }
+    if (!scene.directional_lights.empty()) {
         output << '\n';
     }
 
@@ -916,8 +941,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
     output << '\n';
 
     if (scene.uses_builtin_default_meshes) {
-        LT_LOG_INFO("Saved scene '{}' (built-in default meshes, materials={}, textures={})",
-            path, scene.materials.size(), scene.textures.size());
+        LT_LOG_INFO("Saved scene '{}' (built-in default meshes, materials={}, textures={}, directional_lights={})",
+            path, scene.materials.size(), scene.textures.size(), scene.directional_lights.size());
         return true;
     }
 
@@ -967,8 +992,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             output << mesh.indices[i] << ' ' << mesh.indices[i + 1] << ' ' << mesh.indices[i + 2] << '\n';
         }
     }
-    LT_LOG_INFO("Saved scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
-        path, scene.meshes.size(), scene.spheres.size(), scene.materials.size(), scene.textures.size());
+    LT_LOG_INFO("Saved scene '{}' (meshes={}, spheres={}, materials={}, textures={}, directional_lights={})",
+        path, scene.meshes.size(), scene.spheres.size(), scene.materials.size(), scene.textures.size(), scene.directional_lights.size());
     return true;
 }
 

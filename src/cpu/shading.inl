@@ -194,77 +194,107 @@ float mis_weight(float pdf_a, float pdf_b, MisHeuristic heuristic) {
 Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scene, const Hit& hit, const Material& material, Vec3 wo, Rng& rng, const RenderSettings& settings) {
     Vec3 direct;
     const int light_count = static_cast<int>(render_scene.light_triangle_indices.size());
-    if (light_count <= 0) {
-        return direct;
-    }
-    const int light_list_index = std::min(static_cast<int>(rng.next_float() * static_cast<float>(light_count)), light_count - 1);
-    const int light_index = render_scene.light_triangle_indices[static_cast<size_t>(light_list_index)];
-    if (light_index < 0 || light_index >= static_cast<int>(render_scene.triangles.size())) {
-        return direct;
-    }
-    const Triangle& light = render_scene.triangles[static_cast<size_t>(light_index)];
+    if (light_count > 0) {
+        const int light_list_index = std::min(static_cast<int>(rng.next_float() * static_cast<float>(light_count)), light_count - 1);
+        const int light_index = render_scene.light_triangle_indices[static_cast<size_t>(light_list_index)];
+        if (light_index >= 0 && light_index < static_cast<int>(render_scene.triangles.size())) {
+            const Triangle& light = render_scene.triangles[static_cast<size_t>(light_index)];
 
-    Vec3 light_point;
-    const Vec2 light_uv = sample_triangle_uv(light, rng, light_point);
-    const Vec3 to_light = light_point - hit.position;
-    const float dist2 = dot(to_light, to_light);
-    if (dist2 <= 1.0e-8f) {
-        return direct;
-    }
-    const float dist = std::sqrt(dist2);
-    const Vec3 light_dir = to_light / dist;
-    const float ndotl_raw = dot(hit.normal, light_dir);
-    const float ndotl = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
-    const bool has_mesh_emission = has_light_emission(light_emission(scene, light.mesh));
-    const bool material_emissive_double_sided = !has_mesh_emission &&
-        light.material >= 0 && light.material < static_cast<int>(scene.materials.size()) &&
-        scene.materials[static_cast<size_t>(light.material)] &&
-        scene.materials[static_cast<size_t>(light.material)]->double_sided &&
-        has_light_emission(scene.materials[static_cast<size_t>(light.material)]->emitted(light_uv));
-    const bool light_double_sided = mesh_light_is_double_sided(scene, light.mesh) || material_emissive_double_sided;
-    const float ldot_raw = dot(-light.normal, light_dir);
-    const float ldot = light_double_sided ? std::fabs(ldot_raw) : std::max(0.0f, ldot_raw);
-    if (ndotl <= 0.0f || ldot <= 0.0f) {
-        return direct;
-    }
+            Vec3 light_point;
+            const Vec2 light_uv = sample_triangle_uv(light, rng, light_point);
+            const Vec3 to_light = light_point - hit.position;
+            const float dist2 = dot(to_light, to_light);
+            if (dist2 > 1.0e-8f) {
+                const float dist = std::sqrt(dist2);
+                const Vec3 light_dir = to_light / dist;
+                const float ndotl_raw = dot(hit.normal, light_dir);
+                const float ndotl = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
+                const bool has_mesh_emission = has_light_emission(light_emission(scene, light.mesh));
+                const bool material_emissive_double_sided = !has_mesh_emission &&
+                    light.material >= 0 && light.material < static_cast<int>(scene.materials.size()) &&
+                    scene.materials[static_cast<size_t>(light.material)] &&
+                    scene.materials[static_cast<size_t>(light.material)]->double_sided &&
+                    has_light_emission(scene.materials[static_cast<size_t>(light.material)]->emitted(light_uv));
+                const bool light_double_sided = mesh_light_is_double_sided(scene, light.mesh) || material_emissive_double_sided;
+                const float ldot_raw = dot(-light.normal, light_dir);
+                const float ldot = light_double_sided ? std::fabs(ldot_raw) : std::max(0.0f, ldot_raw);
+                if (ndotl > 0.0f && ldot > 0.0f) {
+                    bool blocked = false;
+                    const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
+                    Ray shadow_ray{hit.position + hit.normal * (0.002f * shadow_offset_side), light_dir};
+                    for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+                        Hit shadow_hit;
+                        if (!intersect_scene(render_scene, shadow_ray, shadow_hit, settings.acceleration_structure)) {
+                            break;
+                        }
+                        const float shadow_dist = length(shadow_hit.position - hit.position);
+                        if (shadow_dist >= dist - 0.01f || shadow_hit.triangle == light_index) {
+                            break;
+                        }
+                        if (shadow_hit.material >= 0 && shadow_hit.material < static_cast<int>(scene.materials.size()) &&
+                            scene.materials[static_cast<size_t>(shadow_hit.material)]) {
+                            const Material& shadow_material = *scene.materials[static_cast<size_t>(shadow_hit.material)];
+                            if (!material_visible(shadow_material, shadow_hit.uv, rng) ||
+                                shadow_material.model() == BrdfModel::Dielectric ||
+                                shadow_material.transmission(shadow_hit.uv) > 0.5f) {
+                                shadow_ray = {shadow_hit.position + light_dir * 0.002f, light_dir};
+                                continue;
+                            }
+                        }
+                        blocked = true;
+                        break;
+                    }
 
-    const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
-    Ray shadow_ray{hit.position + hit.normal * (0.002f * shadow_offset_side), light_dir};
-    for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
-        Hit shadow_hit;
-        if (!intersect_scene(render_scene, shadow_ray, shadow_hit, settings.acceleration_structure)) {
-            break;
-        }
-        const float shadow_dist = length(shadow_hit.position - hit.position);
-        if (shadow_dist >= dist - 0.01f || shadow_hit.triangle == light_index) {
-            break;
-        }
-        if (shadow_hit.material >= 0 && shadow_hit.material < static_cast<int>(scene.materials.size()) &&
-            scene.materials[static_cast<size_t>(shadow_hit.material)]) {
-            const Material& shadow_material = *scene.materials[static_cast<size_t>(shadow_hit.material)];
-            if (!material_visible(shadow_material, shadow_hit.uv, rng) || shadow_material.model() == BrdfModel::Dielectric) {
-                shadow_ray = {shadow_hit.position + light_dir * 0.002f, light_dir};
-                continue;
+                    const float light_pmf = 1.0f / static_cast<float>(light_count);
+                    const float light_pdf = light_pdf_solid_angle(scene, light, hit.position, light_point, light_pmf);
+                    const Vec3 emission = emitted_radiance(scene, light, light_uv, light_dir);
+                    if (!blocked && std::isfinite(light_pdf) && light_pdf > 0.0f && has_light_emission(emission)) {
+                        const float bsdf_pdf = material.pdf(hit.normal, wo, light_dir, hit.uv);
+                        if (std::isfinite(bsdf_pdf) && bsdf_pdf >= 0.0f) {
+                            const float weight = settings.use_mis ? mis_weight(light_pdf, bsdf_pdf, settings.mis_heuristic) : 1.0f;
+                            direct += clamp_sample_radiance(material.evaluate(hit.normal, wo, light_dir, hit.uv) * emission * (ndotl / light_pdf) * weight);
+                        }
+                    }
+                }
             }
         }
-        return direct;
     }
 
-    const float light_pmf = 1.0f / static_cast<float>(light_count);
-    const float light_pdf = light_pdf_solid_angle(scene, light, hit.position, light_point, light_pmf);
-    if (!std::isfinite(light_pdf) || light_pdf <= 0.0f) {
-        return direct;
+    for (const DirectionalLight& light : scene.directional_lights) {
+        if (light.intensity <= 0.0f || dot(light.direction, light.direction) <= 0.0f) {
+            continue;
+        }
+        const Vec3 light_dir = normalize(light.direction);
+        const float ndotl_raw = dot(hit.normal, light_dir);
+        const float ndotl = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
+        if (ndotl <= 0.0f) {
+            continue;
+        }
+        bool blocked = false;
+        const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
+        Ray shadow_ray{hit.position + hit.normal * (0.002f * shadow_offset_side), light_dir};
+        for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+            Hit shadow_hit;
+            if (!intersect_scene(render_scene, shadow_ray, shadow_hit, settings.acceleration_structure)) {
+                break;
+            }
+            if (shadow_hit.material >= 0 && shadow_hit.material < static_cast<int>(scene.materials.size()) &&
+                scene.materials[static_cast<size_t>(shadow_hit.material)]) {
+                const Material& shadow_material = *scene.materials[static_cast<size_t>(shadow_hit.material)];
+                if (!material_visible(shadow_material, shadow_hit.uv, rng) ||
+                    shadow_material.model() == BrdfModel::Dielectric ||
+                    shadow_material.transmission(shadow_hit.uv) > 0.5f) {
+                    shadow_ray = {shadow_hit.position + light_dir * 0.002f, light_dir};
+                    continue;
+                }
+            }
+            blocked = true;
+            break;
+        }
+        if (!blocked) {
+            direct += clamp_sample_radiance(material.evaluate(hit.normal, wo, light_dir, hit.uv) * (light.color * light.intensity) * ndotl);
+        }
     }
-    const Vec3 emission = emitted_radiance(scene, light, light_uv, light_dir);
-    if (!has_light_emission(emission)) {
-        return direct;
-    }
-    const float bsdf_pdf = material.pdf(hit.normal, wo, light_dir, hit.uv);
-    if (!std::isfinite(bsdf_pdf) || bsdf_pdf < 0.0f) {
-        return direct;
-    }
-    const float weight = settings.use_mis ? mis_weight(light_pdf, bsdf_pdf, settings.mis_heuristic) : 1.0f;
-    direct += clamp_sample_radiance(material.evaluate(hit.normal, wo, light_dir, hit.uv) * emission * (ndotl / light_pdf) * weight);
     return direct;
 }
 
@@ -299,7 +329,10 @@ Vec3 color_map_gradient(float t) {
     return mix_color(c3, c4, (t - 0.75f) * 4.0f);
 }
 
-Vec3 dominant_light_direction(const RenderScene& render_scene, const Hit& hit) {
+Vec3 dominant_light_direction(const RenderScene& render_scene, const Scene& scene, const Hit& hit) {
+    if (!scene.directional_lights.empty() && dot(scene.directional_lights.front().direction, scene.directional_lights.front().direction) > 0.0f) {
+        return normalize(scene.directional_lights.front().direction);
+    }
     if (!render_scene.light_triangle_indices.empty()) {
         const int light_index = render_scene.light_triangle_indices.front();
         if (light_index >= 0 && light_index < static_cast<int>(render_scene.triangles.size())) {
@@ -349,7 +382,7 @@ float xtoon_attribute_detail(const RenderScene& render_scene, const Scene& scene
         return std::pow(std::clamp(1.0f - std::fabs(dot(hit.normal, wo)), 0.0f, 1.0f), power);
     }
     if (npr.xtoon_detail_mode == XToonDetailMode::Highlight) {
-        const Vec3 light_dir = dominant_light_direction(render_scene, hit);
+        const Vec3 light_dir = dominant_light_direction(render_scene, scene, hit);
         const Vec3 reflected = normalize(hit.normal * (2.0f * dot(hit.normal, light_dir)) - light_dir);
         return std::pow(std::max(0.0f, dot(wo, reflected)), power);
     }

@@ -26,6 +26,15 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
     if (!size_fits_int(scene.textures.size()) || !size_fits_int(scene.materials.size())) {
         return false;
     }
+    if (!size_fits_int(scene.directional_lights.size())) {
+        return false;
+    }
+    gpu.directional_light_count = static_cast<int>(scene.directional_lights.size());
+    packed.directional_lights.resize(scene.directional_lights.size());
+    for (int i = 0; i < gpu.directional_light_count; ++i) {
+        const DirectionalLight& light = scene.directional_lights[static_cast<size_t>(i)];
+        packed.directional_lights[static_cast<size_t>(i)] = {light.direction, light.color, light.intensity};
+    }
     gpu.texture_count = static_cast<int>(scene.textures.size());
     packed.textures.resize(scene.textures.size());
     for (int i = 0; i < gpu.texture_count; ++i) {

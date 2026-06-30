@@ -305,6 +305,13 @@ uint64_t irradiance_volume_fingerprint(const RenderScene& render_scene, const Sc
         hash_vec3(hash, mesh.light.color);
         hash_value(hash, mesh.light.intensity);
     }
+    const uint64_t directional_light_count = static_cast<uint64_t>(scene.directional_lights.size());
+    hash_value(hash, directional_light_count);
+    for (const DirectionalLight& light : scene.directional_lights) {
+        hash_vec3(hash, light.direction);
+        hash_vec3(hash, light.color);
+        hash_value(hash, light.intensity);
+    }
     hash_vec3(hash, scene.environment.color);
     hash_value(hash, scene.environment.strength);
     hash_value(hash, scene.environment.constant);

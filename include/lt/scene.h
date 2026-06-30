@@ -16,6 +16,12 @@ struct LightComponent {
     float intensity = 1.0f;
 };
 
+struct DirectionalLight {
+    Vec3 direction = {0.0f, 1.0f, 0.0f};
+    Vec3 color = {1.0f, 1.0f, 1.0f};
+    float intensity = 1.0f;
+};
+
 struct Mesh {
     std::string name = "Mesh";
     std::vector<Vec3> vertices;
@@ -93,6 +99,7 @@ struct Scene {
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<Mesh> meshes;
     std::vector<Sphere> spheres;
+    std::vector<DirectionalLight> directional_lights;
 };
 
 struct Triangle {
