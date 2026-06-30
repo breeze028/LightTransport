@@ -4,6 +4,9 @@ project(LightTransport LANGUAGES CXX)
 
 option(LT_ENABLE_CUDA "Build the CUDA path tracing backend" ON)
 option(LT_BUILD_EDITOR "Build the realtime scene editor" ON)
+option(LT_ENABLE_MATERIALX "Enable MaterialX/OpenPBR material interchange support when the SDK is available" ON)
+option(LT_ENABLE_OPENIMAGEIO "Enable OpenImageIO texture decoding when the SDK is available" ON)
+option(LT_ENABLE_OPENCOLORIO "Enable OpenColorIO color management when the SDK is available" ON)
 option(LT_FETCH_IMGUI "Fetch Dear ImGui when building the editor" ON)
 option(LT_FETCH_SPDLOG "Fetch spdlog when it is not provided by the system" ON)
 option(LT_FETCH_STB "Fetch stb header-only image utilities when they are not provided by the system" ON)
@@ -48,12 +51,27 @@ if(NOT STB_INCLUDE_DIR)
     endif()
 endif()
 
+if(LT_ENABLE_MATERIALX)
+    find_package(MaterialX CONFIG QUIET)
+endif()
+
+if(LT_ENABLE_OPENIMAGEIO)
+    find_package(OpenImageIO CONFIG QUIET)
+endif()
+
+if(LT_ENABLE_OPENCOLORIO)
+    find_package(OpenColorIO CONFIG QUIET)
+endif()
+
 add_library(lt_core
+    external/ufbx/ufbx.c
     src/log.cpp
     src/cpu/path_tracer.cpp
     src/cpu/cuda_stub.cpp
+    src/fbx_loader.cpp
     src/gltf_loader.cpp
     src/material.cpp
+    src/materialx_adapter.cpp
     src/pbrt/pbrt_loader.cpp
     src/scene.cpp
     src/scene/render_scene.cpp
@@ -64,7 +82,47 @@ add_library(lt_core
 
 target_include_directories(lt_core PUBLIC include)
 target_include_directories(lt_core PRIVATE ${STB_INCLUDE_DIR})
+target_include_directories(lt_core PRIVATE external/ufbx)
 target_link_libraries(lt_core PUBLIC ${LT_SPDLOG_TARGET})
+set_source_files_properties(external/ufbx/ufbx.c PROPERTIES LANGUAGE CXX)
+
+if(MaterialX_FOUND)
+    target_compile_definitions(lt_core PUBLIC LT_HAS_MATERIALX=1)
+    foreach(materialx_target MaterialXCore MaterialXFormat MaterialXGenShader MaterialX::MaterialXCore MaterialX::MaterialXFormat)
+        if(TARGET ${materialx_target})
+            target_link_libraries(lt_core PUBLIC ${materialx_target})
+        endif()
+    endforeach()
+else()
+    target_compile_definitions(lt_core PUBLIC LT_HAS_MATERIALX=0)
+    if(LT_ENABLE_MATERIALX)
+        message(WARNING "MaterialX was not found. Building with the built-in OpenPBR-compatible material adapter only.")
+    endif()
+endif()
+
+if(OpenImageIO_FOUND)
+    target_compile_definitions(lt_core PUBLIC LT_HAS_OPENIMAGEIO=1)
+    if(TARGET OpenImageIO::OpenImageIO)
+        target_link_libraries(lt_core PUBLIC OpenImageIO::OpenImageIO)
+    endif()
+else()
+    target_compile_definitions(lt_core PUBLIC LT_HAS_OPENIMAGEIO=0)
+    if(LT_ENABLE_OPENIMAGEIO)
+        message(WARNING "OpenImageIO was not found. Building with the built-in WIC/HDR/EXR texture loader fallback.")
+    endif()
+endif()
+
+if(OpenColorIO_FOUND)
+    target_compile_definitions(lt_core PUBLIC LT_HAS_OPENCOLORIO=1)
+    if(TARGET OpenColorIO::OpenColorIO)
+        target_link_libraries(lt_core PUBLIC OpenColorIO::OpenColorIO)
+    endif()
+else()
+    target_compile_definitions(lt_core PUBLIC LT_HAS_OPENCOLORIO=0)
+    if(LT_ENABLE_OPENCOLORIO)
+        message(WARNING "OpenColorIO was not found. Building with explicit sRGB/raw texture role conversion fallback.")
+    endif()
+endif()
 
 if(WIN32)
     target_link_libraries(lt_core PUBLIC windowscodecs ole32 urlmon)

@@ -391,7 +391,7 @@ float xtoon_attribute_detail(const RenderScene& render_scene, const Scene& scene
 
 Vec3 apply_xtoon_style(const RenderScene& render_scene, const Scene& scene, const Material& material, const Hit& hit, Vec3 wo) {
     const NprSettings& npr = material.npr;
-    const Vec3 light_dir = dominant_light_direction(render_scene, hit);
+    const Vec3 light_dir = dominant_light_direction(render_scene, scene, hit);
     const float ndotl_raw = dot(hit.normal, light_dir);
     const float tone = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
     Vec3 toon = xtoon_ramp(material, hit, tone);
@@ -641,6 +641,9 @@ Vec3 diffuse_gi_scale_for_irradiance_volume(const Material& material, Vec2 uv) {
     if (const auto* principled = dynamic_cast<const PrincipledMaterial*>(&material)) {
         return Vec3{1.0f - principled->metallic_at(uv)};
     }
+    if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(&material)) {
+        return Vec3{(1.0f - standard->metalness_at(uv)) * (1.0f - standard->transmission(uv))};
+    }
     return Vec3{1.0f};
 }
 
@@ -648,7 +651,13 @@ bool material_uses_irradiance_volume_gi(const RenderSettings& settings, const Ma
     if (material.model() == BrdfModel::Lambertian) {
         return true;
     }
-    return settings.irradiance_volume_principled_gi && material.model() == BrdfModel::Principled;
+    if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(&material)) {
+        if (standard->transmission({}) > 0.05f) {
+            return false;
+        }
+    }
+    return settings.irradiance_volume_principled_gi &&
+        (material.model() == BrdfModel::Principled || material.model() == BrdfModel::StandardSurface);
 }
 
 Vec3 shade_material_from_irradiance_volume(
@@ -678,8 +687,14 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
     float previous_bsdf_pdf = 0.0f;
     bool previous_delta = false;
 
-    for (int bounce = 0; bounce < settings.max_bounces; ++bounce) {
-        const float sample_clamp = bounce == 0 ? 64.0f : 8.0f;
+    int transmission_bounces = 0;
+    constexpr int kExtraTransmissionBounces = 12;
+    for (int bounce = 0; bounce < settings.max_bounces + kExtraTransmissionBounces; ++bounce) {
+        const int shading_bounce = bounce - transmission_bounces;
+        if (shading_bounce >= settings.max_bounces) {
+            break;
+        }
+        const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
         Hit hit;
         if (!intersect_scene(render_scene, ray, hit, settings.acceleration_structure)) {
             radiance += clamp_sample_radiance(throughput * environment_radiance(scene, ray.direction, settings), sample_clamp);
@@ -704,7 +719,7 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
             emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction);
         }
         if (has_light_emission(emission)) {
-            if (bounce == 0) {
+            if (shading_bounce == 0) {
                 radiance += clamp_sample_radiance(throughput * emission, sample_clamp);
             } else if (previous_delta) {
                 radiance += clamp_sample_radiance(throughput * emission, sample_clamp);
@@ -736,7 +751,7 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
         const Vec3 wo = -ray.direction;
         radiance += clamp_sample_radiance(throughput * estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings), sample_clamp);
 
-        if (bounce >= 3) {
+        if (shading_bounce >= 3) {
             const float p = std::clamp(std::max({throughput.x, throughput.y, throughput.z}), 0.05f, 0.95f);
             if (rng.next_float() > p) {
                 break;
@@ -751,6 +766,9 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
         previous_position = hit.position;
         previous_bsdf_pdf = sample.pdf;
         previous_delta = sample.delta;
+        if (sample.delta && material->transmission(hit.uv) > 0.5f && transmission_bounces < kExtraTransmissionBounces) {
+            ++transmission_bounces;
+        }
         const float offset_side = dot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;
         ray = {hit.position + hit.normal * (0.001f * offset_side), sample.direction};
         throughput = throughput * sample.weight;

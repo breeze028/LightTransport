@@ -6,7 +6,9 @@ void CpuPathTracer::reset() {
 
 void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) {
     framebuffer.resize(settings.width, settings.height);
-    if (!scene_uploaded_ || has_dirty(settings.dirty, RenderDirty::Geometry)) {
+    if (!scene_uploaded_ ||
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform)) {
         LT_LOG_DEBUG(
             "CPU render scene rebuild: meshes={} spheres={} materials={} textures={} accel={}",
             scene.meshes.size(),
@@ -15,6 +17,10 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
             scene.textures.size(),
             static_cast<int>(settings.acceleration_structure));
         cached_render_scene_ = build_render_scene(scene);
+        LT_LOG_DEBUG(
+            "CPU render scene built: triangles={} light_triangles={}",
+            cached_render_scene_.triangles.size(),
+            cached_render_scene_.light_triangle_indices.size());
         scene_uploaded_ = true;
     }
     const RenderScene& render_scene = cached_render_scene_;

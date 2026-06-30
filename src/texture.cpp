@@ -11,6 +11,10 @@
 #include <sstream>
 #include <unordered_map>
 
+#if LT_HAS_OPENIMAGEIO
+#include <OpenImageIO/imageio.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable: 4244 4267 4996)
@@ -123,6 +127,18 @@ std::string lowercase_extension(const std::string& path) {
     std::string ext = dot == std::string::npos ? std::string{} : path.substr(dot);
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return ext;
+}
+
+float srgb_to_scene_linear(float value) {
+    value = std::clamp(value, 0.0f, 1.0f);
+    if (value <= 0.04045f) {
+        return value / 12.92f;
+    }
+    return std::pow((value + 0.055f) / 1.055f, 2.4f);
+}
+
+bool texture_role_is_color(TextureRole role) {
+    return role == TextureRole::Color || role == TextureRole::Emission;
 }
 
 float rgbe_channel(unsigned char value, unsigned char exponent) {
@@ -598,6 +614,58 @@ bool load_wic_memory(const std::string& name, const unsigned char* data, size_t 
 
 } // namespace
 
+#if LT_HAS_OPENIMAGEIO
+bool load_oiio_file(const std::string& name, const std::string& path, Texture& texture, std::string& error) {
+    auto input = OIIO::ImageInput::open(path);
+    if (!input) {
+        error = OIIO::geterror();
+        if (error.empty()) {
+            error = "OpenImageIO could not open texture: " + path;
+        }
+        return false;
+    }
+
+    const OIIO::ImageSpec spec = input->spec();
+    if (spec.width <= 0 || spec.height <= 0 || spec.nchannels <= 0) {
+        error = "OpenImageIO returned invalid image dimensions: " + path;
+        input->close();
+        return false;
+    }
+
+    std::vector<float> decoded(static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) * static_cast<size_t>(spec.nchannels));
+    if (!input->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT, decoded.data())) {
+        error = input->geterror();
+        if (error.empty()) {
+            error = "OpenImageIO could not read texture pixels: " + path;
+        }
+        input->close();
+        return false;
+    }
+    input->close();
+
+    texture = {};
+    texture.name = name;
+    texture.path = path;
+    texture.width = spec.width;
+    texture.height = spec.height;
+    const size_t pixel_count = static_cast<size_t>(texture.width) * static_cast<size_t>(texture.height);
+    texture.pixels.resize(pixel_count);
+    texture.alpha.resize(pixel_count, 1.0f);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        const size_t base = i * static_cast<size_t>(spec.nchannels);
+        const float r = decoded[base + 0u];
+        const float g = spec.nchannels > 1 ? decoded[base + 1u] : r;
+        const float b = spec.nchannels > 2 ? decoded[base + 2u] : r;
+        texture.pixels[i] = {r, g, b};
+        if (spec.nchannels > 3) {
+            texture.alpha[i] = decoded[base + 3u];
+        }
+    }
+    texture.build_mips();
+    return true;
+}
+#endif
+
 Vec3 Texture::sample(Vec2 uv) const {
     if (width <= 0 || height <= 0 || pixels.empty()) {
         return {1.0f, 1.0f, 1.0f};
@@ -732,6 +800,207 @@ bool load_ppm_texture(const std::string& name, const std::string& path, Texture&
                 return false;
             }
             pixel = {std::stof(r) * inv, std::stof(g) * inv, std::stof(b) * inv};
+        }
+    }
+    texture.build_mips();
+    return true;
+}
+
+bool load_tga_texture(const std::string& name, const std::string& path, Texture& texture, std::string& error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "Could not open TGA texture: " + path;
+        return false;
+    }
+    std::vector<unsigned char> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (data.size() < 18) {
+        error = "Invalid TGA texture: " + path;
+        return false;
+    }
+
+    const uint8_t id_length = data[0];
+    const uint8_t color_map_type = data[1];
+    const uint8_t image_type = data[2];
+    const int width = static_cast<int>(data[12]) | (static_cast<int>(data[13]) << 8);
+    const int height = static_cast<int>(data[14]) | (static_cast<int>(data[15]) << 8);
+    const int bits_per_pixel = data[16];
+    const uint8_t descriptor = data[17];
+    if (color_map_type != 0 || width <= 0 || height <= 0) {
+        error = "Unsupported TGA texture: " + path;
+        return false;
+    }
+    const bool rle = image_type == 10 || image_type == 11;
+    const bool grayscale = image_type == 3 || image_type == 11;
+    if (!(image_type == 2 || image_type == 3 || image_type == 10 || image_type == 11)) {
+        error = "Unsupported TGA image type: " + path;
+        return false;
+    }
+    const int bytes_per_pixel = bits_per_pixel / 8;
+    if ((grayscale && bits_per_pixel != 8) || (!grayscale && bits_per_pixel != 24 && bits_per_pixel != 32)) {
+        error = "Unsupported TGA pixel format: " + path;
+        return false;
+    }
+    size_t pos = 18u + static_cast<size_t>(id_length);
+    if (pos > data.size()) {
+        error = "Invalid TGA texture: " + path;
+        return false;
+    }
+
+    texture = {};
+    texture.name = name;
+    texture.path = path;
+    texture.width = width;
+    texture.height = height;
+    const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    texture.pixels.resize(pixel_count);
+    texture.alpha.assign(pixel_count, 1.0f);
+    const bool top_origin = (descriptor & 0x20u) != 0;
+    const bool right_origin = (descriptor & 0x10u) != 0;
+
+    const auto write_pixel = [&](size_t linear_index, const unsigned char* pixel) {
+        const int x = static_cast<int>(linear_index % static_cast<size_t>(width));
+        const int y = static_cast<int>(linear_index / static_cast<size_t>(width));
+        const int out_x = right_origin ? width - 1 - x : x;
+        const int out_y = top_origin ? y : height - 1 - y;
+        const size_t out = static_cast<size_t>(out_y) * static_cast<size_t>(width) + static_cast<size_t>(out_x);
+        if (grayscale) {
+            const float v = static_cast<float>(pixel[0]) / 255.0f;
+            texture.pixels[out] = {v, v, v};
+        } else {
+            texture.pixels[out] = {
+                static_cast<float>(pixel[2]) / 255.0f,
+                static_cast<float>(pixel[1]) / 255.0f,
+                static_cast<float>(pixel[0]) / 255.0f,
+            };
+            if (bytes_per_pixel == 4) {
+                texture.alpha[out] = static_cast<float>(pixel[3]) / 255.0f;
+            }
+        }
+    };
+
+    size_t written = 0;
+    if (rle) {
+        while (written < pixel_count && pos < data.size()) {
+            const uint8_t packet = data[pos++];
+            const size_t count = static_cast<size_t>((packet & 0x7fu) + 1u);
+            if (packet & 0x80u) {
+                if (pos + static_cast<size_t>(bytes_per_pixel) > data.size()) {
+                    error = "TGA texture ended early: " + path;
+                    return false;
+                }
+                const unsigned char* pixel = data.data() + pos;
+                pos += static_cast<size_t>(bytes_per_pixel);
+                for (size_t i = 0; i < count && written < pixel_count; ++i) {
+                    write_pixel(written++, pixel);
+                }
+            } else {
+                if (pos + count * static_cast<size_t>(bytes_per_pixel) > data.size()) {
+                    error = "TGA texture ended early: " + path;
+                    return false;
+                }
+                for (size_t i = 0; i < count && written < pixel_count; ++i) {
+                    write_pixel(written++, data.data() + pos);
+                    pos += static_cast<size_t>(bytes_per_pixel);
+                }
+            }
+        }
+    } else {
+        if (pos + pixel_count * static_cast<size_t>(bytes_per_pixel) > data.size()) {
+            error = "TGA texture ended early: " + path;
+            return false;
+        }
+        for (; written < pixel_count; ++written) {
+            write_pixel(written, data.data() + pos);
+            pos += static_cast<size_t>(bytes_per_pixel);
+        }
+    }
+    if (written != pixel_count) {
+        error = "TGA texture ended early: " + path;
+        return false;
+    }
+    texture.build_mips();
+    return true;
+}
+
+bool read_pfm_float(std::istream& in, bool little_endian, float& value) {
+    unsigned char bytes[4] = {};
+    if (!in.read(reinterpret_cast<char*>(bytes), 4)) return false;
+    uint32_t bits = 0;
+    if (little_endian) {
+        bits = static_cast<uint32_t>(bytes[0]) |
+            (static_cast<uint32_t>(bytes[1]) << 8) |
+            (static_cast<uint32_t>(bytes[2]) << 16) |
+            (static_cast<uint32_t>(bytes[3]) << 24);
+    } else {
+        bits = static_cast<uint32_t>(bytes[3]) |
+            (static_cast<uint32_t>(bytes[2]) << 8) |
+            (static_cast<uint32_t>(bytes[1]) << 16) |
+            (static_cast<uint32_t>(bytes[0]) << 24);
+    }
+    std::memcpy(&value, &bits, sizeof(value));
+    return true;
+}
+
+bool load_pfm_texture(const std::string& name, const std::string& path, Texture& texture, std::string& error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "Could not open PFM texture: " + path;
+        return false;
+    }
+    std::string token;
+    if (!read_token(in, token) || (token != "PF" && token != "Pf")) {
+        error = "Invalid PFM texture: " + path;
+        return false;
+    }
+    const bool color = token == "PF";
+    if (!read_token(in, token)) {
+        error = "Invalid PFM texture dimensions: " + path;
+        return false;
+    }
+    const int width = std::max(0, std::stoi(token));
+    if (!read_token(in, token)) {
+        error = "Invalid PFM texture dimensions: " + path;
+        return false;
+    }
+    const int height = std::max(0, std::stoi(token));
+    if (!read_token(in, token)) {
+        error = "Invalid PFM texture scale: " + path;
+        return false;
+    }
+    const float scale = std::stof(token);
+    if (width <= 0 || height <= 0 || scale == 0.0f) {
+        error = "Invalid PFM texture: " + path;
+        return false;
+    }
+
+    texture = {};
+    texture.name = name;
+    texture.path = path;
+    texture.width = width;
+    texture.height = height;
+    texture.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    texture.alpha.assign(texture.pixels.size(), 1.0f);
+    const bool little_endian = scale < 0.0f;
+    const float multiplier = std::fabs(scale);
+    for (int y = height - 1; y >= 0; --y) {
+        for (int x = 0; x < width; ++x) {
+            float r = 0.0f;
+            float g = 0.0f;
+            float b = 0.0f;
+            if (!read_pfm_float(in, little_endian, r)) {
+                error = "PFM texture ended early: " + path;
+                return false;
+            }
+            if (color) {
+                if (!read_pfm_float(in, little_endian, g) || !read_pfm_float(in, little_endian, b)) {
+                    error = "PFM texture ended early: " + path;
+                    return false;
+                }
+            } else {
+                g = r;
+                b = r;
+            }
+            texture.pixels[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] = {r * multiplier, g * multiplier, b * multiplier};
         }
     }
     texture.build_mips();
@@ -964,10 +1233,21 @@ bool load_exr_texture(const std::string& name, const std::string& path, Texture&
 bool load_texture_file(const std::string& name, const std::string& path, Texture& texture, std::string& error) {
     const std::string ext = lowercase_extension(path);
     bool ok = false;
+#if LT_HAS_OPENIMAGEIO
+    ok = load_oiio_file(name, path, texture, error);
+    if (ok) {
+        LT_LOG_DEBUG("Loaded texture '{}' via OpenImageIO ({}x{})", path, texture.width, texture.height);
+        return true;
+    }
+#endif
     if (ext == ".exr") {
         ok = load_exr_texture(name, path, texture, error);
     } else if (ext == ".hdr") {
         ok = load_hdr_texture(name, path, texture, error);
+    } else if (ext == ".pfm") {
+        ok = load_pfm_texture(name, path, texture, error);
+    } else if (ext == ".tga") {
+        ok = load_tga_texture(name, path, texture, error);
     } else if (ext == ".ppm") {
         ok = load_ppm_texture(name, path, texture, error);
     } else {
@@ -1005,6 +1285,27 @@ bool load_texture_memory(const std::string& name, const unsigned char* data, siz
         LT_LOG_WARN("Failed to load embedded texture '{}': {}", name, error);
     }
     return ok;
+}
+
+void apply_texture_role(Texture& texture, TextureRole role, TextureColorSpace color_space) {
+    texture.role = role;
+    TextureColorSpace resolved = color_space;
+    if (resolved == TextureColorSpace::Auto) {
+        resolved = texture_role_is_color(role) ? TextureColorSpace::SRGB : TextureColorSpace::Raw;
+    }
+    if (resolved == TextureColorSpace::SRGB && texture.color_space != TextureColorSpace::SceneLinear) {
+        for (Vec3& pixel : texture.pixels) {
+            pixel = {
+                srgb_to_scene_linear(pixel.x),
+                srgb_to_scene_linear(pixel.y),
+                srgb_to_scene_linear(pixel.z),
+            };
+        }
+        texture.build_mips();
+        texture.color_space = TextureColorSpace::SceneLinear;
+        return;
+    }
+    texture.color_space = resolved;
 }
 
 bool write_texture_png(const Texture& texture, const std::string& path, std::string& error) {

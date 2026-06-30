@@ -33,6 +33,7 @@ struct Mesh {
     Vec3 rotation = {};
     Vec3 scale = {1.0f, 1.0f, 1.0f};
     LightComponent light;
+    bool exclude_from_irradiance_volume_bake = false;
 };
 
 struct Sphere {
@@ -40,6 +41,7 @@ struct Sphere {
     int material = 0;
     Vec3 center = {};
     float radius = 0.5f;
+    bool exclude_from_irradiance_volume_bake = false;
 };
 
 struct Camera {
@@ -166,6 +168,8 @@ struct SceneLoadResult {
 
 Scene make_default_scene();
 SceneLoadResult load_scene(const std::string& path);
+SceneLoadResult load_fbx_scene(const std::string& path);
+SceneLoadResult load_pyscene_scene(const std::string& path);
 SceneLoadResult load_gltf_scene(const std::string& path);
 SceneLoadResult load_pbrt_scene(const std::string& path);
 bool save_scene(const Scene& scene, const std::string& path, std::string& error);

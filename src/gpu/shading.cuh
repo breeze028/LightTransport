@@ -112,12 +112,33 @@ __device__ float sample_texture_alpha_gpu(const GpuScene& scene, int texture_ind
     return sample.w;
 }
 
+__device__ Vec2 transform_uv_gpu(Vec2 uv, Vec2 offset, Vec2 scale, float rotation) {
+    uv.x *= scale.x;
+    uv.y *= scale.y;
+    if (rotation != 0.0f) {
+        const float c = cosf(rotation);
+        const float s = sinf(rotation);
+        uv = {uv.x * c - uv.y * s, uv.x * s + uv.y * c};
+    }
+    uv.x += offset.x;
+    uv.y += offset.y;
+    return uv;
+}
+
+__device__ Vec2 material_base_uv_gpu(const GpuMaterial& material, Vec2 uv) {
+    return transform_uv_gpu(uv, material.texture_offset, material.texture_scale, material.texture_rotation);
+}
+
+__device__ Vec2 material_emission_uv_gpu(const GpuMaterial& material, Vec2 uv) {
+    return transform_uv_gpu(uv, material.emission_texture_offset, material.emission_texture_scale, material.emission_texture_rotation);
+}
+
 __device__ Vec3 material_emission_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
-    return mul(material.emission, sample_texture_gpu(scene, material.emission_texture_index, uv));
+    return mul(material.emission, sample_texture_gpu(scene, material.emission_texture_index, material_emission_uv_gpu(material, uv)));
 }
 
 __device__ float material_opacity_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
-    return dclamp(material.alpha * sample_texture_alpha_gpu(scene, material.texture_index, uv), 0.0f, 1.0f);
+    return dclamp(material.alpha * sample_texture_alpha_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)), 0.0f, 1.0f);
 }
 
 __device__ bool material_visible_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv, uint32_t& rng) {
@@ -149,13 +170,23 @@ __device__ Vec3 apply_normal_map_gpu(const GpuScene& scene, const GpuMaterial& m
 }
 
 __device__ float material_roughness_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface) && material.roughness_texture_index >= 0) {
+        return dclamp(material.roughness * sample_texture_gpu(scene, material.roughness_texture_index, uv).x, 0.02f, 1.0f);
+    }
     const Vec3 metallic_roughness = sample_texture_gpu(scene, material.metallic_roughness_texture_index, uv);
     return dclamp(material.roughness * metallic_roughness.y, 0.02f, 1.0f);
 }
 
 __device__ float material_metallic_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface) && material.metallic_texture_index >= 0) {
+        return dclamp(material.metallic * sample_texture_gpu(scene, material.metallic_texture_index, uv).x, 0.0f, 1.0f);
+    }
     const Vec3 metallic_roughness = sample_texture_gpu(scene, material.metallic_roughness_texture_index, uv);
     return dclamp(material.metallic * metallic_roughness.z, 0.0f, 1.0f);
+}
+
+__device__ float material_specular_weight_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    return fmaxf(0.0f, material.specular_weight * sample_texture_gpu(scene, material.specular_texture_index, uv).x);
 }
 
 __device__ Vec3 material_sheen_color_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
@@ -168,6 +199,10 @@ __device__ float material_clearcoat_gpu(const GpuScene& scene, const GpuMaterial
 
 __device__ float material_clearcoat_roughness_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
     return dclamp(material.clearcoat_roughness * sample_texture_gpu(scene, material.clearcoat_roughness_texture_index, uv).y, 0.02f, 1.0f);
+}
+
+__device__ float material_transmission_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    return dclamp(material.transmission * sample_texture_gpu(scene, material.transmission_texture_index, uv).x, 0.0f, 1.0f);
 }
 
 __device__ Vec2 equal_area_sphere_to_square_gpu(Vec3 direction) {
@@ -256,27 +291,33 @@ __device__ Vec3 evaluate_brdf_gpu(const GpuScene& scene, const GpuMaterial& mate
         return {};
     }
     if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
-        return divv(mul(material.albedo, sample_texture_gpu(scene, material.texture_index, uv)), kPi);
+        return divv(mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv))), kPi);
     }
-    if (material.brdf_model != static_cast<int>(BrdfModel::Principled)) {
+    const bool standard_surface = material.brdf_model == static_cast<int>(BrdfModel::StandardSurface);
+    if (material.brdf_model != static_cast<int>(BrdfModel::Principled) && !standard_surface) {
         return {};
     }
 
     const float roughness = material_roughness_gpu(scene, material, uv);
     const float metallic = material_metallic_gpu(scene, material, uv);
+    const float transmission = standard_surface ? material_transmission_gpu(scene, material, uv) : 0.0f;
     const float sheen_roughness = dclamp(material.sheen_roughness * sample_texture_alpha_gpu(scene, material.sheen_roughness_texture_index, uv), 0.01f, 1.0f);
     const float clearcoat = material_clearcoat_gpu(scene, material, uv);
     const float clearcoat_roughness = material_clearcoat_roughness_gpu(scene, material, uv);
     const Vec3 h = dnormalize(add(wi, wo));
     const float ndoth = fmaxf(0.0f, ddot(n, h));
     const float vdoth = fmaxf(0.0f, ddot(wo, h));
-    const Vec3 color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, uv));
-    const Vec3 f0 = dlerp(Vec3{0.04f, 0.04f, 0.04f}, color, metallic);
+    const Vec3 color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
+    const float specular_weight = standard_surface ? material_specular_weight_gpu(scene, material, uv) : 1.0f;
+    const float dielectric_f0 = standard_surface
+        ? powf((1.0f - material.specular_ior) / (1.0f + material.specular_ior), 2.0f) * specular_weight
+        : 0.04f;
+    const Vec3 f0 = dlerp(Vec3{dielectric_f0, dielectric_f0, dielectric_f0}, color, metallic);
     const Vec3 f = fresnel_schlick_gpu(vdoth, f0);
     const float d = ggx_distribution_gpu(ndoth, roughness);
     const float g = smith_ggx_g1_gpu(ndotv, roughness) * smith_ggx_g1_gpu(ndotl, roughness);
     const Vec3 specular = mul(f, d * g / fmaxf(1.0e-6f, 4.0f * ndotv * ndotl));
-    const Vec3 diffuse = divv(mul(color, 1.0f - metallic), kPi);
+    const Vec3 diffuse = divv(mul(color, (1.0f - metallic) * (1.0f - transmission)), kPi);
     const Vec3 sheen = mul(material_sheen_color_gpu(scene, material, uv), charlie_sheen_distribution_gpu(ndoth, sheen_roughness) * sheen_visibility_gpu(ndotv, ndotl));
     const Vec3 coat_f = fresnel_schlick_gpu(vdoth, Vec3{0.04f, 0.04f, 0.04f});
     const float coat_d = ggx_distribution_gpu(ndoth, clearcoat_roughness);
@@ -320,22 +361,25 @@ __device__ float material_pdf_gpu(const GpuScene& scene, const GpuMaterial& mate
     if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
         return diffuse_pdf;
     }
-    if (material.brdf_model != static_cast<int>(BrdfModel::Principled)) {
+    const bool standard_surface = material.brdf_model == static_cast<int>(BrdfModel::StandardSurface);
+    if (material.brdf_model != static_cast<int>(BrdfModel::Principled) && !standard_surface) {
         return 0.0f;
     }
     const float roughness = material_roughness_gpu(scene, material, uv);
     const float metallic = material_metallic_gpu(scene, material, uv);
-    const float spec_prob = dclamp(0.25f + 0.75f * metallic + 0.25f * material_clearcoat_gpu(scene, material, uv), 0.25f, 1.0f);
+    const float transmission = standard_surface ? material_transmission_gpu(scene, material, uv) : 0.0f;
+    const float specular_weight = standard_surface ? material_specular_weight_gpu(scene, material, uv) : 1.0f;
+    const float spec_prob = dclamp(0.05f + 0.20f * specular_weight + 0.75f * metallic + 0.25f * material_clearcoat_gpu(scene, material, uv), 0.05f, 1.0f);
     const Vec3 h = dnormalize(add(wi, wo));
     const float ndoth = fmaxf(0.0f, ddot(n, h));
     const float vdoth = fmaxf(0.0f, ddot(wo, h));
     const float specular_pdf = ggx_distribution_gpu(ndoth, roughness) * ndoth / fmaxf(1.0e-6f, 4.0f * vdoth);
-    return (1.0f - spec_prob) * diffuse_pdf + spec_prob * specular_pdf;
+    return transmission + (1.0f - transmission) * ((1.0f - spec_prob) * diffuse_pdf + spec_prob * specular_pdf);
 }
 
 __device__ GpuMaterialSample sample_material_gpu(const GpuScene& scene, const GpuMaterial& material, Vec3 n, Vec3 wo, Vec2 uv, bool front_face, uint32_t& rng) {
     GpuMaterialSample result;
-    const Vec3 color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, uv));
+    const Vec3 color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
     if (material.brdf_model == static_cast<int>(BrdfModel::Mirror) || material.brdf_model == static_cast<int>(BrdfModel::Conductor)) {
         result.direction = dnormalize(reflect_gpu(wo, n));
         result.weight = material.brdf_model == static_cast<int>(BrdfModel::Mirror) ? Vec3{1.0f, 1.0f, 1.0f} : color;
@@ -356,10 +400,28 @@ __device__ GpuMaterialSample sample_material_gpu(const GpuScene& scene, const Gp
         result.delta = true;
         return result;
     }
-    if (material.brdf_model == static_cast<int>(BrdfModel::Principled)) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface)) {
+        const float trans = material_transmission_gpu(scene, material, uv);
+        if (trans > 0.0f && rng_float(rng) < trans) {
+            const float ior = dclamp(material.specular_ior, 1.0f, 3.0f);
+            const float eta = front_face ? 1.0f / ior : ior;
+            const float cos_theta = fminf(ddot(wo, n), 1.0f);
+            const float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+            const bool cannot_refract = eta * sin_theta > 1.0f;
+            const float reflectance = fresnel_dielectric_gpu(cos_theta, eta);
+            result.direction = (cannot_refract || reflectance > rng_float(rng)) ? dnormalize(reflect_gpu(wo, n)) : refract_gpu(wo, n, eta);
+            result.weight = material.transmission_tint;
+            result.pdf = fmaxf(1.0e-6f, trans);
+            result.delta = true;
+            return result;
+        }
+    }
+    if (material.brdf_model == static_cast<int>(BrdfModel::Principled) || material.brdf_model == static_cast<int>(BrdfModel::StandardSurface)) {
         const float roughness = material_roughness_gpu(scene, material, uv);
         const float metallic = material_metallic_gpu(scene, material, uv);
-        const float spec_prob = dclamp(0.25f + 0.75f * metallic + 0.25f * material_clearcoat_gpu(scene, material, uv), 0.25f, 1.0f);
+        const bool standard_surface = material.brdf_model == static_cast<int>(BrdfModel::StandardSurface);
+        const float specular_weight = standard_surface ? material_specular_weight_gpu(scene, material, uv) : 1.0f;
+        const float spec_prob = dclamp(0.05f + 0.20f * specular_weight + 0.75f * metallic + 0.25f * material_clearcoat_gpu(scene, material, uv), 0.05f, 1.0f);
         if (rng_float(rng) < spec_prob) {
             const Vec3 h = sample_ggx_half_gpu(n, roughness, rng_float(rng), rng_float(rng));
             result.direction = dnormalize(reflect_gpu(wo, h));
@@ -425,68 +487,95 @@ __device__ float mis_weight_gpu(float pdf_a, float pdf_b, int heuristic) {
 
 __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material, Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
     Vec3 direct{};
-    if (scene.light_count <= 0) {
-        return direct;
-    }
-    const int list_index = iclamp_gpu(static_cast<int>(rng_float(rng) * static_cast<float>(scene.light_count)), 0, scene.light_count - 1);
-    const int light_index = scene.light_indices[list_index];
-    if (light_index < 0 || light_index >= scene.triangle_count) {
-        return direct;
-    }
-    const GpuTriangle light = scene.triangles[light_index];
-    Vec3 light_point;
-    const Vec2 light_uv = sample_triangle_uv_gpu(light, rng, light_point);
-    const Vec3 to_light = sub(light_point, hit.position);
-    const float dist2 = ddot(to_light, to_light);
-    if (dist2 <= 1.0e-8f) {
-        return direct;
-    }
-    const float dist = sqrtf(dist2);
-    const Vec3 light_dir = divv(to_light, dist);
-    const float ndotl_raw = ddot(hit.normal, light_dir);
-    const float ndotl = material.double_sided ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
-    const GpuMaterial light_material = scene.materials[light.material];
-    const float ldot_raw = ddot(mul(light.normal, -1.0f), light_dir);
-    const bool mesh_light_double_sided = light.light_double_sided != 0;
-    const bool material_emissive_double_sided = !has_light_emission_gpu(light.emission) && light_material.double_sided && has_light_emission_gpu(material_emission_gpu(scene, light_material, light_uv));
-    const float ldot = mesh_light_double_sided || material_emissive_double_sided ? fabsf(ldot_raw) : fmaxf(0.0f, ldot_raw);
-    if (ndotl <= 0.0f || ldot <= 0.0f) {
-        return direct;
-    }
-    const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
-    Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
-    for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
-        GpuHit shadow_hit;
-        if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
-            break;
+    if (scene.light_count > 0) {
+        const int list_index = iclamp_gpu(static_cast<int>(rng_float(rng) * static_cast<float>(scene.light_count)), 0, scene.light_count - 1);
+        const int light_index = scene.light_indices[list_index];
+        if (light_index >= 0 && light_index < scene.triangle_count) {
+            const GpuTriangle light = scene.triangles[light_index];
+            Vec3 light_point;
+            const Vec2 light_uv = sample_triangle_uv_gpu(light, rng, light_point);
+            const Vec3 to_light = sub(light_point, hit.position);
+            const float dist2 = ddot(to_light, to_light);
+            if (dist2 > 1.0e-8f) {
+                const float dist = sqrtf(dist2);
+                const Vec3 light_dir = divv(to_light, dist);
+                const float ndotl_raw = ddot(hit.normal, light_dir);
+                const float ndotl = material.double_sided ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
+                const GpuMaterial light_material = scene.materials[light.material];
+                const float ldot_raw = ddot(mul(light.normal, -1.0f), light_dir);
+                const bool mesh_light_double_sided = light.light_double_sided != 0;
+                const bool material_emissive_double_sided = !has_light_emission_gpu(light.emission) && light_material.double_sided && has_light_emission_gpu(material_emission_gpu(scene, light_material, light_uv));
+                const float ldot = mesh_light_double_sided || material_emissive_double_sided ? fabsf(ldot_raw) : fmaxf(0.0f, ldot_raw);
+                if (ndotl > 0.0f && ldot > 0.0f) {
+                    bool blocked = false;
+                    const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
+                    Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
+                    for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+                        GpuHit shadow_hit;
+                        if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
+                            break;
+                        }
+                        const float shadow_dist = sqrtf(ddot(sub(shadow_hit.position, hit.position), sub(shadow_hit.position, hit.position)));
+                        if (shadow_dist >= dist - 0.01f || shadow_hit.triangle == light_index) {
+                            break;
+                        }
+                        const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
+                        if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
+                            shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+                            material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
+                            shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
+                            continue;
+                        }
+                        blocked = true;
+                        break;
+                    }
+                    const float light_pmf = 1.0f / static_cast<float>(scene.light_count);
+                    const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, hit.position, light_point, light_pmf);
+                    const Vec3 light_emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, light_uv), light.light_double_sided != 0, light_dir);
+                    if (!blocked && isfinite(light_pdf) && light_pdf > 0.0f && has_light_emission_gpu(light_emission)) {
+                        const float bsdf_pdf = material_pdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv);
+                        if (isfinite(bsdf_pdf) && bsdf_pdf >= 0.0f) {
+                            const float weight = settings.use_mis ? mis_weight_gpu(light_pdf, bsdf_pdf, static_cast<int>(settings.mis_heuristic)) : 1.0f;
+                            direct = add(direct, clamp_sample_radiance_gpu(mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv), light_emission), ndotl * weight / light_pdf)));
+                        }
+                    }
+                }
+            }
         }
-        const float shadow_dist = sqrtf(ddot(sub(shadow_hit.position, hit.position), sub(shadow_hit.position, hit.position)));
-        if (shadow_dist >= dist - 0.01f || shadow_hit.triangle == light_index) {
-            break;
-        }
-        const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
-        if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
-            shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric)) {
-            shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
+    }
+    for (int i = 0; i < scene.directional_light_count; ++i) {
+        const GpuDirectionalLight light = scene.directional_lights[i];
+        if (light.intensity <= 0.0f || ddot(light.direction, light.direction) <= 0.0f) {
             continue;
         }
-        return direct;
+        const Vec3 light_dir = dnormalize(light.direction);
+        const float ndotl_raw = ddot(hit.normal, light_dir);
+        const float ndotl = material.double_sided ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
+        if (ndotl <= 0.0f) {
+            continue;
+        }
+        bool blocked = false;
+        const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
+        Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
+        for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+            GpuHit shadow_hit;
+            if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
+                break;
+            }
+            const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
+            if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
+                shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+                material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
+                shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
+                continue;
+            }
+            blocked = true;
+            break;
+        }
+        if (!blocked) {
+            direct = add(direct, clamp_sample_radiance_gpu(mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv), mul(light.color, light.intensity)), ndotl)));
+        }
     }
-    const float light_pmf = 1.0f / static_cast<float>(scene.light_count);
-    const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, hit.position, light_point, light_pmf);
-    if (!isfinite(light_pdf) || light_pdf <= 0.0f) {
-        return direct;
-    }
-    const float bsdf_pdf = material_pdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv);
-    if (!isfinite(bsdf_pdf) || bsdf_pdf < 0.0f) {
-        return direct;
-    }
-    const float weight = settings.use_mis ? mis_weight_gpu(light_pdf, bsdf_pdf, static_cast<int>(settings.mis_heuristic)) : 1.0f;
-    const Vec3 light_emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, light_uv), light.light_double_sided != 0, light_dir);
-    if (!has_light_emission_gpu(light_emission)) {
-        return direct;
-    }
-    direct = add(direct, clamp_sample_radiance_gpu(mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv), light_emission), ndotl * weight / light_pdf)));
     return direct;
 }
 
@@ -625,7 +714,12 @@ __device__ bool material_uses_irradiance_volume_gi_gpu(const RenderSettings& set
     if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
         return true;
     }
-    return settings.irradiance_volume_principled_gi && material.brdf_model == static_cast<int>(BrdfModel::Principled);
+    if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface) && material.transmission > 0.05f) {
+        return false;
+    }
+    return settings.irradiance_volume_principled_gi &&
+        (material.brdf_model == static_cast<int>(BrdfModel::Principled) ||
+            material.brdf_model == static_cast<int>(BrdfModel::StandardSurface));
 }
 
 __device__ Vec3 shade_material_from_irradiance_volume_gpu(
@@ -635,9 +729,11 @@ __device__ Vec3 shade_material_from_irradiance_volume_gpu(
     const GpuHit& hit,
     Vec3 wo,
     uint32_t& rng) {
-    const Vec3 base_color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, hit.uv));
+    const Vec3 base_color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, hit.uv)));
     const float diffuse_scale = material.brdf_model == static_cast<int>(BrdfModel::Principled)
         ? 1.0f - material_metallic_gpu(scene, material, hit.uv)
+        : material.brdf_model == static_cast<int>(BrdfModel::StandardSurface)
+            ? (1.0f - material_metallic_gpu(scene, material, hit.uv)) * (1.0f - material_transmission_gpu(scene, material, hit.uv))
         : 1.0f;
     const Vec3 irradiance = query_irradiance_volume_gpu(scene.irradiance_volume, hit.position, hit.normal);
     const Vec3 indirect = mul(mul(base_color, diffuse_scale), divv(irradiance, kPi));
@@ -701,8 +797,14 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
     Vec3 previous_position{};
     float previous_bsdf_pdf = 0.0f;
     bool previous_delta = false;
-    for (int bounce = 0; bounce < settings.max_bounces; ++bounce) {
-        const float sample_clamp = bounce == 0 ? 64.0f : 8.0f;
+    int transmission_bounces = 0;
+    constexpr int kExtraTransmissionBounces = 12;
+    for (int bounce = 0; bounce < settings.max_bounces + kExtraTransmissionBounces; ++bounce) {
+        const int shading_bounce = bounce - transmission_bounces;
+        if (shading_bounce >= settings.max_bounces) {
+            break;
+        }
+        const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
         GpuHit hit;
         if (!intersect_gpu(scene, ray, hit)) {
             radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
@@ -723,7 +825,7 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
             const GpuTriangle light = hit.triangle >= 0 && hit.triangle < scene.triangle_count ? scene.triangles[hit.triangle] : GpuTriangle{};
             const GpuMaterial light_material = scene.materials[hit.material];
             const Vec3 emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, hit.uv), light.light_double_sided != 0, ray.direction);
-            if (bounce == 0) {
+            if (shading_bounce == 0) {
                 radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, emission), sample_clamp));
             } else if (previous_delta) {
                 radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, emission), sample_clamp));
@@ -742,7 +844,7 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
             break;
         }
         radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, estimate_direct_gpu(scene, hit, material, wo, rng, settings)), sample_clamp));
-        if (bounce >= 3) {
+        if (shading_bounce >= 3) {
             const float p = dclamp(fmaxf(throughput.x, fmaxf(throughput.y, throughput.z)), 0.05f, 0.95f);
             if (rng_float(rng) > p) {
                 break;
@@ -756,6 +858,9 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
         previous_position = hit.position;
         previous_bsdf_pdf = sample.pdf;
         previous_delta = sample.delta;
+        if (sample.delta && material_transmission_gpu(scene, material, hit.uv) > 0.5f && transmission_bounces < kExtraTransmissionBounces) {
+            ++transmission_bounces;
+        }
         const float offset_side = ddot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;
         ray = {add(hit.position, mul(hit.normal, 0.001f * offset_side)), sample.direction};
         throughput = mul(throughput, sample.weight);

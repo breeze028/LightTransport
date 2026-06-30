@@ -64,10 +64,15 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
         int sheen_roughness_texture_index = -1;
         int clearcoat_texture_index = -1;
         int clearcoat_roughness_texture_index = -1;
+        int transmission_texture_index = -1;
         Vec3 sheen_color;
         float sheen_roughness = 0.0f;
         float clearcoat = 0.0f;
         float clearcoat_roughness = 0.0f;
+        Vec3 transmission_tint = {1.0f, 1.0f, 1.0f};
+        float transmission = 0.0f;
+        float specular_ior = 1.5f;
+        float specular_weight = 1.0f;
         if (const auto* principled = dynamic_cast<const PrincipledMaterial*>(material.get())) {
             roughness = principled->roughness;
             metallic = principled->metallic;
@@ -77,9 +82,39 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
             clearcoat_roughness = principled->clearcoat_roughness;
         } else if (const auto* dielectric = dynamic_cast<const DielectricMaterial*>(material.get())) {
             roughness = dielectric->ior;
+            transmission = 1.0f;
+            specular_ior = dielectric->ior;
+            transmission_tint = dielectric->transmission_tint;
+        } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
+            roughness = standard->roughness;
+            metallic = standard->metalness;
+            sheen_color = standard->sheen_color;
+            sheen_roughness = standard->sheen_roughness;
+            clearcoat = standard->coat_weight;
+            clearcoat_roughness = standard->coat_roughness;
+            transmission = standard->transmission_weight;
+            transmission_tint = standard->transmission_color;
+            specular_ior = standard->specular_ior;
+            specular_weight = standard->specular_weight;
         }
         int texture_index = -1;
         int metallic_roughness_texture_index = -1;
+        int roughness_texture_index = -1;
+        int metallic_texture_index = -1;
+        int specular_texture_index = -1;
+        TextureTransform base_texture_transform;
+        TextureTransform emission_texture_transform;
+        const auto find_texture_index = [&](const std::shared_ptr<Texture>& texture) {
+            if (!texture) {
+                return -1;
+            }
+            for (int t = 0; t < gpu.texture_count; ++t) {
+                if (scene.textures[static_cast<size_t>(t)] == texture) {
+                    return t;
+                }
+            }
+            return -1;
+        };
         if (material->albedo_texture) {
             for (int t = 0; t < gpu.texture_count; ++t) {
                 if (scene.textures[static_cast<size_t>(t)] == material->albedo_texture) {
@@ -97,21 +132,24 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
                     }
                 }
             }
-            const auto find_texture_index = [&](const std::shared_ptr<Texture>& texture) {
-                if (!texture) {
-                    return -1;
-                }
-                for (int t = 0; t < gpu.texture_count; ++t) {
-                    if (scene.textures[static_cast<size_t>(t)] == texture) {
-                        return t;
-                    }
-                }
-                return -1;
-            };
             sheen_color_texture_index = find_texture_index(principled->sheen_color_texture);
             sheen_roughness_texture_index = find_texture_index(principled->sheen_roughness_texture);
             clearcoat_texture_index = find_texture_index(principled->clearcoat_texture);
             clearcoat_roughness_texture_index = find_texture_index(principled->clearcoat_roughness_texture);
+        } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
+            base_texture_transform = standard->base_color_input.transform;
+            emission_texture_transform = standard->emission_input.transform;
+            if (standard->roughness_input.texture && standard->roughness_input.texture == standard->metalness_input.texture) {
+                metallic_roughness_texture_index = find_texture_index(standard->roughness_input.texture);
+            }
+            roughness_texture_index = find_texture_index(standard->roughness_input.texture);
+            metallic_texture_index = find_texture_index(standard->metalness_input.texture);
+            specular_texture_index = find_texture_index(standard->specular_weight_input.texture);
+            sheen_color_texture_index = find_texture_index(standard->sheen_color_input.texture);
+            sheen_roughness_texture_index = find_texture_index(standard->sheen_roughness_input.texture);
+            clearcoat_texture_index = find_texture_index(standard->coat_input.texture);
+            clearcoat_roughness_texture_index = find_texture_index(standard->coat_roughness_input.texture);
+            transmission_texture_index = find_texture_index(standard->transmission_input.texture);
         }
         if (material->normal_texture) {
             for (int t = 0; t < gpu.texture_count; ++t) {
@@ -137,6 +175,12 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
             std::clamp(metallic, 0.0f, 1.0f),
             texture_index,
             metallic_roughness_texture_index,
+            roughness_texture_index,
+            metallic_texture_index,
+            specular_texture_index,
+            base_texture_transform.offset,
+            base_texture_transform.scale,
+            base_texture_transform.rotation,
             sheen_color,
             std::clamp(sheen_roughness, 0.0f, 1.0f),
             sheen_color_texture_index,
@@ -149,7 +193,14 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
             material->normal_scale,
             material->emission,
             emission_texture_index,
-            material->model() == BrdfModel::Dielectric ? dynamic_cast<const DielectricMaterial*>(material.get())->transmission_tint : Vec3{1.0f, 1.0f, 1.0f},
+            emission_texture_transform.offset,
+            emission_texture_transform.scale,
+            emission_texture_transform.rotation,
+            transmission_tint,
+            std::clamp(transmission, 0.0f, 1.0f),
+            transmission_texture_index,
+            std::clamp(specular_ior, 1.0f, 3.0f),
+            std::max(0.0f, specular_weight),
             material->alpha,
             material->alpha_cutoff,
             static_cast<int>(material->alpha_mode),
@@ -393,4 +444,3 @@ bool make_environment_gpu(const Scene& scene, GpuScene& gpu) {
     }
     return false;
 }
-

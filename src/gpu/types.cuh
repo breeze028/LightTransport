@@ -5,6 +5,12 @@ struct GpuMaterial {
     float metallic = 0.0f;
     int texture_index = -1;
     int metallic_roughness_texture_index = -1;
+    int roughness_texture_index = -1;
+    int metallic_texture_index = -1;
+    int specular_texture_index = -1;
+    Vec2 texture_offset = {};
+    Vec2 texture_scale = {1.0f, 1.0f};
+    float texture_rotation = 0.0f;
     Vec3 sheen_color;
     float sheen_roughness = 0.0f;
     int sheen_color_texture_index = -1;
@@ -17,7 +23,14 @@ struct GpuMaterial {
     float normal_scale = 1.0f;
     Vec3 emission;
     int emission_texture_index = -1;
+    Vec2 emission_texture_offset = {};
+    Vec2 emission_texture_scale = {1.0f, 1.0f};
+    float emission_texture_rotation = 0.0f;
     Vec3 transmission_tint = {1.0f, 1.0f, 1.0f};
+    float transmission = 0.0f;
+    int transmission_texture_index = -1;
+    float specular_ior = 1.5f;
+    float specular_weight = 1.0f;
     float alpha = 1.0f;
     float alpha_cutoff = 0.5f;
     int alpha_mode = 0;

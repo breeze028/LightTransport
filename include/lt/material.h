@@ -15,6 +15,7 @@ enum class BrdfModel {
     Mirror = 2,
     Dielectric = 3,
     Conductor = 4,
+    StandardSurface = 5,
 };
 
 enum class AlphaMode {
@@ -71,6 +72,31 @@ struct MaterialSample {
     bool delta = false;
 };
 
+enum class MaterialInputChannel {
+    RGB = 0,
+    R = 1,
+    G = 2,
+    B = 3,
+    A = 4,
+};
+
+struct TextureTransform {
+    Vec2 offset = {};
+    Vec2 scale = {1.0f, 1.0f};
+    float rotation = 0.0f;
+    int uv_set = 0;
+};
+
+struct MaterialInput {
+    std::shared_ptr<Texture> texture;
+    Vec3 color_factor = {1.0f, 1.0f, 1.0f};
+    float scalar_factor = 1.0f;
+    MaterialInputChannel channel = MaterialInputChannel::RGB;
+    TextureColorSpace color_space = TextureColorSpace::Auto;
+    TextureRole role = TextureRole::Unknown;
+    TextureTransform transform;
+};
+
 class Material {
 public:
     std::string name = "mat";
@@ -93,8 +119,9 @@ public:
     virtual BrdfModel model() const = 0;
     virtual const char* model_name() const = 0;
     Vec3 base_color(Vec2 uv) const;
-    float opacity(Vec2 uv) const;
-    Vec3 emitted(Vec2 uv) const;
+    virtual float opacity(Vec2 uv) const;
+    virtual Vec3 emitted(Vec2 uv) const;
+    virtual float transmission(Vec2) const { return 0.0f; }
     virtual Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const = 0;
     virtual float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const = 0;
     virtual MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const = 0;
@@ -184,6 +211,62 @@ public:
     float pdf(Vec3, Vec3, Vec3, Vec2) const override { return 0.0f; }
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<ConductorMaterial>(*this); }
+};
+
+class StandardSurfaceMaterial final : public Material {
+public:
+    float roughness = 0.5f;
+    float metalness = 0.0f;
+    float specular_weight = 1.0f;
+    float specular_ior = 1.5f;
+    float transmission_weight = 0.0f;
+    Vec3 transmission_color = {1.0f, 1.0f, 1.0f};
+    float coat_weight = 0.0f;
+    float coat_roughness = 0.0f;
+    Vec3 sheen_color = {};
+    float sheen_weight = 0.0f;
+    float sheen_roughness = 0.0f;
+    float subsurface_weight = 0.0f;
+    Vec3 subsurface_color = {1.0f, 1.0f, 1.0f};
+    float volume_density = 0.0f;
+    Vec3 volume_color = {1.0f, 1.0f, 1.0f};
+    bool thin_walled = false;
+    bool unsupported_volume = false;
+    bool unsupported_subsurface = false;
+
+    MaterialInput base_color_input;
+    MaterialInput roughness_input;
+    MaterialInput metalness_input;
+    MaterialInput specular_weight_input;
+    MaterialInput transmission_input;
+    MaterialInput opacity_input;
+    MaterialInput emission_input;
+    MaterialInput coat_input;
+    MaterialInput coat_roughness_input;
+    MaterialInput sheen_color_input;
+    MaterialInput sheen_roughness_input;
+
+    StandardSurfaceMaterial() = default;
+    StandardSurfaceMaterial(std::string name_, Vec3 albedo_, float roughness_, float metalness_)
+        : Material(std::move(name_), albedo_), roughness(roughness_), metalness(metalness_) {}
+
+    BrdfModel model() const override { return BrdfModel::StandardSurface; }
+    const char* model_name() const override { return "standard_surface"; }
+    Vec3 standard_base_color(Vec2 uv) const;
+    Vec3 emitted(Vec2 uv) const override;
+    float opacity(Vec2 uv) const override;
+    float roughness_at(Vec2 uv) const;
+    float metalness_at(Vec2 uv) const;
+    float specular_weight_at(Vec2 uv) const;
+    float transmission(Vec2 uv) const override;
+    float coat_at(Vec2 uv) const;
+    float coat_roughness_at(Vec2 uv) const;
+    Vec3 sheen_color_at(Vec2 uv) const;
+    float sheen_roughness_at(Vec2 uv) const;
+    Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
+    float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
+    MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
+    std::shared_ptr<Material> clone() const override { return std::make_shared<StandardSurfaceMaterial>(*this); }
 };
 
 std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, BrdfModel model, float roughness, float metallic);

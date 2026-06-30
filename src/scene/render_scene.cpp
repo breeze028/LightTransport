@@ -188,10 +188,15 @@ RenderScene build_render_scene(const Scene& scene) {
             render_scene.triangle_indices.push_back(triangle_index);
 
             Vec3 material_emission;
+            bool material_emission_texture = false;
             if (mesh.material >= 0 && mesh.material < static_cast<int>(scene.materials.size()) && scene.materials[static_cast<size_t>(mesh.material)]) {
-                material_emission = scene.materials[static_cast<size_t>(mesh.material)]->emission;
+                const std::shared_ptr<Material>& material = scene.materials[static_cast<size_t>(mesh.material)];
+                material_emission = material->emission;
+                material_emission_texture = material->emission_texture != nullptr;
             }
-            if ((mesh.light.enabled && mesh.light.intensity > 0.0f) || scene_detail::has_light_emission(material_emission)) {
+            if ((mesh.light.enabled && mesh.light.intensity > 0.0f) ||
+                scene_detail::has_light_emission(material_emission) ||
+                material_emission_texture) {
                 render_scene.light_triangle_indices.push_back(triangle_index);
             }
         }

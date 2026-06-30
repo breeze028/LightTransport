@@ -67,6 +67,97 @@ float principled_specular_probability(float metallic) {
     return std::clamp(0.25f + 0.75f * metallic, 0.25f, 1.0f);
 }
 
+Vec2 transform_material_uv(const MaterialInput& input, Vec2 uv) {
+    uv.x *= input.transform.scale.x;
+    uv.y *= input.transform.scale.y;
+    if (input.transform.rotation != 0.0f) {
+        const float c = std::cos(input.transform.rotation);
+        const float s = std::sin(input.transform.rotation);
+        uv = {uv.x * c - uv.y * s, uv.x * s + uv.y * c};
+    }
+    uv.x += input.transform.offset.x;
+    uv.y += input.transform.offset.y;
+    return uv;
+}
+
+float material_input_scalar(const MaterialInput& input, Vec2 uv, float fallback = 1.0f) {
+    if (!input.texture) {
+        return input.scalar_factor * fallback;
+    }
+    uv = transform_material_uv(input, uv);
+    if (input.channel == MaterialInputChannel::A) {
+        return input.scalar_factor * input.texture->sample_alpha(uv);
+    }
+    const Vec3 sample = input.texture->sample(uv);
+    float value = sample.x;
+    if (input.channel == MaterialInputChannel::G) {
+        value = sample.y;
+    } else if (input.channel == MaterialInputChannel::B) {
+        value = sample.z;
+    } else if (input.channel == MaterialInputChannel::RGB) {
+        value = (sample.x + sample.y + sample.z) / 3.0f;
+    }
+    return input.scalar_factor * value;
+}
+
+Vec3 material_input_color(const MaterialInput& input, Vec2 uv, Vec3 fallback = {1.0f, 1.0f, 1.0f}) {
+    if (!input.texture) {
+        return input.color_factor * fallback;
+    }
+    uv = transform_material_uv(input, uv);
+    Vec3 sample = input.texture->sample(uv);
+    if (input.channel == MaterialInputChannel::A) {
+        sample = Vec3{input.texture->sample_alpha(uv)};
+    } else if (input.channel == MaterialInputChannel::R) {
+        sample = Vec3{sample.x};
+    } else if (input.channel == MaterialInputChannel::G) {
+        sample = Vec3{sample.y};
+    } else if (input.channel == MaterialInputChannel::B) {
+        sample = Vec3{sample.z};
+    }
+    return input.color_factor * sample;
+}
+
+Vec3 evaluate_standard_surface_lobes(
+    Vec3 n,
+    Vec3 wo,
+    Vec3 wi,
+    Vec3 color,
+    float roughness,
+    float metalness,
+    float transmission,
+    float specular_weight,
+    float specular_ior,
+    Vec3 sheen_color,
+    float sheen_weight,
+    float sheen_roughness,
+    float coat,
+    float coat_roughness) {
+    const float ndotv = std::max(0.0f, dot(n, wo));
+    const float ndotl = std::max(0.0f, dot(n, wi));
+    if (ndotv <= 0.0f || ndotl <= 0.0f) {
+        return {};
+    }
+
+    const Vec3 h = normalize(wi + wo);
+    const float ndoth = std::max(0.0f, dot(n, h));
+    const float vdoth = std::max(0.0f, dot(wo, h));
+    const float clamped_ior = std::clamp(specular_ior, 1.0f, 3.0f);
+    const float dielectric_f0 = std::pow((1.0f - clamped_ior) / (1.0f + clamped_ior), 2.0f);
+    const Vec3 f0 = lerp(Vec3{dielectric_f0 * specular_weight}, color, metalness);
+    const Vec3 f = fresnel_schlick(vdoth, f0);
+    const float d = ggx_distribution(ndoth, roughness);
+    const float g = smith_ggx_g1(ndotv, roughness) * smith_ggx_g1(ndotl, roughness);
+    const Vec3 specular = f * (d * g / std::max(1.0e-6f, 4.0f * ndotv * ndotl));
+    const Vec3 diffuse = color * ((1.0f - metalness) * (1.0f - transmission)) / kPi;
+    const Vec3 sheen = sheen_color * (sheen_weight * charlie_sheen_distribution(ndoth, sheen_roughness) * sheen_visibility(ndotv, ndotl));
+    const Vec3 coat_f = fresnel_schlick(vdoth, Vec3{0.04f});
+    const float coat_d = ggx_distribution(ndoth, coat_roughness);
+    const float coat_g = smith_ggx_g1(ndotv, coat_roughness) * smith_ggx_g1(ndotl, coat_roughness);
+    const Vec3 clearcoat_lobe = coat_f * (coat * coat_d * coat_g / std::max(1.0e-6f, 4.0f * ndotv * ndotl));
+    return diffuse + specular + sheen + clearcoat_lobe;
+}
+
 } // namespace
 
 Vec3 Material::base_color(Vec2 uv) const {
@@ -230,7 +321,145 @@ MaterialSample ConductorMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng&) c
     return result;
 }
 
+Vec3 StandardSurfaceMaterial::standard_base_color(Vec2 uv) const {
+    if (base_color_input.texture) {
+        return albedo * material_input_color(base_color_input, uv);
+    }
+    return base_color(uv);
+}
+
+Vec3 StandardSurfaceMaterial::emitted(Vec2 uv) const {
+    if (emission_input.texture) {
+        return emission * material_input_color(emission_input, uv);
+    }
+    return Material::emitted(uv);
+}
+
+float StandardSurfaceMaterial::opacity(Vec2 uv) const {
+    return std::clamp(Material::opacity(uv) * material_input_scalar(opacity_input, uv), 0.0f, 1.0f);
+}
+
+float StandardSurfaceMaterial::roughness_at(Vec2 uv) const {
+    return std::clamp(roughness * material_input_scalar(roughness_input, uv), 0.02f, 1.0f);
+}
+
+float StandardSurfaceMaterial::metalness_at(Vec2 uv) const {
+    return std::clamp(metalness * material_input_scalar(metalness_input, uv), 0.0f, 1.0f);
+}
+
+float StandardSurfaceMaterial::specular_weight_at(Vec2 uv) const {
+    return std::max(0.0f, specular_weight * material_input_scalar(specular_weight_input, uv));
+}
+
+float StandardSurfaceMaterial::transmission(Vec2 uv) const {
+    return std::clamp(transmission_weight * material_input_scalar(transmission_input, uv), 0.0f, 1.0f);
+}
+
+float StandardSurfaceMaterial::coat_at(Vec2 uv) const {
+    return std::clamp(coat_weight * material_input_scalar(coat_input, uv), 0.0f, 1.0f);
+}
+
+float StandardSurfaceMaterial::coat_roughness_at(Vec2 uv) const {
+    return std::clamp(coat_roughness * material_input_scalar(coat_roughness_input, uv), 0.02f, 1.0f);
+}
+
+Vec3 StandardSurfaceMaterial::sheen_color_at(Vec2 uv) const {
+    return sheen_color_input.texture ? material_input_color(sheen_color_input, uv, sheen_color) : sheen_color;
+}
+
+float StandardSurfaceMaterial::sheen_roughness_at(Vec2 uv) const {
+    return std::clamp(sheen_roughness * material_input_scalar(sheen_roughness_input, uv), 0.01f, 1.0f);
+}
+
+Vec3 StandardSurfaceMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
+    if (ndotv <= 0.0f || ndotl <= 0.0f) {
+        return {};
+    }
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    return evaluate_standard_surface_lobes(
+        facing_n,
+        wo,
+        wi,
+        standard_base_color(uv),
+        roughness_at(uv),
+        metalness_at(uv),
+        transmission(uv),
+        specular_weight_at(uv),
+        specular_ior,
+        sheen_color_at(uv),
+        sheen_weight,
+        sheen_roughness_at(uv),
+        coat_at(uv),
+        coat_roughness_at(uv));
+}
+
+float StandardSurfaceMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
+    if (ndotl <= 0.0f || ndotv <= 0.0f) {
+        return 0.0f;
+    }
+    const float transmission_prob = transmission(uv);
+    if (transmission_prob >= 0.999f) {
+        return 1.0f;
+    }
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    const float diffuse_pdf = std::max(0.0f, dot(facing_n, wi)) / kPi;
+    const float r = roughness_at(uv);
+    const float m = metalness_at(uv);
+    const float spec_prob = std::clamp(0.05f + 0.20f * specular_weight_at(uv) + 0.75f * m + 0.25f * coat_at(uv), 0.05f, 1.0f);
+    const Vec3 h = normalize(wi + wo);
+    const float ndoth = std::max(0.0f, dot(facing_n, h));
+    const float vdoth = std::max(0.0f, dot(wo, h));
+    const float specular_pdf = ggx_distribution(ndoth, r) * ndoth / std::max(1.0e-6f, 4.0f * vdoth);
+    return transmission_prob + (1.0f - transmission_prob) * ((1.0f - spec_prob) * diffuse_pdf + spec_prob * specular_pdf);
+}
+
+MaterialSample StandardSurfaceMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const {
+    MaterialSample result;
+    const float trans = transmission(uv);
+    const Vec3 color = standard_base_color(uv);
+    (void)color;
+    const Vec3 tint = transmission_color;
+    if (trans > 0.0f && rng.next_float() < trans) {
+        const float ior = std::clamp(specular_ior, 1.0f, 3.0f);
+        const float eta = front_face ? 1.0f / ior : ior;
+        const float cos_theta = std::min(dot(wo, n), 1.0f);
+        const float sin_theta = std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+        const bool cannot_refract = eta * sin_theta > 1.0f;
+        const float reflectance = fresnel_dielectric(cos_theta, eta);
+        result.direction = (cannot_refract || reflectance > rng.next_float()) ? normalize(reflect(wo, n)) : refract(wo, n, eta);
+        result.weight = tint;
+        result.pdf = std::max(1.0e-6f, trans);
+        result.delta = true;
+        return result;
+    }
+
+    const float r = roughness_at(uv);
+    const float m = metalness_at(uv);
+    const float spec_prob = std::clamp(0.05f + 0.20f * specular_weight_at(uv) + 0.75f * m + 0.25f * coat_at(uv), 0.05f, 1.0f);
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    if (rng.next_float() < spec_prob) {
+        const Vec3 h = sample_ggx_half(facing_n, r, rng.next_float(), rng.next_float());
+        result.direction = normalize(reflect(wo, h));
+        if (dot(result.direction, facing_n) <= 0.0f) {
+            result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), facing_n));
+        }
+    } else {
+        result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), facing_n));
+    }
+    result.pdf = pdf(n, wo, result.direction, uv);
+    const float ndotl = std::max(0.0f, dot(facing_n, result.direction));
+    result.weight = result.pdf > 0.0f ? evaluate(n, wo, result.direction, uv) * (ndotl / result.pdf) : Vec3{};
+    return result;
+}
+
 std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, BrdfModel model, float roughness, float metallic) {
+    if (model == BrdfModel::StandardSurface) {
+        return std::make_shared<StandardSurfaceMaterial>(name, albedo, std::clamp(roughness, 0.02f, 1.0f), std::clamp(metallic, 0.0f, 1.0f));
+    }
     if (model == BrdfModel::Principled) {
         return std::make_shared<PrincipledMaterial>(name, albedo, std::clamp(roughness, 0.02f, 1.0f), std::clamp(metallic, 0.0f, 1.0f));
     }
@@ -247,6 +476,7 @@ std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, Br
 }
 
 BrdfModel parse_brdf_model(const std::string& name) {
+    if (name == "standard_surface" || name == "standard-surface" || name == "openpbr" || name == "open_pbr") return BrdfModel::StandardSurface;
     if (name == "principled" || name == "cook_torrance" || name == "cook-torrance" || name == "ggx") return BrdfModel::Principled;
     if (name == "mirror" || name == "specular") return BrdfModel::Mirror;
     if (name == "dielectric" || name == "glass") return BrdfModel::Dielectric;

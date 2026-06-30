@@ -93,6 +93,66 @@ const char* alpha_mode_name(AlphaMode mode) {
     }
 }
 
+TextureRole parse_texture_role_name(const std::string& name) {
+    if (name == "color") return TextureRole::Color;
+    if (name == "data" || name == "raw") return TextureRole::Data;
+    if (name == "normal") return TextureRole::Normal;
+    if (name == "emission" || name == "emissive") return TextureRole::Emission;
+    if (name == "environment") return TextureRole::Environment;
+    return TextureRole::Unknown;
+}
+
+const char* texture_role_name(TextureRole role) {
+    switch (role) {
+    case TextureRole::Color: return "color";
+    case TextureRole::Data: return "data";
+    case TextureRole::Normal: return "normal";
+    case TextureRole::Emission: return "emission";
+    case TextureRole::Environment: return "environment";
+    case TextureRole::Unknown:
+    default:
+        return "unknown";
+    }
+}
+
+TextureColorSpace parse_texture_color_space_name(const std::string& name) {
+    if (name == "scene_linear" || name == "linear") return TextureColorSpace::SceneLinear;
+    if (name == "srgb" || name == "sRGB") return TextureColorSpace::SRGB;
+    if (name == "raw" || name == "data") return TextureColorSpace::Raw;
+    return TextureColorSpace::Auto;
+}
+
+const char* texture_color_space_name(TextureColorSpace color_space) {
+    switch (color_space) {
+    case TextureColorSpace::SceneLinear: return "scene_linear";
+    case TextureColorSpace::SRGB: return "srgb";
+    case TextureColorSpace::Raw: return "raw";
+    case TextureColorSpace::Auto:
+    default:
+        return "auto";
+    }
+}
+
+MaterialInputChannel parse_material_input_channel_name(const std::string& name) {
+    if (name == "r" || name == "R") return MaterialInputChannel::R;
+    if (name == "g" || name == "G") return MaterialInputChannel::G;
+    if (name == "b" || name == "B") return MaterialInputChannel::B;
+    if (name == "a" || name == "A" || name == "alpha") return MaterialInputChannel::A;
+    return MaterialInputChannel::RGB;
+}
+
+const char* material_input_channel_name(MaterialInputChannel channel) {
+    switch (channel) {
+    case MaterialInputChannel::R: return "r";
+    case MaterialInputChannel::G: return "g";
+    case MaterialInputChannel::B: return "b";
+    case MaterialInputChannel::A: return "a";
+    case MaterialInputChannel::RGB:
+    default:
+        return "rgb";
+    }
+}
+
 bool has_nonzero(Vec3 value) {
     return value.x != 0.0f || value.y != 0.0f || value.z != 0.0f;
 }
@@ -108,15 +168,76 @@ bool has_nondefault_material_properties(const Material& material) {
 
 bool assign_material_texture(Material& material, const std::string& slot, const std::shared_ptr<Texture>& texture) {
     if (slot == "albedo" || slot == "base_color" || slot == "baseColor") {
+        if (texture) {
+            apply_texture_role(*texture, TextureRole::Color, TextureColorSpace::SRGB);
+        }
         material.albedo_texture = texture;
+        if (auto* standard = dynamic_cast<StandardSurfaceMaterial*>(&material)) {
+            standard->base_color_input.texture = texture;
+            standard->base_color_input.role = TextureRole::Color;
+            standard->base_color_input.color_space = TextureColorSpace::SceneLinear;
+        }
         return true;
     }
     if (slot == "normal") {
+        if (texture) {
+            apply_texture_role(*texture, TextureRole::Normal, TextureColorSpace::Raw);
+        }
         material.normal_texture = texture;
         return true;
     }
     if (slot == "emission" || slot == "emissive") {
+        if (texture) {
+            apply_texture_role(*texture, TextureRole::Emission, TextureColorSpace::SRGB);
+        }
         material.emission_texture = texture;
+        if (auto* standard = dynamic_cast<StandardSurfaceMaterial*>(&material)) {
+            standard->emission_input.texture = texture;
+            standard->emission_input.role = TextureRole::Emission;
+            standard->emission_input.color_space = TextureColorSpace::SceneLinear;
+        }
+        return true;
+    }
+    if (auto* standard = dynamic_cast<StandardSurfaceMaterial*>(&material)) {
+        if (texture) {
+            apply_texture_role(*texture, TextureRole::Data, TextureColorSpace::Raw);
+        }
+        if (slot == "metallic_roughness" || slot == "metallicRoughness") {
+            standard->roughness_input.texture = texture;
+            standard->roughness_input.channel = MaterialInputChannel::G;
+            standard->metalness_input.texture = texture;
+            standard->metalness_input.channel = MaterialInputChannel::B;
+        } else if (slot == "roughness") {
+            standard->roughness_input.texture = texture;
+            standard->roughness_input.channel = MaterialInputChannel::R;
+        } else if (slot == "metalness" || slot == "metallic") {
+            standard->metalness_input.texture = texture;
+            standard->metalness_input.channel = MaterialInputChannel::R;
+        } else if (slot == "transmission") {
+            standard->transmission_input.texture = texture;
+            standard->transmission_input.channel = MaterialInputChannel::R;
+        } else if (slot == "opacity") {
+            standard->opacity_input.texture = texture;
+            standard->opacity_input.channel = MaterialInputChannel::A;
+        } else if (slot == "coat" || slot == "clearcoat") {
+            standard->coat_input.texture = texture;
+            standard->coat_input.channel = MaterialInputChannel::R;
+        } else if (slot == "coat_roughness" || slot == "clearcoat_roughness") {
+            standard->coat_roughness_input.texture = texture;
+            standard->coat_roughness_input.channel = MaterialInputChannel::G;
+        } else if (slot == "sheen_color") {
+            if (texture) {
+                apply_texture_role(*texture, TextureRole::Color, TextureColorSpace::SRGB);
+            }
+            standard->sheen_color_input.texture = texture;
+            standard->sheen_color_input.role = TextureRole::Color;
+            standard->sheen_color_input.color_space = TextureColorSpace::SceneLinear;
+        } else if (slot == "sheen_roughness") {
+            standard->sheen_roughness_input.texture = texture;
+            standard->sheen_roughness_input.channel = MaterialInputChannel::A;
+        } else {
+            return false;
+        }
         return true;
     }
     auto* principled = dynamic_cast<PrincipledMaterial*>(&material);
@@ -139,10 +260,65 @@ bool assign_material_texture(Material& material, const std::string& slot, const 
     return true;
 }
 
+MaterialInput* standard_material_input_for_slot(StandardSurfaceMaterial& material, const std::string& slot) {
+    if (slot == "base_color" || slot == "baseColor" || slot == "albedo") return &material.base_color_input;
+    if (slot == "roughness") return &material.roughness_input;
+    if (slot == "metalness" || slot == "metallic") return &material.metalness_input;
+    if (slot == "specular" || slot == "specular_weight") return &material.specular_weight_input;
+    if (slot == "transmission") return &material.transmission_input;
+    if (slot == "opacity") return &material.opacity_input;
+    if (slot == "emission" || slot == "emissive") return &material.emission_input;
+    if (slot == "coat" || slot == "clearcoat") return &material.coat_input;
+    if (slot == "coat_roughness" || slot == "clearcoat_roughness") return &material.coat_roughness_input;
+    if (slot == "sheen_color") return &material.sheen_color_input;
+    if (slot == "sheen_roughness") return &material.sheen_roughness_input;
+    return nullptr;
+}
+
+const MaterialInput* standard_material_input_for_slot(const StandardSurfaceMaterial& material, const std::string& slot) {
+    return standard_material_input_for_slot(const_cast<StandardSurfaceMaterial&>(material), slot);
+}
+
+bool assign_standard_material_input(StandardSurfaceMaterial& material, const std::string& slot, MaterialInput input) {
+    MaterialInput* target = standard_material_input_for_slot(material, slot);
+    if (!target) {
+        return false;
+    }
+    if (input.texture) {
+        apply_texture_role(*input.texture, input.role, input.color_space);
+    }
+    *target = std::move(input);
+    if (slot == "base_color" || slot == "baseColor" || slot == "albedo") {
+        material.albedo_texture = target->texture;
+    } else if (slot == "normal") {
+        material.normal_texture = target->texture;
+    } else if (slot == "emission" || slot == "emissive") {
+        material.emission_texture = target->texture;
+    }
+    return true;
+}
+
 void write_material_texture(std::ostream& output, const Material& material, const char* slot, const std::shared_ptr<Texture>& texture) {
     if (texture) {
         output << "material_texture " << material.name << ' ' << slot << ' ' << texture->name << '\n';
     }
+}
+
+void write_material_input(std::ostream& output, const StandardSurfaceMaterial& material, const char* slot, const MaterialInput& input) {
+    if (!input.texture) {
+        return;
+    }
+    output << "material_input " << material.name << ' ' << slot << ' '
+        << input.texture->name << ' '
+        << texture_role_name(input.role) << ' '
+        << texture_color_space_name(input.color_space) << ' '
+        << material_input_channel_name(input.channel) << ' '
+        << input.scalar_factor << ' '
+        << input.color_factor.x << ' ' << input.color_factor.y << ' ' << input.color_factor.z << ' '
+        << input.transform.uv_set << ' '
+        << input.transform.offset.x << ' ' << input.transform.offset.y << ' '
+        << input.transform.scale.x << ' ' << input.transform.scale.y << ' '
+        << input.transform.rotation << '\n';
 }
 
 void parse_npr_settings(const std::vector<std::string>& tokens, NprSettings& npr) {
@@ -272,6 +448,26 @@ SceneLoadResult load_scene(const std::string& path) {
     }
 
     const std::string extension = lowercase_extension(path);
+    if (extension == ".fbx") {
+        SceneLoadResult result = load_fbx_scene(path);
+        if (result.error.empty()) {
+            LT_LOG_INFO("Loaded FBX scene '{}' (meshes={}, spheres={}, materials={}, textures={})",
+                path, result.scene.meshes.size(), result.scene.spheres.size(), result.scene.materials.size(), result.scene.textures.size());
+        } else {
+            LT_LOG_ERROR("Failed to load FBX scene '{}': {}", path, result.error);
+        }
+        return result;
+    }
+    if (extension == ".pyscene") {
+        SceneLoadResult result = load_pyscene_scene(path);
+        if (result.error.empty()) {
+            LT_LOG_INFO("Loaded pyscene '{}' (meshes={}, spheres={}, materials={}, textures={})",
+                path, result.scene.meshes.size(), result.scene.spheres.size(), result.scene.materials.size(), result.scene.textures.size());
+        } else {
+            LT_LOG_ERROR("Failed to load pyscene '{}': {}", path, result.error);
+        }
+        return result;
+    }
     if (extension == ".glb" || extension == ".gltf") {
         SceneLoadResult result = load_gltf_scene(path);
         if (result.error.empty()) {
@@ -480,7 +676,12 @@ SceneLoadResult load_scene(const std::string& path) {
             material_ids[material_name] = static_cast<int>(scene.materials.size());
             std::shared_ptr<Material> material = make_material(material_name, albedo, brdf, roughness, metallic);
             const std::string texture_name = remaining_tokens.size() >= 4 ? remaining_tokens[3] : std::string{};
-            material->albedo_texture = texture_name.empty() ? nullptr : find_texture(scene, texture_name);
+            if (!texture_name.empty()) {
+                std::shared_ptr<Texture> texture = find_texture(scene, texture_name);
+                if (texture) {
+                    assign_material_texture(*material, "base_color", texture);
+                }
+            }
             scene.materials.push_back(material);
             material_texture_names.push_back(texture_name);
             legacy_material_emissions.push_back(legacy_emission);
@@ -529,6 +730,48 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!assign_material_texture(*scene.materials[static_cast<size_t>(index)], slot, texture)) {
                 return fail("Unknown material_texture slot '" + slot + "' at line " + std::to_string(line_number));
             }
+        } else if (tag == "material_input") {
+            std::string material_name;
+            std::string slot;
+            std::string texture_name;
+            std::string role_name;
+            std::string color_space_name;
+            std::string channel_name;
+            MaterialInput material_input;
+            input >> material_name >> slot >> texture_name >> role_name >> color_space_name >> channel_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid material_input at line " + std::to_string(line_number));
+            }
+            auto* standard = dynamic_cast<StandardSurfaceMaterial*>(scene.materials[static_cast<size_t>(index)].get());
+            if (!standard) {
+                return fail("material_input used on non-standard-surface material at line " + std::to_string(line_number));
+            }
+            if (texture_name != "none") {
+                material_input.texture = find_texture(scene, texture_name);
+                if (!material_input.texture) {
+                    return fail("Unknown material_input texture '" + texture_name + "' at line " + std::to_string(line_number));
+                }
+            }
+            material_input.role = parse_texture_role_name(role_name);
+            material_input.color_space = parse_texture_color_space_name(color_space_name);
+            material_input.channel = parse_material_input_channel_name(channel_name);
+            input >> material_input.scalar_factor
+                >> material_input.color_factor.x
+                >> material_input.color_factor.y
+                >> material_input.color_factor.z
+                >> material_input.transform.uv_set
+                >> material_input.transform.offset.x
+                >> material_input.transform.offset.y
+                >> material_input.transform.scale.x
+                >> material_input.transform.scale.y
+                >> material_input.transform.rotation;
+            if (!input) {
+                return fail("Invalid material_input values at line " + std::to_string(line_number));
+            }
+            if (!assign_standard_material_input(*standard, slot, std::move(material_input))) {
+                return fail("Unknown material_input slot '" + slot + "' at line " + std::to_string(line_number));
+            }
         } else if (tag == "principled_properties") {
             std::string material_name;
             input >> material_name;
@@ -567,6 +810,44 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!input) {
                 return fail("Invalid dielectric_properties at line " + std::to_string(line_number));
             }
+        } else if (tag == "standard_surface") {
+            std::string material_name;
+            input >> material_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid standard_surface material at line " + std::to_string(line_number));
+            }
+            auto* standard = dynamic_cast<StandardSurfaceMaterial*>(scene.materials[static_cast<size_t>(index)].get());
+            if (!standard) {
+                return fail("standard_surface used on non-standard-surface material at line " + std::to_string(line_number));
+            }
+            input >> standard->specular_weight
+                >> standard->specular_ior
+                >> standard->transmission_weight
+                >> standard->transmission_color.x
+                >> standard->transmission_color.y
+                >> standard->transmission_color.z
+                >> standard->coat_weight
+                >> standard->coat_roughness
+                >> standard->sheen_color.x
+                >> standard->sheen_color.y
+                >> standard->sheen_color.z
+                >> standard->sheen_weight
+                >> standard->sheen_roughness
+                >> standard->subsurface_weight
+                >> standard->volume_density;
+            if (!input) {
+                return fail("Invalid standard_surface values at line " + std::to_string(line_number));
+            }
+            standard->specular_weight = std::max(0.0f, standard->specular_weight);
+            standard->specular_ior = std::clamp(standard->specular_ior, 1.0f, 3.0f);
+            standard->transmission_weight = std::clamp(standard->transmission_weight, 0.0f, 1.0f);
+            standard->coat_weight = std::clamp(standard->coat_weight, 0.0f, 1.0f);
+            standard->coat_roughness = std::clamp(standard->coat_roughness, 0.0f, 1.0f);
+            standard->sheen_weight = std::clamp(standard->sheen_weight, 0.0f, 1.0f);
+            standard->sheen_roughness = std::clamp(standard->sheen_roughness, 0.0f, 1.0f);
+            standard->unsupported_subsurface = standard->subsurface_weight > 0.0f;
+            standard->unsupported_volume = standard->volume_density > 0.0f;
         } else if (tag == "npr") {
             std::string material_name;
             std::string style_name;
@@ -601,6 +882,10 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!input || sphere.material < 0 || sphere.radius <= 0.0f) {
                 return fail("Invalid sphere at line " + std::to_string(line_number));
             }
+            int exclude_from_irradiance_volume_bake = 0;
+            if (input >> exclude_from_irradiance_volume_bake) {
+                sphere.exclude_from_irradiance_volume_bake = exclude_from_irradiance_volume_bake != 0;
+            }
             scene.spheres.push_back(sphere);
             scene.uses_builtin_default_meshes = false;
         } else if (tag == "mesh") {
@@ -617,10 +902,18 @@ SceneLoadResult load_scene(const std::string& path) {
                 std::istringstream retry(line);
                 retry >> tag >> mesh.name >> material_name >> mesh.translation.x >> mesh.translation.y >> mesh.translation.z >>
                     mesh.rotation.x >> mesh.rotation.y >> mesh.rotation.z >> mesh.scale.x >> vertex_count >> triangle_count;
+                int exclude_from_irradiance_volume_bake = 0;
+                if (retry >> exclude_from_irradiance_volume_bake) {
+                    mesh.exclude_from_irradiance_volume_bake = exclude_from_irradiance_volume_bake != 0;
+                }
             }
             mesh.material = material_id(material_ids, material_name);
             if (!input || mesh.material < 0 || vertex_count < 0 || triangle_count < 0) {
                 return fail("Invalid mesh header at line " + std::to_string(line_number));
+            }
+            int exclude_from_irradiance_volume_bake = 0;
+            if (input >> exclude_from_irradiance_volume_bake) {
+                mesh.exclude_from_irradiance_volume_bake = exclude_from_irradiance_volume_bake != 0;
             }
 
             for (int i = 0; i < vertex_count; ++i) {
@@ -846,6 +1139,9 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             metallic = principled->metallic;
         } else if (const auto* dielectric = dynamic_cast<const DielectricMaterial*>(material.get())) {
             roughness = dielectric->ior;
+        } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
+            roughness = standard->roughness;
+            metallic = standard->metalness;
         }
         output << "material " << material->name << ' '
             << material->albedo.x << ' ' << material->albedo.y << ' ' << material->albedo.z << ' '
@@ -900,6 +1196,48 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
                     << dielectric->transmission_tint.y << ' '
                     << dielectric->transmission_tint.z << '\n';
             }
+        } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
+            if (standard->specular_weight != 1.0f ||
+                standard->specular_ior != 1.5f ||
+                standard->transmission_weight != 0.0f ||
+                standard->transmission_color.x != 1.0f ||
+                standard->transmission_color.y != 1.0f ||
+                standard->transmission_color.z != 1.0f ||
+                standard->coat_weight != 0.0f ||
+                standard->coat_roughness != 0.0f ||
+                has_nonzero(standard->sheen_color) ||
+                standard->sheen_weight != 0.0f ||
+                standard->sheen_roughness != 0.0f ||
+                standard->subsurface_weight != 0.0f ||
+                standard->volume_density != 0.0f) {
+                output << "standard_surface " << material->name << ' '
+                    << standard->specular_weight << ' '
+                    << standard->specular_ior << ' '
+                    << standard->transmission_weight << ' '
+                    << standard->transmission_color.x << ' '
+                    << standard->transmission_color.y << ' '
+                    << standard->transmission_color.z << ' '
+                    << standard->coat_weight << ' '
+                    << standard->coat_roughness << ' '
+                    << standard->sheen_color.x << ' '
+                    << standard->sheen_color.y << ' '
+                    << standard->sheen_color.z << ' '
+                    << standard->sheen_weight << ' '
+                    << standard->sheen_roughness << ' '
+                    << standard->subsurface_weight << ' '
+                    << standard->volume_density << '\n';
+            }
+            write_material_input(output, *standard, "base_color", standard->base_color_input);
+            write_material_input(output, *standard, "roughness", standard->roughness_input);
+            write_material_input(output, *standard, "metalness", standard->metalness_input);
+            write_material_input(output, *standard, "specular", standard->specular_weight_input);
+            write_material_input(output, *standard, "transmission", standard->transmission_input);
+            write_material_input(output, *standard, "opacity", standard->opacity_input);
+            write_material_input(output, *standard, "emission", standard->emission_input);
+            write_material_input(output, *standard, "coat", standard->coat_input);
+            write_material_input(output, *standard, "coat_roughness", standard->coat_roughness_input);
+            write_material_input(output, *standard, "sheen_color", standard->sheen_color_input);
+            write_material_input(output, *standard, "sheen_roughness", standard->sheen_roughness_input);
         }
     }
     output << '\n';
@@ -961,7 +1299,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             continue;
         }
         output << "sphere " << sphere.name << ' ' << scene.materials[static_cast<size_t>(sphere.material)]->name << ' '
-            << sphere.center.x << ' ' << sphere.center.y << ' ' << sphere.center.z << ' ' << sphere.radius << '\n';
+            << sphere.center.x << ' ' << sphere.center.y << ' ' << sphere.center.z << ' ' << sphere.radius << ' '
+            << (sphere.exclude_from_irradiance_volume_bake ? 1 : 0) << '\n';
     }
     if (!scene.spheres.empty()) {
         output << '\n';
@@ -972,7 +1311,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             << mesh.translation.x << ' ' << mesh.translation.y << ' ' << mesh.translation.z << ' '
             << mesh.rotation.x << ' ' << mesh.rotation.y << ' ' << mesh.rotation.z << ' '
             << mesh.scale.x << ' ' << mesh.scale.y << ' ' << mesh.scale.z << ' '
-            << mesh.vertices.size() << ' ' << mesh.indices.size() / 3 << '\n';
+            << mesh.vertices.size() << ' ' << mesh.indices.size() / 3 << ' '
+            << (mesh.exclude_from_irradiance_volume_bake ? 1 : 0) << '\n';
         for (Vec3 vertex : mesh.vertices) {
             output << vertex.x << ' ' << vertex.y << ' ' << vertex.z << '\n';
         }

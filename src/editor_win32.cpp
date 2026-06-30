@@ -1,5 +1,6 @@
 #include "lt/renderer.h"
 #include "lt/log.h"
+#include "lt/materialx_adapter.h"
 #include "editor/editor_platform.h"
 #include "editor/editor_state.h"
 
@@ -346,7 +347,7 @@ void open_scene_dialog() {
     ofn.hwndOwner = g_hwnd;
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"Scene files (*.lt;*.glb;*.gltf;*.pbrt)\0*.lt;*.glb;*.gltf;*.pbrt\0LightTransport scenes (*.lt)\0*.lt\0glTF scenes (*.glb;*.gltf)\0*.glb;*.gltf\0PBRT scenes (*.pbrt)\0*.pbrt\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Scene files (*.lt;*.fbx;*.pyscene;*.glb;*.gltf;*.pbrt)\0*.lt;*.fbx;*.pyscene;*.glb;*.gltf;*.pbrt\0LightTransport scenes (*.lt)\0*.lt\0FBX scenes (*.fbx;*.pyscene)\0*.fbx;*.pyscene\0glTF scenes (*.glb;*.gltf)\0*.glb;*.gltf\0PBRT scenes (*.pbrt)\0*.pbrt\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) load_scene_file(narrow(filename));
 }
@@ -1262,6 +1263,22 @@ void rotate_camera(float yaw, float pitch) {
     camera.target = camera.position + lt::Vec3{std::sin(current_yaw) * std::cos(current_pitch), std::sin(current_pitch), std::cos(current_yaw) * std::cos(current_pitch)} * radius;
 }
 
+bool move_selected_object(lt::Vec3 delta) {
+    if (has_mesh_selection()) {
+        lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
+        mesh.translation += delta;
+        g_editor.scene.uses_builtin_default_meshes = false;
+        return true;
+    }
+    if (has_sphere_selection()) {
+        lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
+        sphere.center += delta;
+        g_editor.scene.uses_builtin_default_meshes = false;
+        return true;
+    }
+    return false;
+}
+
 lt::Vec3 handle_axis(GizmoHandle handle) {
     switch (handle) {
     case GizmoHandle::AxisX: return {1.0f, 0.0f, 0.0f};
@@ -1562,7 +1579,7 @@ void handle_sphere_gizmo_drag() {
         }
     }
     g_editor.scene.uses_builtin_default_meshes = false;
-    reset_accumulation(lt::RenderDirty::Geometry);
+    reset_accumulation(lt::RenderDirty::Transform);
 }
 
 void handle_gizmo_drag() {
@@ -1647,7 +1664,7 @@ void handle_gizmo_drag() {
                 const float len = std::sqrt(combined.x * combined.x + combined.y * combined.y);
                 const float amount = len > 1.0f ? (delta.x * combined.x + delta.y * combined.y) / len * world_per_pixel : 0.0f;
                 mesh.translation = g_editor.drag_start_mesh.translation + lt::normalize(a + b) * amount;
-                reset_accumulation(lt::RenderDirty::Geometry);
+                reset_accumulation(lt::RenderDirty::Transform);
                 return;
             }
             mesh.translation = g_editor.drag_start_mesh.translation + a * amount_a + b * amount_b;
@@ -1712,7 +1729,7 @@ void handle_gizmo_drag() {
         mesh.scale.y = std::max(0.01f, mesh.scale.y);
         mesh.scale.z = std::max(0.01f, mesh.scale.z);
     }
-    reset_accumulation(lt::RenderDirty::Geometry);
+    reset_accumulation(lt::RenderDirty::Transform);
 }
 
 void draw_arrow_2d(ImDrawList* draw_list, ImVec2 start, ImVec2 end, ImU32 color) {
@@ -1933,7 +1950,8 @@ void draw_gizmo_overlay() {
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (has_sphere_selection()) {
         const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
-        draw_sphere_outline(draw_list, g_editor.selected_sphere, IM_COL32(255, 150, 35, 255), 2.0f);
+        if (!g_editor.hide_dirty_wireframes)
+            draw_sphere_outline(draw_list, g_editor.selected_sphere, IM_COL32(255, 150, 35, 255), 2.0f);
         if (g_editor.tool_mode == ToolMode::Move) {
             draw_move_gizmo_handles(
                 draw_list,
@@ -1951,7 +1969,8 @@ void draw_gizmo_overlay() {
     ImVec2 center{};
     if (!project_point(center3, center)) return;
     if (g_editor.tool_mode == ToolMode::Select) {
-        draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, IM_COL32(255, 150, 35, 255), 2.0f);
+        if (!g_editor.hide_dirty_wireframes)
+            draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, IM_COL32(255, 150, 35, 255), 2.0f);
     }
     if (g_editor.tool_mode == ToolMode::Move || g_editor.tool_mode == ToolMode::Scale) {
         const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
@@ -2008,7 +2027,7 @@ bool edit_location_world(const char* label, lt::Mesh& mesh) {
     if (ImGui::DragFloat3(label, data, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
         const lt::Vec3 next{data[0], data[1], data[2]};
         mesh.translation += next - location;
-        reset_accumulation(lt::RenderDirty::Geometry);
+        reset_accumulation(lt::RenderDirty::Transform);
         return true;
     }
     return false;
@@ -2020,7 +2039,7 @@ bool edit_rotation_degrees(const char* label, lt::Vec3& radians) {
     float data[3] = {radians.x * kRadToDeg, radians.y * kRadToDeg, radians.z * kRadToDeg};
     if (ImGui::DragFloat3(label, data, 0.2f, -36000.0f, 36000.0f, "%.2f deg")) {
         radians = {data[0] * kDegToRad, data[1] * kDegToRad, data[2] * kDegToRad};
-        reset_accumulation(lt::RenderDirty::Geometry);
+        reset_accumulation(lt::RenderDirty::Transform);
         return true;
     }
     return false;
@@ -2215,7 +2234,7 @@ float draw_top_bar() {
     }
     if (ImGui::BeginMenu("Object")) {
         if (ImGui::BeginMenu("Add Mesh")) {
-            if (ImGui::MenuItem("Cube", "Shift+A")) add_cube_mesh();
+            if (ImGui::MenuItem("Cube")) add_cube_mesh();
             if (ImGui::MenuItem("Plane")) add_plane_mesh();
             if (ImGui::MenuItem("UV Sphere")) add_uv_sphere_mesh();
             if (ImGui::MenuItem("Analytic Sphere")) add_analytic_sphere();
@@ -2223,7 +2242,7 @@ float draw_top_bar() {
             if (ImGui::MenuItem("Area Light")) add_area_light_mesh();
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, has_selection())) duplicate_selected();
+        if (ImGui::MenuItem("Duplicate", nullptr, false, has_selection())) duplicate_selected();
         if (ImGui::MenuItem("Delete", "Del", false, has_selection())) delete_selected();
         ImGui::EndMenu();
     }
@@ -2272,8 +2291,9 @@ void draw_outliner() {
     if (ImGui::TreeNodeEx("Meshes", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
             const bool selected = g_editor.selection_kind == SelectionKind::Mesh && g_editor.selected_mesh == i;
+            const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(i)];
             ImGui::PushID(i);
-            if (ImGui::Selectable(g_editor.scene.meshes[static_cast<size_t>(i)].name.c_str(), selected)) select_mesh(i);
+            if (ImGui::Selectable(mesh.name.c_str(), selected)) select_mesh(i);
             ImGui::PopID();
         }
         ImGui::TreePop();
@@ -2281,8 +2301,9 @@ void draw_outliner() {
     if (ImGui::TreeNodeEx("Spheres", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
             const bool selected = g_editor.selection_kind == SelectionKind::Sphere && g_editor.selected_sphere == i;
+            const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(i)];
             ImGui::PushID(i);
-            if (ImGui::Selectable(g_editor.scene.spheres[static_cast<size_t>(i)].name.c_str(), selected)) select_sphere(i);
+            if (ImGui::Selectable(sphere.name.c_str(), selected)) select_sphere(i);
             ImGui::PopID();
         }
         ImGui::TreePop();
@@ -2311,10 +2332,14 @@ void draw_properties() {
                 }
                 edit_location_world("Location", mesh);
                 edit_rotation_degrees("Rotation", mesh.rotation);
-                if (edit_vec3("Scale", mesh.scale, 0.01f, lt::RenderDirty::Geometry)) {
+                if (edit_vec3("Scale", mesh.scale, 0.01f, lt::RenderDirty::Transform)) {
                     mesh.scale.x = std::max(0.01f, mesh.scale.x);
                     mesh.scale.y = std::max(0.01f, mesh.scale.y);
                     mesh.scale.z = std::max(0.01f, mesh.scale.z);
+                }
+                if (ImGui::Checkbox("Exclude from IV Bake", &mesh.exclude_from_irradiance_volume_bake)) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
                 if (ImGui::Combo("Material", &mesh.material, [](void* data, int idx, const char** out) {
                     const auto* scene = static_cast<const lt::Scene*>(data);
@@ -2367,8 +2392,12 @@ void draw_properties() {
                         g_editor.scene.uses_builtin_default_meshes = false;
                     }
                 }
-                if (edit_vec3("Location", sphere.center, 0.02f, lt::RenderDirty::Geometry)) {
+                if (edit_vec3("Location", sphere.center, 0.02f, lt::RenderDirty::Transform)) {
                     g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                if (ImGui::Checkbox("Exclude from IV Bake", &sphere.exclude_from_irradiance_volume_bake)) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
                 if (ImGui::DragFloat("Radius", &sphere.radius, 0.01f, 0.001f, 1000.0f, "%.3f")) {
                     sphere.radius = std::max(0.001f, sphere.radius);
@@ -2400,7 +2429,7 @@ void draw_properties() {
                     continue;
                 }
                 ImGui::PushID(material_index);
-                if (ImGui::TreeNodeEx(material->name.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::TreeNodeEx(material->name.c_str())) {
                     color_edit("Base Color", material->albedo, lt::RenderDirty::Material);
                     int texture_index = 0;
                     if (material->albedo_texture) {
@@ -2426,6 +2455,11 @@ void draw_properties() {
                     };
                     if (ImGui::Combo("Base Texture", &texture_index, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
                         material->albedo_texture = texture_index > 0 ? g_editor.scene.textures[static_cast<size_t>(texture_index - 1)] : nullptr;
+                        if (auto* standard = dynamic_cast<lt::StandardSurfaceMaterial*>(material.get())) {
+                            standard->base_color_input.texture = material->albedo_texture;
+                            standard->base_color_input.role = lt::TextureRole::Color;
+                            standard->base_color_input.color_space = lt::TextureColorSpace::SceneLinear;
+                        }
                         reset_accumulation(lt::RenderDirty::Material);
                     }
                     if (ImGui::Button("Load Texture")) {
@@ -2434,7 +2468,12 @@ void draw_properties() {
                     if (ImGui::Checkbox("Double-sided Material", &material->double_sided)) {
                         reset_accumulation(lt::RenderDirty::Material);
                     }
-                    const char* models[] = {"Lambertian", "Principled", "Mirror", "Dielectric", "Conductor"};
+                    const lt::MaterialSystemStatus material_system = lt::material_system_status();
+                    ImGui::TextDisabled("MaterialX %s | OIIO %s | OCIO %s",
+                        material_system.materialx_available ? "on" : "fallback",
+                        material_system.openimageio_available ? "on" : "fallback",
+                        material_system.opencolorio_available ? "on" : "fallback");
+                    const char* models[] = {"Lambertian", "Principled", "Mirror", "Dielectric", "Conductor", "Standard Surface"};
                     int model = static_cast<int>(material->model());
                     if (ImGui::Combo("BRDF", &model, models, IM_ARRAYSIZE(models))) {
                         const std::string name = material->name;
@@ -2446,6 +2485,9 @@ void draw_properties() {
                             metallic = principled->metallic;
                         } else if (const auto* dielectric = dynamic_cast<const lt::DielectricMaterial*>(material.get())) {
                             roughness = dielectric->ior;
+                        } else if (const auto* standard = dynamic_cast<const lt::StandardSurfaceMaterial*>(material.get())) {
+                            roughness = standard->roughness;
+                            metallic = standard->metalness;
                         }
                         const auto next_model = static_cast<lt::BrdfModel>(model);
                         if (next_model == lt::BrdfModel::Dielectric && material->model() != lt::BrdfModel::Dielectric) {
@@ -2519,7 +2561,7 @@ void draw_properties() {
                             principled->metallic = std::clamp(principled->metallic, 0.0f, 1.0f);
                             reset_accumulation(lt::RenderDirty::Material);
                         }
-                        if (ImGui::TreeNodeEx("Sheen", ImGuiTreeNodeFlags_DefaultOpen)) {
+                        if (ImGui::TreeNode("Sheen")) {
                             if (color_edit("Sheen Color", principled->sheen_color, lt::RenderDirty::Material)) {
                                 principled->sheen_color = lt::clamp(principled->sheen_color);
                             }
@@ -2547,7 +2589,7 @@ void draw_properties() {
                             }
                             ImGui::TreePop();
                         }
-                        if (ImGui::TreeNodeEx("Clearcoat", ImGuiTreeNodeFlags_DefaultOpen)) {
+                        if (ImGui::TreeNode("Clearcoat")) {
                             if (ImGui::DragFloat("Clearcoat", &principled->clearcoat, 0.01f, 0.0f, 1.0f, "%.2f")) {
                                 principled->clearcoat = std::clamp(principled->clearcoat, 0.0f, 1.0f);
                                 reset_accumulation(lt::RenderDirty::Material);
@@ -2581,6 +2623,78 @@ void draw_properties() {
                         if (ImGui::DragFloat("IOR", &dielectric->ior, 0.01f, 1.0f, 3.0f, "%.2f")) {
                             dielectric->ior = std::clamp(dielectric->ior, 1.0f, 3.0f);
                             reset_accumulation(lt::RenderDirty::Material);
+                        }
+                    }
+                    if (auto* standard = dynamic_cast<lt::StandardSurfaceMaterial*>(material.get())) {
+                        if (ImGui::DragFloat("Roughness", &standard->roughness, 0.01f, 0.02f, 1.0f, "%.2f")) {
+                            standard->roughness = std::clamp(standard->roughness, 0.02f, 1.0f);
+                            reset_accumulation(lt::RenderDirty::Material);
+                        }
+                        if (ImGui::DragFloat("Metalness", &standard->metalness, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                            standard->metalness = std::clamp(standard->metalness, 0.0f, 1.0f);
+                            reset_accumulation(lt::RenderDirty::Material);
+                        }
+                        if (ImGui::DragFloat("Specular Weight", &standard->specular_weight, 0.01f, 0.0f, 2.0f, "%.2f")) {
+                            standard->specular_weight = std::max(0.0f, standard->specular_weight);
+                            reset_accumulation(lt::RenderDirty::Material);
+                        }
+                        if (ImGui::DragFloat("Transmission", &standard->transmission_weight, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                            standard->transmission_weight = std::clamp(standard->transmission_weight, 0.0f, 1.0f);
+                            reset_accumulation(lt::RenderDirty::Material);
+                        }
+                        if (ImGui::DragFloat("Specular IOR", &standard->specular_ior, 0.01f, 1.0f, 3.0f, "%.2f")) {
+                            standard->specular_ior = std::clamp(standard->specular_ior, 1.0f, 3.0f);
+                            reset_accumulation(lt::RenderDirty::Material);
+                        }
+                        if (color_edit("Transmission Color", standard->transmission_color, lt::RenderDirty::Material)) {
+                            standard->transmission_color = lt::clamp(standard->transmission_color);
+                        }
+                        auto material_input_texture_combo = [&](const char* label, lt::MaterialInput& input, lt::MaterialInputChannel channel) {
+                            int texture = 0;
+                            for (int i = 0; i < static_cast<int>(g_editor.scene.textures.size()); ++i) {
+                                if (g_editor.scene.textures[static_cast<size_t>(i)] == input.texture) {
+                                    texture = i + 1;
+                                    break;
+                                }
+                            }
+                            if (ImGui::Combo(label, &texture, texture_label, &g_editor.scene, static_cast<int>(g_editor.scene.textures.size()) + 1)) {
+                                input.texture = texture > 0 ? g_editor.scene.textures[static_cast<size_t>(texture - 1)] : nullptr;
+                                input.channel = channel;
+                                input.role = lt::TextureRole::Data;
+                                input.color_space = lt::TextureColorSpace::Raw;
+                                if (input.texture) {
+                                    lt::apply_texture_role(*input.texture, input.role, input.color_space);
+                                }
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                        };
+                        material_input_texture_combo("Roughness Texture", standard->roughness_input, lt::MaterialInputChannel::R);
+                        material_input_texture_combo("Metalness Texture", standard->metalness_input, lt::MaterialInputChannel::R);
+                        material_input_texture_combo("Specular Texture", standard->specular_weight_input, lt::MaterialInputChannel::R);
+                        if (ImGui::TreeNode("Coat")) {
+                            if (ImGui::DragFloat("Coat Weight", &standard->coat_weight, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                standard->coat_weight = std::clamp(standard->coat_weight, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            if (ImGui::DragFloat("Coat Roughness", &standard->coat_roughness, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                standard->coat_roughness = std::clamp(standard->coat_roughness, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            ImGui::TreePop();
+                        }
+                        if (ImGui::TreeNode("Sheen")) {
+                            if (color_edit("Sheen Color", standard->sheen_color, lt::RenderDirty::Material)) {
+                                standard->sheen_color = lt::clamp(standard->sheen_color);
+                            }
+                            if (ImGui::DragFloat("Sheen Weight", &standard->sheen_weight, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                standard->sheen_weight = std::clamp(standard->sheen_weight, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            if (ImGui::DragFloat("Sheen Roughness", &standard->sheen_roughness, 0.01f, 0.0f, 1.0f, "%.2f")) {
+                                standard->sheen_roughness = std::clamp(standard->sheen_roughness, 0.0f, 1.0f);
+                                reset_accumulation(lt::RenderDirty::Material);
+                            }
+                            ImGui::TreePop();
                         }
                     }
                     draw_npr_controls(*material);
@@ -2635,7 +2749,7 @@ void draw_properties() {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
             }
-            ImGui::Checkbox("Hide Dirty Wireframes", &g_editor.hide_dirty_wireframes);
+            ImGui::Checkbox("Hide Wireframes", &g_editor.hide_dirty_wireframes);
             const char* accel_modes[] = {"Auto", "Flat BVH", "Two-level BVH"};
             int accel_mode = static_cast<int>(g_editor.settings.acceleration_structure);
             if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
@@ -2772,19 +2886,36 @@ void handle_viewport_input() {
     ImGuiIO& io = ImGui::GetIO();
     if (!g_editor.viewport_hovered && !g_editor.viewport_focused) return;
     if (g_editor.gizmo_dragging) return;
-    const float step = io.KeyShift ? 0.18f : 0.06f;
-    float right_delta = 0.0f;
-    float up_delta = 0.0f;
-    float forward_delta = 0.0f;
-    if (ImGui::IsKeyDown(ImGuiKey_W)) forward_delta += step;
-    if (ImGui::IsKeyDown(ImGuiKey_S)) forward_delta -= step;
-    if (ImGui::IsKeyDown(ImGuiKey_A)) right_delta -= step;
-    if (ImGui::IsKeyDown(ImGuiKey_D)) right_delta += step;
-    if (ImGui::IsKeyDown(ImGuiKey_Q)) up_delta -= step;
-    if (ImGui::IsKeyDown(ImGuiKey_E)) up_delta += step;
-    bool camera_changed = right_delta != 0.0f || up_delta != 0.0f || forward_delta != 0.0f;
-    if (camera_changed) {
-        move_camera(right_delta, up_delta, forward_delta);
+    float right_axis = 0.0f;
+    float up_axis = 0.0f;
+    float forward_axis = 0.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_W)) forward_axis += 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_S)) forward_axis -= 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_A)) right_axis -= 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_D)) right_axis += 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_Q)) up_axis -= 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_E)) up_axis += 1.0f;
+    const bool movement_requested = right_axis != 0.0f || up_axis != 0.0f || forward_axis != 0.0f;
+    const bool right_mouse_down = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+    bool camera_changed = false;
+    bool object_changed = false;
+    if (movement_requested) {
+        if (g_editor.tool_mode == ToolMode::Move && has_selection() && !right_mouse_down) {
+            const float step = io.KeyShift ? 0.012f : 0.06f;
+            const float right_delta = right_axis * step;
+            const float up_delta = up_axis * step;
+            const float forward_delta = forward_axis * step;
+            const ViewTransform view = make_view_transform(true);
+            const lt::Vec3 delta = view.right * right_delta + view.up * up_delta + view.forward * forward_delta;
+            object_changed = move_selected_object(delta);
+        } else {
+            const float step = io.KeyShift ? 0.012f : 0.06f;
+            const float right_delta = right_axis * step;
+            const float up_delta = up_axis * step;
+            const float forward_delta = forward_axis * step;
+            move_camera(right_delta, up_delta, forward_delta);
+            camera_changed = true;
+        }
     }
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
         const ImVec2 delta = io.MouseDelta;
@@ -2795,6 +2926,8 @@ void handle_viewport_input() {
     }
     if (camera_changed) {
         reset_accumulation(lt::RenderDirty::Camera);
+    } else if (object_changed) {
+        reset_accumulation(lt::RenderDirty::Transform);
     }
 }
 
@@ -2827,7 +2960,7 @@ void draw_viewport() {
         }
     }
     handle_gizmo_drag();
-    if (g_editor.frame_index == 0 && !g_editor.hide_dirty_wireframes) {
+    if (!g_editor.hide_dirty_wireframes) {
         draw_scene_reference_outlines(ImGui::GetWindowDrawList());
     }
     draw_gizmo_overlay();
@@ -2837,7 +2970,9 @@ void draw_viewport() {
         if (g_editor.tool_mode == ToolMode::Scale) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
     }
     handle_viewport_input();
-    const char* hint = "LMB select/drag | RMB look | WASD/QE fly";
+    const char* hint = g_editor.tool_mode == ToolMode::Move && has_selection()
+        ? "LMB drag gizmo | WASD/QE move object | RMB look"
+        : "LMB select/drag | RMB look | WASD/QE fly";
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     const float button_size = 28.0f;
     const ImVec2 button_min = {g_editor.viewport_image_max.x - button_size - 10.0f, g_editor.viewport_image_min.y + 10.0f};
@@ -3129,14 +3264,10 @@ void handle_global_shortcuts() {
     if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene_as_dialog();
     else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R)) reset_accumulation();
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) duplicate_selected();
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) delete_selected();
     if (ImGui::IsKeyPressed(ImGuiKey_O)) open_scene_dialog();
     if (ImGui::IsKeyPressed(ImGuiKey_Space)) g_editor.paused = !g_editor.paused;
     if (ImGui::IsKeyPressed(ImGuiKey_F11)) g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen;
-    if (!io.KeyCtrl) {
-        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_A)) add_mesh();
-    }
 }
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {

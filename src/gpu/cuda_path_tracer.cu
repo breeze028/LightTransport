@@ -244,7 +244,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     uint32_t* device_rgba = static_cast<uint32_t*>(device_rgba_);
     GpuScene* device_scene = static_cast<GpuScene*>(device_scene_);
 
-    if (has_dirty(settings.dirty, RenderDirty::Geometry)) {
+    if (has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform)) {
         cached_render_scene_valid_ = false;
     }
 
@@ -276,8 +277,10 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
 
     const bool full_upload = !scene_uploaded_ ||
         has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform) ||
         has_dirty(settings.dirty, RenderDirty::Material) ||
-        has_dirty(settings.dirty, RenderDirty::Texture);
+        has_dirty(settings.dirty, RenderDirty::Texture) ||
+        has_dirty(settings.dirty, RenderDirty::Environment);
     const bool irradiance_volume_upload = full_upload || irradiance_volume_rebuilt || irradiance_volume_enabled_changed;
     const auto upload_gpu_irradiance_volume = [&](const IrradianceVolume* volume, GpuIrradianceVolume& gpu_volume) {
         PackedGpuIrradianceVolume packed;

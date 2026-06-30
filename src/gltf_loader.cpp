@@ -570,7 +570,13 @@ int material_texture_source(const Json& root, int texture_index) {
     return root["textures"][static_cast<size_t>(texture_index)]["source"].integer(-1);
 }
 
-std::shared_ptr<Texture> scene_texture_for_gltf_texture(const Json& root, const std::vector<int>& image_to_texture, const Scene& scene, int texture_index) {
+std::shared_ptr<Texture> scene_texture_for_gltf_texture(
+    const Json& root,
+    const std::vector<int>& image_to_texture,
+    const Scene& scene,
+    int texture_index,
+    TextureRole role = TextureRole::Unknown,
+    TextureColorSpace color_space = TextureColorSpace::Auto) {
     const int source = material_texture_source(root, texture_index);
     if (source < 0 || source >= static_cast<int>(image_to_texture.size())) {
         return {};
@@ -579,7 +585,11 @@ std::shared_ptr<Texture> scene_texture_for_gltf_texture(const Json& root, const 
     if (scene_texture < 0 || scene_texture >= static_cast<int>(scene.textures.size())) {
         return {};
     }
-    return scene.textures[static_cast<size_t>(scene_texture)];
+    std::shared_ptr<Texture> texture = scene.textures[static_cast<size_t>(scene_texture)];
+    if (texture && role != TextureRole::Unknown) {
+        apply_texture_role(*texture, role, color_space);
+    }
+    return texture;
 }
 
 std::string embedded_image_extension(const Json& image, const unsigned char* data, size_t size) {
@@ -652,7 +662,7 @@ void load_images(const Json& root, const std::string& scene_dir, const std::vect
 
 void load_materials(const Json& root, const std::vector<int>& image_to_texture, Scene& scene) {
     if (root["materials"].array().empty()) {
-        scene.materials.push_back(make_material("default", {0.8f, 0.8f, 0.8f}, BrdfModel::Principled, 0.5f, 0.0f));
+        scene.materials.push_back(make_material("default", {0.8f, 0.8f, 0.8f}, BrdfModel::StandardSurface, 0.5f, 0.0f));
         return;
     }
     for (size_t i = 0; i < root["materials"].array().size(); ++i) {
@@ -679,15 +689,16 @@ void load_materials(const Json& root, const std::vector<int>& image_to_texture, 
                 volume["attenuationColor"][2].number(1.0f),
             };
         }
-        std::shared_ptr<Material> material = make_material(
+        auto material = std::make_shared<StandardSurfaceMaterial>(
             material_json["name"].string("material_" + std::to_string(i)),
             base,
-            uses_transmission ? BrdfModel::Dielectric : BrdfModel::Principled,
-            uses_transmission ? ior : roughness,
+            std::clamp(roughness, 0.02f, 1.0f),
             metallic);
-        if (auto* dielectric = dynamic_cast<DielectricMaterial*>(material.get())) {
-            dielectric->transmission_tint = transmission_tint;
-        }
+        material->transmission_weight = transmission_factor;
+        material->transmission_color = transmission_tint;
+        material->specular_ior = ior;
+        material->unsupported_volume = !volume.is_null();
+        (void)uses_transmission;
         if (pbr["baseColorFactor"].is_array() && pbr["baseColorFactor"].array().size() >= 4) {
             material->alpha = std::clamp(pbr["baseColorFactor"][3].number(1.0f), 0.0f, 1.0f);
         }
@@ -700,9 +711,14 @@ void load_materials(const Json& root, const std::vector<int>& image_to_texture, 
         material->double_sided = material_json["doubleSided"].boolean(false);
         material->alpha_cutoff = std::clamp(material_json["alphaCutoff"].number(0.5f), 0.0f, 1.0f);
         const int base_texture = pbr["baseColorTexture"]["index"].integer(-1);
-        material->albedo_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, base_texture);
+        material->albedo_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, base_texture, TextureRole::Color, TextureColorSpace::SRGB);
+        if (material->albedo_texture) {
+            material->base_color_input.texture = material->albedo_texture;
+            material->base_color_input.role = TextureRole::Color;
+            material->base_color_input.color_space = TextureColorSpace::SceneLinear;
+        }
         const int normal_texture = material_json["normalTexture"]["index"].integer(-1);
-        material->normal_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, normal_texture);
+        material->normal_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, normal_texture, TextureRole::Normal, TextureColorSpace::Raw);
         material->normal_scale = material_json["normalTexture"]["scale"].number(1.0f);
         if (material_json["emissiveFactor"].is_array()) {
             material->emission = {
@@ -714,30 +730,47 @@ void load_materials(const Json& root, const std::vector<int>& image_to_texture, 
         const float emissive_strength = extensions["KHR_materials_emissive_strength"]["emissiveStrength"].number(1.0f);
         material->emission = material->emission * std::max(0.0f, emissive_strength);
         const int emission_texture = material_json["emissiveTexture"]["index"].integer(-1);
-        material->emission_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, emission_texture);
+        material->emission_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, emission_texture, TextureRole::Emission, TextureColorSpace::SRGB);
         if (material->emission_texture && material->emission.x == 0.0f && material->emission.y == 0.0f && material->emission.z == 0.0f) {
             material->emission = Vec3{1.0f, 1.0f, 1.0f} * std::max(0.0f, emissive_strength);
         }
-        if (auto* principled = dynamic_cast<PrincipledMaterial*>(material.get())) {
-            const int metallic_roughness_texture = pbr["metallicRoughnessTexture"]["index"].integer(-1);
-            principled->metallic_roughness_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, metallic_roughness_texture);
-            const Json& sheen = extensions["KHR_materials_sheen"];
-            if (sheen["sheenColorFactor"].is_array()) {
-                principled->sheen_color = {
-                    sheen["sheenColorFactor"][0].number(),
-                    sheen["sheenColorFactor"][1].number(),
-                    sheen["sheenColorFactor"][2].number(),
-                };
-            }
-            principled->sheen_roughness = std::clamp(sheen["sheenRoughnessFactor"].number(0.0f), 0.0f, 1.0f);
-            principled->sheen_color_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, sheen["sheenColorTexture"]["index"].integer(-1));
-            principled->sheen_roughness_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, sheen["sheenRoughnessTexture"]["index"].integer(-1));
-            const Json& clearcoat = extensions["KHR_materials_clearcoat"];
-            principled->clearcoat = std::clamp(clearcoat["clearcoatFactor"].number(0.0f), 0.0f, 1.0f);
-            principled->clearcoat_roughness = std::clamp(clearcoat["clearcoatRoughnessFactor"].number(0.0f), 0.0f, 1.0f);
-            principled->clearcoat_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, clearcoat["clearcoatTexture"]["index"].integer(-1));
-            principled->clearcoat_roughness_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, clearcoat["clearcoatRoughnessTexture"]["index"].integer(-1));
+        const int metallic_roughness_texture = pbr["metallicRoughnessTexture"]["index"].integer(-1);
+        std::shared_ptr<Texture> mr_texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, metallic_roughness_texture, TextureRole::Data, TextureColorSpace::Raw);
+        if (mr_texture) {
+            material->roughness = 1.0f;
+            material->metalness = 1.0f;
+            material->roughness_input.texture = mr_texture;
+            material->roughness_input.channel = MaterialInputChannel::G;
+            material->roughness_input.role = TextureRole::Data;
+            material->roughness_input.color_space = TextureColorSpace::Raw;
+            material->metalness_input.texture = mr_texture;
+            material->metalness_input.channel = MaterialInputChannel::B;
+            material->metalness_input.role = TextureRole::Data;
+            material->metalness_input.color_space = TextureColorSpace::Raw;
         }
+        const int transmission_texture = transmission["transmissionTexture"]["index"].integer(-1);
+        material->transmission_input.texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, transmission_texture, TextureRole::Data, TextureColorSpace::Raw);
+        material->transmission_input.channel = MaterialInputChannel::R;
+        const Json& sheen = extensions["KHR_materials_sheen"];
+        if (sheen["sheenColorFactor"].is_array()) {
+            material->sheen_color = {
+                sheen["sheenColorFactor"][0].number(),
+                sheen["sheenColorFactor"][1].number(),
+                sheen["sheenColorFactor"][2].number(),
+            };
+            material->sheen_weight = 1.0f;
+        }
+        material->sheen_roughness = std::clamp(sheen["sheenRoughnessFactor"].number(0.0f), 0.0f, 1.0f);
+        material->sheen_color_input.texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, sheen["sheenColorTexture"]["index"].integer(-1), TextureRole::Color, TextureColorSpace::SRGB);
+        material->sheen_roughness_input.texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, sheen["sheenRoughnessTexture"]["index"].integer(-1), TextureRole::Data, TextureColorSpace::Raw);
+        material->sheen_roughness_input.channel = MaterialInputChannel::A;
+        const Json& clearcoat = extensions["KHR_materials_clearcoat"];
+        material->coat_weight = std::clamp(clearcoat["clearcoatFactor"].number(0.0f), 0.0f, 1.0f);
+        material->coat_roughness = std::clamp(clearcoat["clearcoatRoughnessFactor"].number(0.0f), 0.0f, 1.0f);
+        material->coat_input.texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, clearcoat["clearcoatTexture"]["index"].integer(-1), TextureRole::Data, TextureColorSpace::Raw);
+        material->coat_input.channel = MaterialInputChannel::R;
+        material->coat_roughness_input.texture = scene_texture_for_gltf_texture(root, image_to_texture, scene, clearcoat["clearcoatRoughnessTexture"]["index"].integer(-1), TextureRole::Data, TextureColorSpace::Raw);
+        material->coat_roughness_input.channel = MaterialInputChannel::G;
         scene.materials.push_back(material);
     }
 }

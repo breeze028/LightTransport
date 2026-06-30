@@ -50,7 +50,8 @@ enum class RenderDirty : uint32_t {
     Geometry = 1u << 4u,
     Environment = 1u << 5u,
     IrradianceVolume = 1u << 6u,
-    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u) | (1u << 6u),
+    Transform = 1u << 7u,
+    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u) | (1u << 6u) | (1u << 7u),
 };
 
 constexpr RenderDirty operator|(RenderDirty a, RenderDirty b) {

@@ -1,66 +1,92 @@
-# Mesh-based Cornell-ish test scene with an analytic sphere.
+camera -0.0455678 1.67495 -4.52002   -0.0356016 1.46496 -3.27165   45
 
-camera 0 1.05 -1.25   0 0.85 0   45
+npr_sampling 8 1
+irradiance_volume 0 7 3 9 1 4 0.01 0 0 0.1 1 1 0
 
-material white 0.78 0.78 0.72 lambertian 0.65 0
-material red   0.85 0.18 0.14 lambertian 0.65 0
-material green 0.18 0.70 0.24 lambertian 0.65 0
-material blue  0.22 0.32 0.90 principled 0.35 0
-material light 1.00 0.90 0.72 lambertian 0.50 0
+material white 0.78 0.78 0.72 lambertian 0.5 0
+material red 0.85 0.18 0.14 lambertian 0.5 0
+material green 0.18 0.7 0.24 lambertian 0.5 0
+material blue 0.22 0.32 0.9 principled 0.35 0
+material light 1 0.9 0.72 lambertian 0.5 0
 
-light Area_Light 1.0 0.888889 0.666667 9.0 1
 
-sphere Blue_Sphere blue -0.55 0.42 0.0 0.42
+light Area_Light 1 0.888889 0.666667 9 0
 
-mesh Floor white 0 0 0 0 0 0 1 1 1 4 2
+sphere Blue_Sphere blue -0.55 0.42 0 0.42 0
+
+mesh Floor white 0 0 0 0 0 0 1 1 1 4 2 0
 -1.4 0 -1.5
 1.4 0 -1.5
 1.4 0 1.5
 -1.4 0 1.5
+texcoords 4
+-0.9 -1
+1.9 -1
+1.9 2
+-0.9 2
 0 1 2
 0 2 3
-
-mesh Ceiling white 0 2.2 0 0 0 0 1 1 1 4 2
+mesh Ceiling white 0 2.2 0 0 0 0 1 1 1 4 2 0
 -1.4 0 1.5
 1.4 0 1.5
 1.4 0 -1.5
 -1.4 0 -1.5
+texcoords 4
+-0.9 2
+1.9 2
+1.9 -1
+-0.9 -1
 0 1 2
 0 2 3
-
-mesh Left_Wall red -1.4 1.1 0 0 0 0 1 1 1 4 2
+mesh Left_Wall red -1.4 1.1 0 0 0 0 1 1 1 4 2 0
 0 -1.1 1.5
 0 1.1 1.5
 0 1.1 -1.5
 0 -1.1 -1.5
+texcoords 4
+0.5 2
+0.5 2
+0.5 -1
+0.5 -1
 0 1 2
 0 2 3
-
-mesh Right_Wall green 1.4 1.1 0 0 0 0 1 1 1 4 2
+mesh Right_Wall green 1.4 1.1 0 0 0 0 1 1 1 4 2 0
 0 -1.1 -1.5
 0 1.1 -1.5
 0 1.1 1.5
 0 -1.1 1.5
+texcoords 4
+0.5 -1
+0.5 -1
+0.5 2
+0.5 2
 0 1 2
 0 2 3
-
-mesh Back_Wall white 0 1.1 1.5 0 0 0 1 1 1 4 2
+mesh Back_Wall white 0 1.1 1.5 0 0 0 1 1 1 4 2 0
 -1.4 -1.1 0
 1.4 -1.1 0
 1.4 1.1 0
 -1.4 1.1 0
+texcoords 4
+-0.9 0.5
+1.9 0.5
+1.9 0.5
+-0.9 0.5
 0 1 2
 0 2 3
-
-mesh Area_Light light 0 2.18 0 0 0 0 1 1 1 4 2
+mesh Area_Light light 0 2.18 0 0 0 0 1 1 1 4 2 0
 -0.28 0 0.28
 -0.28 0 -0.28
 0.28 0 -0.28
 0.28 0 0.28
+texcoords 4
+0.22 0.78
+0.22 0.22
+0.78 0.22
+0.78 0.78
 0 1 2
 0 2 3
-
-mesh White_Block white 0.48 0.32 -0.55 0 0 0 0.62 0.62 0.62 8 12
+mesh White_Block white 0.48 0.32 -0.55 0 0 0 0.62 0.62 0.62 8 12 1
 -0.5 -0.5 -0.5
 0.5 -0.5 -0.5
 0.5 0.5 -0.5
@@ -69,6 +95,15 @@ mesh White_Block white 0.48 0.32 -0.55 0 0 0 0.62 0.62 0.62 8 12
 0.5 -0.5 0.5
 0.5 0.5 0.5
 -0.5 0.5 0.5
+texcoords 8
+0 0
+1 0
+1 0
+0 0
+0 1
+1 1
+1 1
+0 1
 0 2 1
 0 3 2
 4 5 6

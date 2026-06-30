@@ -1,0 +1,38 @@
+camera 0 1.1 -4   0 0.8 0   45
+
+material floor 0.72 0.72 0.68 lambertian 0.5 0
+material glass 0.92 0.97 1 standard_surface 0.02 0
+material light 1 1 1 lambertian 0.5 0
+
+material_properties light 1 0.5 opaque 0 1 8 8 8
+standard_surface glass 1 1.5 1 1 1 1 0 0 0 0 0 0 0 0 0
+
+light Area_Light 1 1 1 6 0
+
+sphere Glass_Sphere glass 0 0.75 0 0.55 0
+
+mesh Floor floor 0 0 0 0 0 0 1 1 1 4 2 0
+-2 0 -2
+2 0 -2
+2 0 2
+-2 0 2
+texcoords 4
+0 0
+1 0
+1 1
+0 1
+0 1 2
+0 2 3
+
+mesh Area_Light light 0 2.4 0 0 0 0 1 1 1 4 2 0
+-0.55 0 0.55
+0.55 0 0.55
+0.55 0 -0.55
+-0.55 0 -0.55
+texcoords 4
+0 0
+1 0
+1 1
+0 1
+0 1 2
+0 2 3

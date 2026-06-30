@@ -245,6 +245,27 @@ void hash_material(uint64_t& hash, const std::shared_ptr<Material>& material) {
     } else if (const auto* dielectric = dynamic_cast<const DielectricMaterial*>(material.get())) {
         hash_value(hash, dielectric->ior);
         hash_vec3(hash, dielectric->transmission_tint);
+    } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
+        hash_value(hash, standard->roughness);
+        hash_value(hash, standard->metalness);
+        hash_value(hash, standard->specular_weight);
+        hash_value(hash, standard->specular_ior);
+        hash_value(hash, standard->transmission_weight);
+        hash_vec3(hash, standard->transmission_color);
+        hash_value(hash, standard->coat_weight);
+        hash_value(hash, standard->coat_roughness);
+        hash_vec3(hash, standard->sheen_color);
+        hash_value(hash, standard->sheen_weight);
+        hash_value(hash, standard->sheen_roughness);
+        hash_texture_ref(hash, standard->base_color_input.texture);
+        hash_texture_ref(hash, standard->roughness_input.texture);
+        hash_texture_ref(hash, standard->metalness_input.texture);
+        hash_texture_ref(hash, standard->specular_weight_input.texture);
+        hash_texture_ref(hash, standard->transmission_input.texture);
+        hash_texture_ref(hash, standard->coat_input.texture);
+        hash_texture_ref(hash, standard->coat_roughness_input.texture);
+        hash_texture_ref(hash, standard->sheen_color_input.texture);
+        hash_texture_ref(hash, standard->sheen_roughness_input.texture);
     }
 }
 
@@ -321,6 +342,33 @@ uint64_t irradiance_volume_fingerprint(const RenderScene& render_scene, const Sc
     hash_vec3(hash, scene.environment.light_from_world_z);
     hash_texture_ref(hash, scene.environment.texture);
     return hash;
+}
+
+bool scene_has_irradiance_volume_exclusions(const Scene& scene) {
+    for (const Mesh& mesh : scene.meshes) {
+        if (mesh.exclude_from_irradiance_volume_bake) return true;
+    }
+    for (const Sphere& sphere : scene.spheres) {
+        if (sphere.exclude_from_irradiance_volume_bake) return true;
+    }
+    return false;
+}
+
+Scene make_irradiance_volume_bake_scene(const Scene& scene) {
+    Scene bake_scene = scene;
+    bake_scene.meshes.erase(
+        std::remove_if(
+            bake_scene.meshes.begin(),
+            bake_scene.meshes.end(),
+            [](const Mesh& mesh) { return mesh.exclude_from_irradiance_volume_bake; }),
+        bake_scene.meshes.end());
+    bake_scene.spheres.erase(
+        std::remove_if(
+            bake_scene.spheres.begin(),
+            bake_scene.spheres.end(),
+            [](const Sphere& sphere) { return sphere.exclude_from_irradiance_volume_bake; }),
+        bake_scene.spheres.end());
+    return bake_scene;
 }
 
 std::string irradiance_volume_cache_path(const RenderSettings& settings) {
@@ -807,9 +855,20 @@ std::shared_ptr<IrradianceVolume> update_irradiance_volume(
         return std::static_pointer_cast<IrradianceVolume>(cached_irradiance_volume);
     }
 
-    const uint64_t fingerprint = irradiance_volume_fingerprint(render_scene, scene, settings);
+    Scene bake_scene_storage;
+    RenderScene bake_render_scene_storage;
+    const Scene* bake_scene = &scene;
+    const RenderScene* bake_render_scene = &render_scene;
+    if (scene_has_irradiance_volume_exclusions(scene)) {
+        bake_scene_storage = make_irradiance_volume_bake_scene(scene);
+        bake_render_scene_storage = build_render_scene(bake_scene_storage);
+        bake_scene = &bake_scene_storage;
+        bake_render_scene = &bake_render_scene_storage;
+    }
+
+    const uint64_t fingerprint = irradiance_volume_fingerprint(*bake_render_scene, *bake_scene, settings);
     if (!force_rebake) {
-        if (std::shared_ptr<IrradianceVolume> cached = load_irradiance_volume_cache(render_scene, scene, settings, fingerprint)) {
+        if (std::shared_ptr<IrradianceVolume> cached = load_irradiance_volume_cache(*bake_render_scene, *bake_scene, settings, fingerprint)) {
             cached_irradiance_volume = cached;
             volume_rebuilt = true;
             return cached;
@@ -826,7 +885,7 @@ std::shared_ptr<IrradianceVolume> update_irradiance_volume(
     }
 
     reset_irradiance_volume_progress(settings, IrradianceVolumeBakePhase::Baking);
-    std::shared_ptr<IrradianceVolume> volume = build_irradiance_volume(render_scene, scene, settings);
+    std::shared_ptr<IrradianceVolume> volume = build_irradiance_volume(*bake_render_scene, *bake_scene, settings);
     cached_irradiance_volume = volume;
     volume_rebuilt = true;
     save_irradiance_volume_cache(*volume, settings, fingerprint);

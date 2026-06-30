@@ -101,6 +101,37 @@ Vec3 inverse_transform_component_basis_assuming_rotation(const Mat4& m, int comp
     });
 }
 
+bool invert_affine(const Mat4& m, Mat4& inverse) {
+    const float a00 = m.m[0][0], a01 = m.m[0][1], a02 = m.m[0][2];
+    const float a10 = m.m[1][0], a11 = m.m[1][1], a12 = m.m[1][2];
+    const float a20 = m.m[2][0], a21 = m.m[2][1], a22 = m.m[2][2];
+    const float det =
+        a00 * (a11 * a22 - a12 * a21) -
+        a01 * (a10 * a22 - a12 * a20) +
+        a02 * (a10 * a21 - a11 * a20);
+    if (std::fabs(det) <= 1.0e-8f) return false;
+    const float inv_det = 1.0f / det;
+
+    Mat4 r;
+    r.m[0][0] = (a11 * a22 - a12 * a21) * inv_det;
+    r.m[0][1] = (a02 * a21 - a01 * a22) * inv_det;
+    r.m[0][2] = (a01 * a12 - a02 * a11) * inv_det;
+    r.m[1][0] = (a12 * a20 - a10 * a22) * inv_det;
+    r.m[1][1] = (a00 * a22 - a02 * a20) * inv_det;
+    r.m[1][2] = (a02 * a10 - a00 * a12) * inv_det;
+    r.m[2][0] = (a10 * a21 - a11 * a20) * inv_det;
+    r.m[2][1] = (a01 * a20 - a00 * a21) * inv_det;
+    r.m[2][2] = (a00 * a11 - a01 * a10) * inv_det;
+
+    const Vec3 t{m.m[0][3], m.m[1][3], m.m[2][3]};
+    const Vec3 inv_t = transform_vector(r, t * -1.0f);
+    r.m[0][3] = inv_t.x;
+    r.m[1][3] = inv_t.y;
+    r.m[2][3] = inv_t.z;
+    inverse = r;
+    return true;
+}
+
 Mat4 translate(Vec3 t) {
     Mat4 m;
     m.m[0][3] = t.x;
@@ -534,6 +565,10 @@ private:
         const std::string& op = command.text;
         if (op == "Include" && pos < tokens.size()) {
             parse_file(resolve_path(base, tokens[pos++].text));
+        } else if (op == "WorldBegin") {
+            state_ = ImportState{};
+            attribute_stack_.clear();
+            transform_stack_.clear();
         } else if (op == "AttributeBegin") {
             attribute_stack_.push_back(state_);
         } else if (op == "AttributeEnd") {
@@ -622,7 +657,9 @@ private:
             parse_float(tokens[pos++].text, m.m[i / 4][i % 4]);
         }
         if (pos < tokens.size() && tokens[pos].text == "]") ++pos;
-        return m;
+        // PBRT writes explicit matrices in row-major order, while the loader's
+        // transform helpers use column-vector math.
+        return transpose(m);
     }
 
     void parse_look_at(const std::vector<Token>& tokens, size_t& pos) {
@@ -656,10 +693,12 @@ private:
         return false;
     }
 
-    void apply_camera_transform(const Mat4& camera_to_world) {
-        const Vec3 origin = transform_point(camera_to_world, {});
-        const Vec3 target = transform_point(camera_to_world, {0.0f, 0.0f, 1.0f});
-        const Vec3 up = transform_vector(camera_to_world, {0.0f, 1.0f, 0.0f});
+    void apply_camera_transform(const Mat4& camera_from_world) {
+        Mat4 world_from_camera;
+        if (!invert_affine(camera_from_world, world_from_camera)) return;
+        const Vec3 origin = transform_point(world_from_camera, {});
+        const Vec3 target = transform_point(world_from_camera, {0.0f, 0.0f, 1.0f});
+        const Vec3 up = transform_vector(world_from_camera, {0.0f, 1.0f, 0.0f});
         const Vec3 forward = normalize(target - origin);
         if (dot(forward, forward) <= 0.0f || (std::fabs(origin.x) + std::fabs(origin.y) + std::fabs(origin.z)) <= 0.0f) {
             return;
@@ -667,7 +706,7 @@ private:
         scene_.camera.position = origin;
         scene_.camera.target = target;
         scene_.camera.up = dot(up, up) > 0.0f ? normalize(up) : Vec3{0.0f, 1.0f, 0.0f};
-        scene_.camera.right_sign = -1.0f;
+        scene_.camera.right_sign = 1.0f;
     }
 
     void parse_texture(const std::vector<Token>& tokens, size_t& pos, const std::filesystem::path& base) {
@@ -683,6 +722,7 @@ private:
         std::string error;
         const std::filesystem::path texture_path = resolve_path(base, filename);
         if (load_texture_file(name, texture_path.string(), texture, error)) {
+            apply_texture_role(texture, TextureRole::Color, TextureColorSpace::SRGB);
             texture.path = filename;
             scene_.textures.push_back(std::make_shared<Texture>(std::move(texture)));
         } else {
@@ -768,6 +808,7 @@ private:
                 Texture texture;
                 std::string error;
                 if (load_texture_file("environment", resolve_path(base, filename).string(), texture, error)) {
+                    apply_texture_role(texture, TextureRole::Environment, TextureColorSpace::SceneLinear);
                     texture.path = filename;
                     scene_.textures.push_back(std::make_shared<Texture>(std::move(texture)));
                     scene_.environment.texture = scene_.textures.back();
