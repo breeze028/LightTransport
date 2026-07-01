@@ -58,6 +58,8 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
         }
         float roughness = 0.5f;
         float metallic = 0.0f;
+        Vec3 conductor_eta = {0.200438f, 0.924033f, 1.102212f};
+        Vec3 conductor_k = {3.912949f, 2.452848f, 2.142188f};
         int normal_texture_index = -1;
         int emission_texture_index = -1;
         int sheen_color_texture_index = -1;
@@ -85,6 +87,10 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
             transmission = 1.0f;
             specular_ior = dielectric->ior;
             transmission_tint = dielectric->transmission_tint;
+        } else if (const auto* conductor = dynamic_cast<const ConductorMaterial*>(material.get())) {
+            roughness = conductor->roughness;
+            conductor_eta = conductor->eta;
+            conductor_k = conductor->k;
         } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
             roughness = standard->roughness;
             metallic = standard->metalness;
@@ -167,12 +173,16 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
                 }
             }
         }
-        const float packed_roughness = material->model() == BrdfModel::Dielectric ? std::clamp(roughness, 1.0f, 3.0f) : std::clamp(roughness, 0.02f, 1.0f);
+        const float packed_roughness = material->model() == BrdfModel::Dielectric
+            ? std::clamp(roughness, 1.0f, 3.0f)
+            : (material->model() == BrdfModel::Conductor ? std::clamp(roughness, 0.0f, 1.0f) : std::clamp(roughness, 0.02f, 1.0f));
         packed.materials[static_cast<size_t>(i)] = {
             material->albedo,
             static_cast<int>(material->model()),
             packed_roughness,
             std::clamp(metallic, 0.0f, 1.0f),
+            conductor_eta,
+            conductor_k,
             texture_index,
             metallic_roughness_texture_index,
             roughness_texture_index,

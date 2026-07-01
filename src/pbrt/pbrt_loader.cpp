@@ -293,6 +293,48 @@ Vec3 vec3_param(const std::vector<Param>& params, const std::string& name, Vec3 
     return value;
 }
 
+bool has_param(const std::vector<Param>& params, const std::string& name) {
+    return find_param(params, name) != nullptr;
+}
+
+bool bool_param(const std::vector<Param>& params, const std::string& name, bool fallback) {
+    const Param* param = find_param(params, name);
+    if (!param || param->values.empty()) return fallback;
+    const std::string value = lower(param->values[0]);
+    if (value == "true" || value == "1") return true;
+    if (value == "false" || value == "0") return false;
+    return fallback;
+}
+
+float roughness_param(const std::vector<Param>& params, float fallback = 0.5f, float min_value = 0.02f) {
+    const bool has_u = has_param(params, "uroughness");
+    const bool has_v = has_param(params, "vroughness");
+    if (has_u && has_v) {
+        return std::clamp(
+            0.5f * (float_param(params, "uroughness", fallback) + float_param(params, "vroughness", fallback)),
+            min_value,
+            1.0f);
+    }
+    return std::clamp(float_param(params, "roughness", float_param(params, "uroughness", float_param(params, "vroughness", fallback))), min_value, 1.0f);
+}
+
+float pbrt_roughness_to_alpha(float roughness) {
+    const float r = std::max(roughness, 1.0e-3f);
+    const float x = std::log(r);
+    return std::clamp(
+        1.62142f + 0.819955f * x + 0.1734f * x * x + 0.0171201f * x * x * x + 0.000640711f * x * x * x * x,
+        0.001f,
+        1.0f);
+}
+
+Vec3 conductor_k_from_reflectance(Vec3 reflectance) {
+    reflectance = clamp(reflectance, 0.0f, 0.999f);
+    const auto channel = [](float r) {
+        return 2.0f * std::sqrt(r) / std::sqrt(std::max(1.0e-6f, 1.0f - r));
+    };
+    return {channel(reflectance.x), channel(reflectance.y), channel(reflectance.z)};
+}
+
 std::string string_param(const std::vector<Param>& params, const std::string& name, const std::string& fallback = {}) {
     const Param* param = find_param(params, name);
     return param && !param->values.empty() ? param->values[0] : fallback;
@@ -336,6 +378,15 @@ void apply_transform(Mesh& mesh, const Mat4& transform) {
     for (Vec3& normal : mesh.normals) {
         normal = normalize(transform_vector(transform, normal));
     }
+}
+
+Mesh make_baked_uv_sphere_mesh(const std::string& name, int material, float radius, int segments, int rings) {
+    Mesh mesh = make_uv_sphere_mesh(name, material, {}, 1.0f, segments, rings);
+    for (Vec3& vertex : mesh.vertices) {
+        vertex *= radius;
+    }
+    mesh.scale = {1.0f, 1.0f, 1.0f};
+    return mesh;
 }
 
 void triangulate_face(Mesh& mesh, const std::vector<uint32_t>& face) {
@@ -508,6 +559,8 @@ public:
         LT_LOG_INFO("Loading PBRT scene '{}'", path);
         scene_.camera = {{0.0f, 1.0f, 4.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, 45.0f};
         scene_.environment.constant = true;
+        scene_.environment.color = {};
+        scene_.environment.strength = 0.0f;
         scene_.materials.push_back(make_material("default", {0.8f, 0.8f, 0.8f}, BrdfModel::Principled, 0.5f, 0.0f));
         named_materials_["default"] = 0;
         state_.material = 0;
@@ -747,7 +800,7 @@ private:
     int add_material(const std::string& name, const std::vector<Param>& params) {
         const std::string type = lower(string_param(params, "type", "diffuse"));
         const Vec3 color = vec3_param(params, "reflectance", vec3_param(params, "Kd", vec3_param(params, "color", {0.8f, 0.8f, 0.8f})));
-        const float roughness = std::clamp(float_param(params, "roughness", float_param(params, "uroughness", 0.5f)), 0.02f, 1.0f);
+        const float roughness = roughness_param(params);
         std::shared_ptr<Material> material;
         if (type == "dielectric" || type == "thindielectric" || type == "glass") {
             const Vec3 transmission = vec3_param(params, "transmittance", vec3_param(params, "T", {1.0f, 1.0f, 1.0f}));
@@ -760,7 +813,20 @@ private:
             principled->clearcoat_roughness = std::clamp(float_param(params, "interface.roughness", roughness), 0.02f, 1.0f);
             material = principled;
         } else if (type == "conductor") {
-            material = make_material(name, color, BrdfModel::Conductor, roughness, 1.0f);
+            float conductor_alpha = roughness_param(params, 0.5f, 0.0f);
+            if (bool_param(params, "remaproughness", true)) {
+                conductor_alpha = pbrt_roughness_to_alpha(conductor_alpha);
+            }
+            const bool has_eta = has_param(params, "eta");
+            const bool has_k = has_param(params, "k");
+            Vec3 eta = vec3_param(params, "eta", {0.200438f, 0.924033f, 1.102212f});
+            Vec3 k = vec3_param(params, "k", {3.912949f, 2.452848f, 2.142188f});
+            if (!has_eta && !has_k) {
+                const Vec3 reflectance = vec3_param(params, "reflectance", vec3_param(params, "color", {0.5f, 0.5f, 0.5f}));
+                eta = {1.0f, 1.0f, 1.0f};
+                k = conductor_k_from_reflectance(reflectance);
+            }
+            material = std::make_shared<ConductorMaterial>(name, Vec3{1.0f, 1.0f, 1.0f}, conductor_alpha, eta, k);
         } else if (type == "coatedconductor") {
             auto principled = std::make_shared<PrincipledMaterial>(name, color, std::clamp(float_param(params, "conductor.roughness", roughness), 0.02f, 1.0f), 1.0f);
             principled->clearcoat = 1.0f;
@@ -837,7 +903,7 @@ private:
             const float intensity = std::max({color.x, color.y, color.z}) * scale_value;
             if (intensity <= 0.0f) return;
             const int mat = add_light_material("point_light_material_" + std::to_string(scene_.materials.size()), color * scale_value);
-            Mesh mesh = make_uv_sphere_mesh("point_light_" + std::to_string(scene_.meshes.size()), mat, {}, 0.035f, 12, 6);
+            Mesh mesh = make_baked_uv_sphere_mesh("point_light_" + std::to_string(scene_.meshes.size()), mat, 0.035f, 12, 6);
             apply_transform(mesh, state_.transform);
             mesh.light.enabled = true;
             mesh.light.double_sided = true;
@@ -1043,7 +1109,7 @@ private:
 
     void add_sphere(const std::vector<Param>& params) {
         const float radius = std::max(0.0f, float_param(params, "radius", 1.0f));
-        Mesh mesh = make_uv_sphere_mesh("sphere_" + std::to_string(scene_.meshes.size()), state_.material, {}, radius, 32, 16);
+        Mesh mesh = make_baked_uv_sphere_mesh("sphere_" + std::to_string(scene_.meshes.size()), state_.material, radius, 32, 16);
         apply_transform(mesh, state_.transform);
         finish_mesh(mesh);
     }

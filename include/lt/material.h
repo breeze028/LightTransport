@@ -203,12 +203,19 @@ public:
 
 class ConductorMaterial final : public Material {
 public:
-    using Material::Material;
+    float roughness = 0.0f;
+    Vec3 eta = {0.200438f, 0.924033f, 1.102212f};
+    Vec3 k = {3.912949f, 2.452848f, 2.142188f};
+
+    ConductorMaterial() = default;
+    ConductorMaterial(std::string name_, Vec3 albedo_, float roughness_ = 0.0f, Vec3 eta_ = {0.200438f, 0.924033f, 1.102212f}, Vec3 k_ = {3.912949f, 2.452848f, 2.142188f})
+        : Material(std::move(name_), albedo_), roughness(roughness_), eta(eta_), k(k_) {}
 
     BrdfModel model() const override { return BrdfModel::Conductor; }
     const char* model_name() const override { return "conductor"; }
-    Vec3 evaluate(Vec3, Vec3, Vec3, Vec2) const override { return {}; }
-    float pdf(Vec3, Vec3, Vec3, Vec2) const override { return 0.0f; }
+    float roughness_at(Vec2 uv) const;
+    Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
+    float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<ConductorMaterial>(*this); }
 };

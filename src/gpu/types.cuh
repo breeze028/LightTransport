@@ -3,6 +3,8 @@ struct GpuMaterial {
     int brdf_model = 0;
     float roughness = 0.5f;
     float metallic = 0.0f;
+    Vec3 conductor_eta = {0.200438f, 0.924033f, 1.102212f};
+    Vec3 conductor_k = {3.912949f, 2.452848f, 2.142188f};
     int texture_index = -1;
     int metallic_roughness_texture_index = -1;
     int roughness_texture_index = -1;

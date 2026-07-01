@@ -15,9 +15,38 @@ Vec3 fresnel_schlick(float cos_theta, Vec3 f0) {
     return f0 + (Vec3{1.0f} - f0) * f;
 }
 
+Vec3 fresnel_conductor(float cos_theta, Vec3 eta, Vec3 k) {
+    const float c = std::clamp(std::fabs(cos_theta), 0.0f, 1.0f);
+    const float cos2 = c * c;
+    const float sin2 = std::max(0.0f, 1.0f - cos2);
+    const auto channel = [=](float e, float kk) {
+        e = std::max(0.0f, e);
+        kk = std::max(0.0f, kk);
+        const float eta2 = e * e;
+        const float k2 = kk * kk;
+        const float t0 = eta2 - k2 - sin2;
+        const float a2pb2 = std::sqrt(std::max(0.0f, t0 * t0 + 4.0f * eta2 * k2));
+        const float a = std::sqrt(std::max(0.0f, 0.5f * (a2pb2 + t0)));
+        const float t1 = a2pb2 + cos2;
+        const float t2 = 2.0f * c * a;
+        const float rs = (t1 - t2) / std::max(1.0e-6f, t1 + t2);
+        const float t3 = cos2 * a2pb2 + sin2 * sin2;
+        const float t4 = t2 * sin2;
+        const float rp = rs * (t3 - t4) / std::max(1.0e-6f, t3 + t4);
+        return std::clamp(0.5f * (rp + rs), 0.0f, 1.0f);
+    };
+    return {channel(eta.x, k.x), channel(eta.y, k.y), channel(eta.z, k.z)};
+}
+
 float ggx_distribution(float ndoth, float roughness) {
     const float a = roughness * roughness;
     const float a2 = a * a;
+    const float d = ndoth * ndoth * (a2 - 1.0f) + 1.0f;
+    return a2 / std::max(1.0e-6f, kPi * d * d);
+}
+
+float ggx_distribution_alpha(float ndoth, float alpha) {
+    const float a2 = alpha * alpha;
     const float d = ndoth * ndoth * (a2 - 1.0f) + 1.0f;
     return a2 / std::max(1.0e-6f, kPi * d * d);
 }
@@ -26,6 +55,15 @@ float smith_ggx_g1(float ndotv, float roughness) {
     const float r = roughness + 1.0f;
     const float k = (r * r) * 0.125f;
     return ndotv / std::max(1.0e-6f, ndotv * (1.0f - k) + k);
+}
+
+float smith_ggx_g1_alpha(float ndotv, float alpha) {
+    if (ndotv <= 0.0f) {
+        return 0.0f;
+    }
+    const float cos2 = ndotv * ndotv;
+    const float tan2 = std::max(0.0f, 1.0f - cos2) / std::max(1.0e-6f, cos2);
+    return 2.0f / (1.0f + std::sqrt(1.0f + alpha * alpha * tan2));
 }
 
 float charlie_sheen_distribution(float ndoth, float roughness) {
@@ -59,6 +97,14 @@ Vec3 sample_ggx_half(Vec3 n, float roughness, float u1, float u2) {
     const float a = roughness * roughness;
     const float phi = 2.0f * kPi * u1;
     const float cos_theta = std::sqrt((1.0f - u2) / std::max(1.0e-6f, 1.0f + (a * a - 1.0f) * u2));
+    const float sin_theta = std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+    return normalize(to_world({sin_theta * std::cos(phi), sin_theta * std::sin(phi), cos_theta}, n));
+}
+
+Vec3 sample_ggx_half_alpha(Vec3 n, float alpha, float u1, float u2) {
+    const float a2 = alpha * alpha;
+    const float phi = 2.0f * kPi * u1;
+    const float cos_theta = std::sqrt((1.0f - u2) / std::max(1.0e-6f, 1.0f + (a2 - 1.0f) * u2));
     const float sin_theta = std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
     return normalize(to_world({sin_theta * std::cos(phi), sin_theta * std::sin(phi), cos_theta}, n));
 }
@@ -312,12 +358,69 @@ MaterialSample DielectricMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_f
     return result;
 }
 
-MaterialSample ConductorMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng&) const {
+float ConductorMaterial::roughness_at(Vec2) const {
+    return std::clamp(roughness, 0.0f, 1.0f);
+}
+
+Vec3 ConductorMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
+    if (ndotv <= 0.0f || ndotl <= 0.0f || roughness_at(uv) <= 0.001f) {
+        return {};
+    }
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    const Vec3 h = normalize(wi + wo);
+    const float ndoth = std::max(0.0f, dot(facing_n, h));
+    const float vdoth = std::max(0.0f, dot(wo, h));
+    if (ndoth <= 0.0f || vdoth <= 0.0f) {
+        return {};
+    }
+    const float micro_alpha = std::clamp(roughness_at(uv), 0.001f, 1.0f);
+    const Vec3 f = base_color(uv) * fresnel_conductor(vdoth, eta, k);
+    const float d = ggx_distribution_alpha(ndoth, micro_alpha);
+    const float g = smith_ggx_g1_alpha(ndotv, micro_alpha) * smith_ggx_g1_alpha(ndotl, micro_alpha);
+    return f * (d * g / std::max(1.0e-6f, 4.0f * ndotv * ndotl));
+}
+
+float ConductorMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotv = double_sided ? std::fabs(dot(n, wo)) : std::max(0.0f, dot(n, wo));
+    const float ndotl = double_sided ? std::fabs(dot(n, wi)) : std::max(0.0f, dot(n, wi));
+    if (ndotv <= 0.0f || ndotl <= 0.0f || roughness_at(uv) <= 0.001f) {
+        return 0.0f;
+    }
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    const Vec3 h = normalize(wi + wo);
+    const float ndoth = std::max(0.0f, dot(facing_n, h));
+    const float vdoth = std::max(0.0f, dot(wo, h));
+    if (ndoth <= 0.0f || vdoth <= 0.0f) {
+        return 0.0f;
+    }
+    const float micro_alpha = std::clamp(roughness_at(uv), 0.001f, 1.0f);
+    return ggx_distribution_alpha(ndoth, micro_alpha) * ndoth / std::max(1.0e-6f, 4.0f * vdoth);
+}
+
+MaterialSample ConductorMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& rng) const {
     MaterialSample result;
-    result.direction = normalize(reflect(wo, n));
-    result.weight = base_color(uv);
-    result.pdf = 1.0f;
-    result.delta = true;
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    const float micro_alpha = roughness_at(uv);
+    if (micro_alpha <= 0.001f) {
+        result.direction = normalize(reflect(wo, facing_n));
+        result.weight = base_color(uv) * fresnel_conductor(dot(facing_n, wo), eta, k);
+        result.pdf = 1.0f;
+        result.delta = true;
+        return result;
+    }
+
+    const Vec3 h = sample_ggx_half_alpha(facing_n, std::clamp(micro_alpha, 0.001f, 1.0f), rng.next_float(), rng.next_float());
+    result.direction = normalize(reflect(wo, h));
+    if (dot(result.direction, facing_n) <= 0.0f) {
+        result.pdf = 0.0f;
+        result.weight = {};
+        return result;
+    }
+    result.pdf = pdf(n, wo, result.direction, uv);
+    const float ndotl = std::max(0.0f, dot(facing_n, result.direction));
+    result.weight = result.pdf > 0.0f ? evaluate(n, wo, result.direction, uv) * (ndotl / result.pdf) : Vec3{};
     return result;
 }
 
@@ -470,7 +573,7 @@ std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, Br
         return std::make_shared<DielectricMaterial>(name, albedo, std::clamp(roughness, 1.0f, 3.0f));
     }
     if (model == BrdfModel::Conductor) {
-        return std::make_shared<ConductorMaterial>(name, albedo);
+        return std::make_shared<ConductorMaterial>(name, albedo, std::clamp(roughness, 0.0f, 1.0f));
     }
     return std::make_shared<LambertianMaterial>(name, albedo);
 }

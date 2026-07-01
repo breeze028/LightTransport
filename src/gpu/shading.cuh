@@ -35,6 +35,34 @@ __device__ Vec3 fresnel_schlick_gpu(float cos_theta, Vec3 f0) {
     return add(f0, mul(sub(Vec3{1.0f, 1.0f, 1.0f}, f0), f));
 }
 
+__device__ float fresnel_conductor_channel_gpu(float cos_theta, float eta, float k) {
+    const float c = dclamp(fabsf(cos_theta), 0.0f, 1.0f);
+    const float cos2 = c * c;
+    const float sin2 = fmaxf(0.0f, 1.0f - cos2);
+    eta = fmaxf(0.0f, eta);
+    k = fmaxf(0.0f, k);
+    const float eta2 = eta * eta;
+    const float k2 = k * k;
+    const float t0 = eta2 - k2 - sin2;
+    const float a2pb2 = sqrtf(fmaxf(0.0f, t0 * t0 + 4.0f * eta2 * k2));
+    const float a = sqrtf(fmaxf(0.0f, 0.5f * (a2pb2 + t0)));
+    const float t1 = a2pb2 + cos2;
+    const float t2 = 2.0f * c * a;
+    const float rs = (t1 - t2) / fmaxf(1.0e-6f, t1 + t2);
+    const float t3 = cos2 * a2pb2 + sin2 * sin2;
+    const float t4 = t2 * sin2;
+    const float rp = rs * (t3 - t4) / fmaxf(1.0e-6f, t3 + t4);
+    return dclamp(0.5f * (rp + rs), 0.0f, 1.0f);
+}
+
+__device__ Vec3 fresnel_conductor_gpu(float cos_theta, Vec3 eta, Vec3 k) {
+    return {
+        fresnel_conductor_channel_gpu(cos_theta, eta.x, k.x),
+        fresnel_conductor_channel_gpu(cos_theta, eta.y, k.y),
+        fresnel_conductor_channel_gpu(cos_theta, eta.z, k.z),
+    };
+}
+
 __device__ Vec3 sample_texture_gpu(const GpuScene& scene, int texture_index, Vec2 uv) {
     if (texture_index < 0 || texture_index >= scene.texture_count) {
         return {1.0f, 1.0f, 1.0f};
@@ -170,6 +198,9 @@ __device__ Vec3 apply_normal_map_gpu(const GpuScene& scene, const GpuMaterial& m
 }
 
 __device__ float material_roughness_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::Conductor)) {
+        return dclamp(material.roughness, 0.0f, 1.0f);
+    }
     if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface) && material.roughness_texture_index >= 0) {
         return dclamp(material.roughness * sample_texture_gpu(scene, material.roughness_texture_index, uv).x, 0.02f, 1.0f);
     }
@@ -268,10 +299,25 @@ __device__ float ggx_distribution_gpu(float ndoth, float roughness) {
     return a2 / fmaxf(1.0e-6f, kPi * d * d);
 }
 
+__device__ float ggx_distribution_alpha_gpu(float ndoth, float alpha) {
+    const float a2 = alpha * alpha;
+    const float d = ndoth * ndoth * (a2 - 1.0f) + 1.0f;
+    return a2 / fmaxf(1.0e-6f, kPi * d * d);
+}
+
 __device__ float smith_ggx_g1_gpu(float ndotv, float roughness) {
     const float r = roughness + 1.0f;
     const float k = (r * r) * 0.125f;
     return ndotv / fmaxf(1.0e-6f, ndotv * (1.0f - k) + k);
+}
+
+__device__ float smith_ggx_g1_alpha_gpu(float ndotv, float alpha) {
+    if (ndotv <= 0.0f) {
+        return 0.0f;
+    }
+    const float cos2 = ndotv * ndotv;
+    const float tan2 = fmaxf(0.0f, 1.0f - cos2) / fmaxf(1.0e-6f, cos2);
+    return 2.0f / (1.0f + sqrtf(1.0f + alpha * alpha * tan2));
 }
 
 __device__ float charlie_sheen_distribution_gpu(float ndoth, float roughness) {
@@ -292,6 +338,24 @@ __device__ Vec3 evaluate_brdf_gpu(const GpuScene& scene, const GpuMaterial& mate
     }
     if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
         return divv(mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv))), kPi);
+    }
+    if (material.brdf_model == static_cast<int>(BrdfModel::Conductor)) {
+        const float alpha = material_roughness_gpu(scene, material, uv);
+        if (alpha <= 0.001f) {
+            return {};
+        }
+        const Vec3 facing_n = ddot(n, wo) >= 0.0f ? n : mul(n, -1.0f);
+        const Vec3 h = dnormalize(add(wi, wo));
+        const float ndoth = fmaxf(0.0f, ddot(facing_n, h));
+        const float vdoth = fmaxf(0.0f, ddot(wo, h));
+        if (ndoth <= 0.0f || vdoth <= 0.0f) {
+            return {};
+        }
+        const Vec3 color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
+        const Vec3 f = mul(color, fresnel_conductor_gpu(vdoth, material.conductor_eta, material.conductor_k));
+        const float d = ggx_distribution_alpha_gpu(ndoth, dclamp(alpha, 0.001f, 1.0f));
+        const float g = smith_ggx_g1_alpha_gpu(ndotv, alpha) * smith_ggx_g1_alpha_gpu(ndotl, alpha);
+        return mul(f, d * g / fmaxf(1.0e-6f, 4.0f * ndotv * ndotl));
     }
     const bool standard_surface = material.brdf_model == static_cast<int>(BrdfModel::StandardSurface);
     if (material.brdf_model != static_cast<int>(BrdfModel::Principled) && !standard_surface) {
@@ -351,6 +415,14 @@ __device__ Vec3 sample_ggx_half_gpu(Vec3 n, float roughness, float u1, float u2)
     return dnormalize(to_world_gpu({sin_theta * cosf(phi), sin_theta * sinf(phi), cos_theta}, n));
 }
 
+__device__ Vec3 sample_ggx_half_alpha_gpu(Vec3 n, float alpha, float u1, float u2) {
+    const float a2 = alpha * alpha;
+    const float phi = 2.0f * kPi * u1;
+    const float cos_theta = sqrtf((1.0f - u2) / fmaxf(1.0e-6f, 1.0f + (a2 - 1.0f) * u2));
+    const float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+    return dnormalize(to_world_gpu({sin_theta * cosf(phi), sin_theta * sinf(phi), cos_theta}, n));
+}
+
 __device__ float material_pdf_gpu(const GpuScene& scene, const GpuMaterial& material, Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) {
     const float ndotl = material.double_sided ? fabsf(ddot(n, wi)) : fmaxf(0.0f, ddot(n, wi));
     const float ndotv = material.double_sided ? fabsf(ddot(n, wo)) : fmaxf(0.0f, ddot(n, wo));
@@ -360,6 +432,20 @@ __device__ float material_pdf_gpu(const GpuScene& scene, const GpuMaterial& mate
     const float diffuse_pdf = ndotl / kPi;
     if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
         return diffuse_pdf;
+    }
+    if (material.brdf_model == static_cast<int>(BrdfModel::Conductor)) {
+        const float alpha = material_roughness_gpu(scene, material, uv);
+        if (alpha <= 0.001f) {
+            return 0.0f;
+        }
+        const Vec3 facing_n = ddot(n, wo) >= 0.0f ? n : mul(n, -1.0f);
+        const Vec3 h = dnormalize(add(wi, wo));
+        const float ndoth = fmaxf(0.0f, ddot(facing_n, h));
+        const float vdoth = fmaxf(0.0f, ddot(wo, h));
+        if (ndoth <= 0.0f || vdoth <= 0.0f) {
+            return 0.0f;
+        }
+        return ggx_distribution_alpha_gpu(ndoth, dclamp(alpha, 0.001f, 1.0f)) * ndoth / fmaxf(1.0e-6f, 4.0f * vdoth);
     }
     const bool standard_surface = material.brdf_model == static_cast<int>(BrdfModel::StandardSurface);
     if (material.brdf_model != static_cast<int>(BrdfModel::Principled) && !standard_surface) {
@@ -380,11 +466,33 @@ __device__ float material_pdf_gpu(const GpuScene& scene, const GpuMaterial& mate
 __device__ GpuMaterialSample sample_material_gpu(const GpuScene& scene, const GpuMaterial& material, Vec3 n, Vec3 wo, Vec2 uv, bool front_face, uint32_t& rng) {
     GpuMaterialSample result;
     const Vec3 color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
-    if (material.brdf_model == static_cast<int>(BrdfModel::Mirror) || material.brdf_model == static_cast<int>(BrdfModel::Conductor)) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::Mirror)) {
         result.direction = dnormalize(reflect_gpu(wo, n));
-        result.weight = material.brdf_model == static_cast<int>(BrdfModel::Mirror) ? Vec3{1.0f, 1.0f, 1.0f} : color;
+        result.weight = Vec3{1.0f, 1.0f, 1.0f};
         result.pdf = 1.0f;
         result.delta = true;
+        return result;
+    }
+    if (material.brdf_model == static_cast<int>(BrdfModel::Conductor)) {
+        const Vec3 facing_n = ddot(n, wo) >= 0.0f ? n : mul(n, -1.0f);
+        const float alpha = material_roughness_gpu(scene, material, uv);
+        if (alpha <= 0.001f) {
+            result.direction = dnormalize(reflect_gpu(wo, facing_n));
+            result.weight = mul(color, fresnel_conductor_gpu(ddot(facing_n, wo), material.conductor_eta, material.conductor_k));
+            result.pdf = 1.0f;
+            result.delta = true;
+            return result;
+        }
+        const Vec3 h = sample_ggx_half_alpha_gpu(facing_n, dclamp(alpha, 0.001f, 1.0f), rng_float(rng), rng_float(rng));
+        result.direction = dnormalize(reflect_gpu(wo, h));
+        if (ddot(result.direction, facing_n) <= 0.0f) {
+            result.pdf = 0.0f;
+            result.weight = {};
+            return result;
+        }
+        result.pdf = material_pdf_gpu(scene, material, n, wo, result.direction, uv);
+        const float ndotl = fmaxf(0.0f, ddot(facing_n, result.direction));
+        result.weight = result.pdf > 0.0f ? mul(evaluate_brdf_gpu(scene, material, n, wo, result.direction, uv), ndotl / result.pdf) : Vec3{};
         return result;
     }
     if (material.brdf_model == static_cast<int>(BrdfModel::Dielectric)) {
