@@ -660,6 +660,35 @@ bool material_uses_irradiance_volume_gi(const RenderSettings& settings, const Ma
         (material.model() == BrdfModel::Principled || material.model() == BrdfModel::StandardSurface);
 }
 
+bool material_uses_lightmap_gi(const RenderSettings& settings, const Material& material) {
+    if (material.model() == BrdfModel::Lambertian) {
+        return true;
+    }
+    if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(&material)) {
+        if (standard->transmission({}) > 0.05f) {
+            return false;
+        }
+    }
+    return settings.lightmap_principled_gi &&
+        (material.model() == BrdfModel::Principled || material.model() == BrdfModel::StandardSurface);
+}
+
+Vec3 shade_material_from_lightmap(
+    const Lightmap& lightmap,
+    const RenderScene& render_scene,
+    const Scene& scene,
+    const RenderSettings& settings,
+    const Material& material,
+    const Hit& hit,
+    Vec3 wo,
+    Rng& rng) {
+    const Vec3 irradiance = query_lightmap(lightmap, hit.lightmap_uv);
+    const Vec3 indirect = material.base_color(hit.uv) * diffuse_gi_scale_for_irradiance_volume(material, hit.uv) * (irradiance / kPi);
+    const Vec3 direct_lights = estimate_direct_lighting(render_scene, scene, hit, material, wo, rng, settings);
+    const Vec3 direct_environment = estimate_direct_environment(render_scene, scene, settings, material, hit, wo, rng);
+    return material.emitted(hit.uv) + direct_lights + direct_environment + indirect;
+}
+
 Vec3 shade_material_from_irradiance_volume(
     const IrradianceVolume& volume,
     const RenderScene& render_scene,
@@ -676,8 +705,15 @@ Vec3 shade_material_from_irradiance_volume(
     return material.emitted(hit.uv) + direct_lights + direct_environment + indirect;
 }
 
-Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rng& rng, const RenderSettings& settings, const IrradianceVolume* irradiance_volume = nullptr) {
-    if (!irradiance_volume_rendering_enabled(settings) && stylized_rendering_enabled(settings, scene)) {
+Vec3 trace_path(
+    const RenderScene& render_scene,
+    const Scene& scene,
+    Ray ray,
+    Rng& rng,
+    const RenderSettings& settings,
+    const IrradianceVolume* irradiance_volume = nullptr,
+    const Lightmap* lightmap = nullptr) {
+    if (!irradiance_volume_rendering_enabled(settings) && !lightmap_rendering_enabled(settings) && stylized_rendering_enabled(settings, scene)) {
         return trace_stylized_radiance(render_scene, scene, ray, rng, settings, {}, 0, {}, 0.0f, false);
     }
 
@@ -732,6 +768,22 @@ Vec3 trace_path(const RenderScene& render_scene, const Scene& scene, Ray ray, Rn
             break;
         }
 
+        if (lightmap && hit.has_lightmap && material_uses_lightmap_gi(settings, *material)) {
+            const Vec3 wo = -ray.direction;
+            radiance += clamp_sample_radiance(
+                throughput * shade_material_from_lightmap(
+                    *lightmap,
+                    render_scene,
+                    scene,
+                    settings,
+                    *material,
+                    hit,
+                    wo,
+                    rng),
+                sample_clamp);
+            break;
+        }
+
         if (irradiance_volume && material_uses_irradiance_volume_gi(settings, *material)) {
             const Vec3 wo = -ray.direction;
             radiance += clamp_sample_radiance(
@@ -782,9 +834,10 @@ Vec3 trace_path_with_irradiance_probe_debug(
     Ray ray,
     Rng& rng,
     const RenderSettings& settings,
-    const IrradianceVolume* irradiance_volume) {
+    const IrradianceVolume* irradiance_volume,
+    const Lightmap* lightmap) {
     if (!irradiance_volume || !settings.irradiance_volume_debug_probes || irradiance_volume->debug_probes.empty()) {
-        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume);
+        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume, lightmap);
     }
 
     IrradianceVolumeProbeHit probe_hit;
@@ -793,12 +846,12 @@ Vec3 trace_path_with_irradiance_probe_debug(
             ray,
             settings.irradiance_volume_debug_probe_radius_scale,
             probe_hit)) {
-        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume);
+        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume, lightmap);
     }
 
     Hit scene_hit;
     if (intersect_scene(render_scene, ray, scene_hit, settings.acceleration_structure) && scene_hit.t < probe_hit.t) {
-        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume);
+        return trace_path(render_scene, scene, ray, rng, settings, irradiance_volume, lightmap);
     }
     return shade_irradiance_debug_probe(probe_hit, ray.direction);
 }

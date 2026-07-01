@@ -640,6 +640,33 @@ SceneLoadResult load_scene(const std::string& path) {
                 return fail("Invalid irradiance_volume_bounds at line " + std::to_string(line_number));
             }
             scene.has_render_settings = true;
+        } else if (tag == "lightmap") {
+            int enabled = scene.render_settings.use_lightmap ? 1 : 0;
+            int principled_gi = scene.render_settings.lightmap_principled_gi ? 1 : 0;
+            int cache_enabled = scene.render_settings.lightmap_cache_enabled ? 1 : 0;
+            int auto_update = scene.render_settings.lightmap_auto_update ? 1 : 0;
+            input >> enabled
+                >> scene.render_settings.lightmap_resolution
+                >> scene.render_settings.lightmap_padding
+                >> scene.render_settings.lightmap_dilation
+                >> scene.render_settings.lightmap_bake_samples
+                >> scene.render_settings.lightmap_bake_bounces
+                >> principled_gi
+                >> cache_enabled
+                >> auto_update;
+            if (!input) {
+                return fail("Invalid lightmap at line " + std::to_string(line_number));
+            }
+            scene.render_settings.use_lightmap = enabled != 0;
+            scene.render_settings.lightmap_resolution = std::clamp(scene.render_settings.lightmap_resolution, 16, 16384);
+            scene.render_settings.lightmap_padding = std::clamp(scene.render_settings.lightmap_padding, 0, 64);
+            scene.render_settings.lightmap_dilation = std::clamp(scene.render_settings.lightmap_dilation, 0, 64);
+            scene.render_settings.lightmap_bake_samples = std::clamp(scene.render_settings.lightmap_bake_samples, 1, 256);
+            scene.render_settings.lightmap_bake_bounces = std::clamp(scene.render_settings.lightmap_bake_bounces, 1, 32);
+            scene.render_settings.lightmap_principled_gi = principled_gi != 0;
+            scene.render_settings.lightmap_cache_enabled = cache_enabled != 0;
+            scene.render_settings.lightmap_auto_update = auto_update != 0;
+            scene.has_render_settings = true;
         } else if (tag == "material") {
             std::string material_name;
             Vec3 albedo;
@@ -1125,6 +1152,16 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
                 << settings.irradiance_volume_bounds_max.y << ' '
                 << settings.irradiance_volume_bounds_max.z << '\n';
         }
+        output << "lightmap "
+            << (settings.use_lightmap ? 1 : 0) << ' '
+            << settings.lightmap_resolution << ' '
+            << settings.lightmap_padding << ' '
+            << settings.lightmap_dilation << ' '
+            << settings.lightmap_bake_samples << ' '
+            << settings.lightmap_bake_bounces << ' '
+            << (settings.lightmap_principled_gi ? 1 : 0) << ' '
+            << (settings.lightmap_cache_enabled ? 1 : 0) << ' '
+            << (settings.lightmap_auto_update ? 1 : 0) << '\n';
         output << '\n';
     }
 

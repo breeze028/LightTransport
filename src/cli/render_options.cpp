@@ -88,6 +88,8 @@ RenderOptions parse_render_options(int argc, char** argv) {
             }
         } else if (argument == "--spp" && i + 1 < argc) {
             options.settings.samples_per_pixel = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--max-bounces" && i + 1 < argc) {
+            options.settings.max_bounces = std::clamp(std::atoi(argv[++i]), 1, 32);
         } else if (argument == "--frames" && i + 1 < argc) {
             options.settings.frame_index = static_cast<uint32_t>(std::max(0, std::atoi(argv[++i]) - 1));
         } else if (argument == "--size" && i + 2 < argc) {
@@ -142,6 +144,35 @@ RenderOptions parse_render_options(int argc, char** argv) {
                 static_cast<float>(std::atof(argv[++i])),
                 static_cast<float>(std::atof(argv[++i])),
             };
+        } else if (argument == "--lightmap") {
+            options.settings.use_lightmap = true;
+        } else if (argument == "--no-lightmap") {
+            options.settings.use_lightmap = false;
+        } else if (argument == "--lightmap-resolution" && i + 1 < argc) {
+            options.settings.lightmap_resolution = std::clamp(std::atoi(argv[++i]), 16, 16384);
+        } else if (argument == "--lightmap-padding" && i + 1 < argc) {
+            options.settings.lightmap_padding = std::clamp(std::atoi(argv[++i]), 0, 64);
+        } else if (argument == "--lightmap-dilation" && i + 1 < argc) {
+            options.settings.lightmap_dilation = std::clamp(std::atoi(argv[++i]), 0, 64);
+        } else if (argument == "--lightmap-bake-samples" && i + 1 < argc) {
+            options.settings.lightmap_bake_samples = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--lightmap-bake-bounces" && i + 1 < argc) {
+            options.settings.lightmap_bake_bounces = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--lightmap-principled-gi") {
+            options.settings.lightmap_principled_gi = true;
+        } else if (argument == "--no-lightmap-principled-gi") {
+            options.settings.lightmap_principled_gi = false;
+        } else if (argument == "--lightmap-cache" && i + 1 < argc) {
+            options.settings.lightmap_cache_enabled = true;
+            copy_setting_text(options.settings.lightmap_cache_path, argv[++i]);
+        } else if (argument == "--no-lightmap-cache") {
+            options.settings.lightmap_cache_enabled = false;
+        } else if (argument == "--lightmap-auto-update") {
+            options.settings.lightmap_auto_update = true;
+        } else if (argument == "--no-lightmap-auto-update") {
+            options.settings.lightmap_auto_update = false;
+        } else if (argument == "--lightmap-force-bake") {
+            options.settings.lightmap_force_rebake = true;
         } else if (argument == "--style" && i + 1 < argc) {
             options.global_style = parse_npr_style(argv[++i]);
             options.global_style_set = true;

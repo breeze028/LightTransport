@@ -41,6 +41,15 @@ void set_irradiance_volume_cache_defaults(lt::RenderSettings& settings, const st
     }
 }
 
+void set_lightmap_cache_defaults(lt::RenderSettings& settings, const std::string& scene_path) {
+    if (settings.lightmap_cache_key[0] == '\0') {
+        copy_setting_text(settings.lightmap_cache_key, scene_path);
+    }
+    if (settings.lightmap_cache_path[0] == '\0' && !scene_path.empty()) {
+        copy_setting_text(settings.lightmap_cache_path, scene_path + ".lmap");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -62,6 +71,7 @@ int main(int argc, char** argv) {
     }
     lt::cli::apply_material_styles(options, loaded.scene, std::cerr);
     set_irradiance_volume_cache_defaults(options.settings, options.scene_path);
+    set_lightmap_cache_defaults(options.settings, options.scene_path);
 
     lt::CpuPathTracer cpu;
     lt::CudaPathTracer cuda;

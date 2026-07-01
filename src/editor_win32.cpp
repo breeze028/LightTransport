@@ -8,6 +8,11 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <d3d11.h>
+#include <psapi.h>
+
+#if LT_HAS_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -15,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <ctime>
@@ -63,6 +69,17 @@ const char* tool_mode_icon(ToolMode mode) {
     case ToolMode::Scale: return "K";
     default: return "?";
     }
+}
+
+void format_bytes(size_t bytes, char* buf, size_t buf_size) {
+    if (bytes >= 1024ull * 1024ull * 1024ull)
+        std::snprintf(buf, buf_size, "%.2f GiB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    else if (bytes >= 1024ull * 1024ull)
+        std::snprintf(buf, buf_size, "%.2f MiB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    else if (bytes >= 1024ull)
+        std::snprintf(buf, buf_size, "%.2f KiB", static_cast<double>(bytes) / 1024.0);
+    else
+        std::snprintf(buf, buf_size, "%zu B", bytes);
 }
 
 void enqueue_editor_log(const lt::LogRecord& record) {
@@ -147,7 +164,8 @@ void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
         lt::has_dirty(dirty, lt::RenderDirty::Texture) ||
         lt::has_dirty(dirty, lt::RenderDirty::Geometry) ||
         lt::has_dirty(dirty, lt::RenderDirty::Environment) ||
-        lt::has_dirty(dirty, lt::RenderDirty::IrradianceVolume)) {
+        lt::has_dirty(dirty, lt::RenderDirty::IrradianceVolume) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Lightmap)) {
         ++g_editor.content_generation;
     }
     g_editor.frame_index = 0;
@@ -391,6 +409,22 @@ std::string default_irradiance_volume_cache_path() {
     return g_editor.scene_path + ".ivol";
 }
 
+std::string default_lightmap_cache_path() {
+    if (g_editor.scene_path.empty()) {
+        return "cache/lightmap/untitled.lmap";
+    }
+    if (is_url_path(g_editor.scene_path)) {
+        std::string safe = g_editor.scene_path;
+        for (char& c : safe) {
+            if (!std::isalnum(static_cast<unsigned char>(c))) {
+                c = '_';
+            }
+        }
+        return (std::filesystem::path("cache") / "lightmap" / (safe + ".lmap")).string();
+    }
+    return g_editor.scene_path + ".lmap";
+}
+
 std::string ensure_lt_extension(const std::string& path) {
     if (lowercase_extension(path) == ".lt") {
         return path;
@@ -620,6 +654,15 @@ lt::SceneRenderSettings capture_scene_render_settings() {
     settings.irradiance_volume_manual_bounds = g_editor.settings.irradiance_volume_manual_bounds;
     settings.irradiance_volume_bounds_min = g_editor.settings.irradiance_volume_bounds_min;
     settings.irradiance_volume_bounds_max = g_editor.settings.irradiance_volume_bounds_max;
+    settings.use_lightmap = g_editor.settings.use_lightmap;
+    settings.lightmap_resolution = g_editor.settings.lightmap_resolution;
+    settings.lightmap_padding = g_editor.settings.lightmap_padding;
+    settings.lightmap_dilation = g_editor.settings.lightmap_dilation;
+    settings.lightmap_bake_samples = g_editor.settings.lightmap_bake_samples;
+    settings.lightmap_bake_bounces = g_editor.settings.lightmap_bake_bounces;
+    settings.lightmap_principled_gi = g_editor.settings.lightmap_principled_gi;
+    settings.lightmap_cache_enabled = g_editor.settings.lightmap_cache_enabled;
+    settings.lightmap_auto_update = g_editor.settings.lightmap_auto_update;
     return settings;
 }
 
@@ -650,6 +693,15 @@ void apply_scene_render_settings(const lt::Scene& scene) {
     g_editor.settings.irradiance_volume_manual_bounds = settings.irradiance_volume_manual_bounds;
     g_editor.settings.irradiance_volume_bounds_min = settings.irradiance_volume_bounds_min;
     g_editor.settings.irradiance_volume_bounds_max = settings.irradiance_volume_bounds_max;
+    g_editor.settings.use_lightmap = settings.use_lightmap;
+    g_editor.settings.lightmap_resolution = settings.lightmap_resolution;
+    g_editor.settings.lightmap_padding = settings.lightmap_padding;
+    g_editor.settings.lightmap_dilation = settings.lightmap_dilation;
+    g_editor.settings.lightmap_bake_samples = settings.lightmap_bake_samples;
+    g_editor.settings.lightmap_bake_bounces = settings.lightmap_bake_bounces;
+    g_editor.settings.lightmap_principled_gi = settings.lightmap_principled_gi;
+    g_editor.settings.lightmap_cache_enabled = settings.lightmap_cache_enabled;
+    g_editor.settings.lightmap_auto_update = settings.lightmap_auto_update;
 }
 
 void load_texture_dialog(lt::Material& material) {
@@ -1059,7 +1111,11 @@ void launch_render_task() {
     copy_setting_text(settings.irradiance_volume_cache_key, g_editor.scene_path);
     copy_setting_text(settings.irradiance_volume_cache_path, default_irradiance_volume_cache_path());
     settings.irradiance_volume_bake_progress = g_editor.irradiance_volume_bake_progress.get();
+    copy_setting_text(settings.lightmap_cache_key, g_editor.scene_path);
+    copy_setting_text(settings.lightmap_cache_path, default_lightmap_cache_path());
+    settings.lightmap_bake_progress = g_editor.lightmap_bake_progress.get();
     const bool consume_force_rebake = settings.irradiance_volume_force_rebake;
+    const bool consume_lightmap_force_rebake = settings.lightmap_force_rebake;
     lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene)
         ? static_cast<lt::IRenderer*>(&g_editor.cpu)
         : g_editor.renderer;
@@ -1075,6 +1131,9 @@ void launch_render_task() {
     });
     if (consume_force_rebake) {
         g_editor.settings.irradiance_volume_force_rebake = false;
+    }
+    if (consume_lightmap_force_rebake) {
+        g_editor.settings.lightmap_force_rebake = false;
     }
 }
 
@@ -2249,6 +2308,7 @@ float draw_top_bar() {
     }
     if (ImGui::BeginMenu("Window")) {
         ImGui::MenuItem("Log", nullptr, &g_editor.show_log_panel);
+        ImGui::MenuItem("Statistics", nullptr, &g_editor.show_statistics_panel);
         ImGui::EndMenu();
     }
     ImGui::Separator();
@@ -2752,123 +2812,168 @@ void draw_properties() {
                 g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
                 reset_accumulation(lt::RenderDirty::Geometry);
             }
-            ImGui::SeparatorText("Irradiance Volume");
-            if (ImGui::Checkbox("Enable Irradiance Volume", &g_editor.settings.use_irradiance_volume)) {
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            ImGui::BeginDisabled(!g_editor.settings.use_irradiance_volume);
-            if (ImGui::Checkbox("Disk Cache", &g_editor.settings.irradiance_volume_cache_enabled)) {
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::Checkbox("Auto Update", &g_editor.settings.irradiance_volume_auto_update)) {
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::Button("Update Volume")) {
-                g_editor.settings.irradiance_volume_force_rebake = true;
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            const std::string cache_path = default_irradiance_volume_cache_path();
-            ImGui::TextWrapped("Cache: %s", cache_path.c_str());
-            if (ImGui::DragInt("Volume Grid", &g_editor.settings.irradiance_volume_grid_resolution, 1.0f, 2, 16)) {
-                g_editor.settings.irradiance_volume_grid_resolution = std::clamp(g_editor.settings.irradiance_volume_grid_resolution, 2, 64);
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::DragInt("Subgrid", &g_editor.settings.irradiance_volume_subgrid_resolution, 1.0f, 2, 8)) {
-                g_editor.settings.irradiance_volume_subgrid_resolution = std::clamp(g_editor.settings.irradiance_volume_subgrid_resolution, 2, 32);
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::DragInt("Direction Grid", &g_editor.settings.irradiance_volume_direction_resolution, 1.0f, 1, 16)) {
-                g_editor.settings.irradiance_volume_direction_resolution = std::clamp(g_editor.settings.irradiance_volume_direction_resolution, 1, 32);
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::DragInt("Bake Samples", &g_editor.settings.irradiance_volume_bake_samples, 1.0f, 1, 16)) {
-                g_editor.settings.irradiance_volume_bake_samples = std::clamp(g_editor.settings.irradiance_volume_bake_samples, 1, 256);
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::DragInt("Bake Bounces", &g_editor.settings.irradiance_volume_bake_bounces, 1.0f, 1, 16)) {
-                g_editor.settings.irradiance_volume_bake_bounces = std::clamp(g_editor.settings.irradiance_volume_bake_bounces, 1, 32);
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::DragFloat("Bounds Inset", &g_editor.settings.irradiance_volume_bounds_inset, 0.002f, 0.0f, 0.45f, "%.3f")) {
-                g_editor.settings.irradiance_volume_bounds_inset = std::clamp(g_editor.settings.irradiance_volume_bounds_inset, 0.0f, 0.45f);
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            if (ImGui::Checkbox("Principled GI", &g_editor.settings.irradiance_volume_principled_gi)) {
-                reset_accumulation();
-            }
-            if (ImGui::Checkbox("Debug Probes", &g_editor.settings.irradiance_volume_debug_probes)) {
-                if (g_editor.settings.irradiance_volume_debug_probes) {
-                    g_editor.settings.use_irradiance_volume = true;
+            if (ImGui::CollapsingHeader("Irradiance Volume")) {
+                if (ImGui::Checkbox("Enable Irradiance Volume", &g_editor.settings.use_irradiance_volume)) {
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
-                reset_accumulation();
-            }
-            if (ImGui::DragFloat("Probe Radius", &g_editor.settings.irradiance_volume_debug_probe_radius_scale, 0.01f, 0.0f, 2.0f, "%.2f")) {
-                g_editor.settings.irradiance_volume_debug_probe_radius_scale =
-                    std::clamp(g_editor.settings.irradiance_volume_debug_probe_radius_scale, 0.0f, 2.0f);
-                reset_accumulation();
-            }
-            if (ImGui::Checkbox("Manual Bounds", &g_editor.settings.irradiance_volume_manual_bounds)) {
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            ImGui::BeginDisabled(!g_editor.settings.irradiance_volume_manual_bounds);
-            float bounds_min[3] = {
-                g_editor.settings.irradiance_volume_bounds_min.x,
-                g_editor.settings.irradiance_volume_bounds_min.y,
-                g_editor.settings.irradiance_volume_bounds_min.z,
-            };
-            if (ImGui::DragFloat3("Bounds Min", bounds_min, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
-                g_editor.settings.irradiance_volume_bounds_min = {bounds_min[0], bounds_min[1], bounds_min[2]};
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            float bounds_max[3] = {
-                g_editor.settings.irradiance_volume_bounds_max.x,
-                g_editor.settings.irradiance_volume_bounds_max.y,
-                g_editor.settings.irradiance_volume_bounds_max.z,
-            };
-            if (ImGui::DragFloat3("Bounds Max", bounds_max, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
-                g_editor.settings.irradiance_volume_bounds_max = {bounds_max[0], bounds_max[1], bounds_max[2]};
-                reset_accumulation(lt::RenderDirty::IrradianceVolume);
-            }
-            ImGui::EndDisabled();
-            ImGui::EndDisabled();
-            ImGui::SeparatorText("NPR Sampling");
-            if (ImGui::DragInt("Style Samples", &g_editor.settings.stylized_samples, 1.0f, 1, 128)) {
-                g_editor.settings.stylized_samples = std::clamp(g_editor.settings.stylized_samples, 1, 128);
-                if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
-                    set_renderer(false);
+                ImGui::BeginDisabled(!g_editor.settings.use_irradiance_volume);
+                if (ImGui::Checkbox("Disk Cache", &g_editor.settings.irradiance_volume_cache_enabled)) {
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
-                reset_accumulation();
-            }
-            if (ImGui::DragInt("Style Depth", &g_editor.settings.stylized_max_depth, 1.0f, 0, 32)) {
-                g_editor.settings.stylized_max_depth = std::clamp(g_editor.settings.stylized_max_depth, 0, 32);
-                if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
-                    set_renderer(false);
+                if (ImGui::Checkbox("Auto Update", &g_editor.settings.irradiance_volume_auto_update)) {
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
-                reset_accumulation();
+                if (ImGui::Button("Update Volume")) {
+                    g_editor.settings.irradiance_volume_force_rebake = true;
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                const std::string cache_path = default_irradiance_volume_cache_path();
+                ImGui::TextWrapped("Cache: %s", cache_path.c_str());
+                if (ImGui::DragInt("Volume Grid", &g_editor.settings.irradiance_volume_grid_resolution, 1.0f, 2, 16)) {
+                    g_editor.settings.irradiance_volume_grid_resolution = std::clamp(g_editor.settings.irradiance_volume_grid_resolution, 2, 64);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                if (ImGui::DragInt("Subgrid", &g_editor.settings.irradiance_volume_subgrid_resolution, 1.0f, 2, 8)) {
+                    g_editor.settings.irradiance_volume_subgrid_resolution = std::clamp(g_editor.settings.irradiance_volume_subgrid_resolution, 2, 32);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                if (ImGui::DragInt("Direction Grid", &g_editor.settings.irradiance_volume_direction_resolution, 1.0f, 1, 16)) {
+                    g_editor.settings.irradiance_volume_direction_resolution = std::clamp(g_editor.settings.irradiance_volume_direction_resolution, 1, 32);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                if (ImGui::DragInt("Bake Samples", &g_editor.settings.irradiance_volume_bake_samples, 1.0f, 1, 16)) {
+                    g_editor.settings.irradiance_volume_bake_samples = std::clamp(g_editor.settings.irradiance_volume_bake_samples, 1, 256);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                if (ImGui::DragInt("Bake Bounces", &g_editor.settings.irradiance_volume_bake_bounces, 1.0f, 1, 16)) {
+                    g_editor.settings.irradiance_volume_bake_bounces = std::clamp(g_editor.settings.irradiance_volume_bake_bounces, 1, 32);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                if (ImGui::DragFloat("Bounds Inset", &g_editor.settings.irradiance_volume_bounds_inset, 0.002f, 0.0f, 0.45f, "%.3f")) {
+                    g_editor.settings.irradiance_volume_bounds_inset = std::clamp(g_editor.settings.irradiance_volume_bounds_inset, 0.0f, 0.45f);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                if (ImGui::Checkbox("Principled GI", &g_editor.settings.irradiance_volume_principled_gi)) {
+                    reset_accumulation();
+                }
+                if (ImGui::Checkbox("Debug Probes", &g_editor.settings.irradiance_volume_debug_probes)) {
+                    if (g_editor.settings.irradiance_volume_debug_probes) {
+                        g_editor.settings.use_irradiance_volume = true;
+                    }
+                    reset_accumulation();
+                }
+                if (ImGui::DragFloat("Probe Radius", &g_editor.settings.irradiance_volume_debug_probe_radius_scale, 0.01f, 0.0f, 2.0f, "%.2f")) {
+                    g_editor.settings.irradiance_volume_debug_probe_radius_scale =
+                        std::clamp(g_editor.settings.irradiance_volume_debug_probe_radius_scale, 0.0f, 2.0f);
+                    reset_accumulation();
+                }
+                if (ImGui::Checkbox("Manual Bounds", &g_editor.settings.irradiance_volume_manual_bounds)) {
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                ImGui::BeginDisabled(!g_editor.settings.irradiance_volume_manual_bounds);
+                float bounds_min[3] = {
+                    g_editor.settings.irradiance_volume_bounds_min.x,
+                    g_editor.settings.irradiance_volume_bounds_min.y,
+                    g_editor.settings.irradiance_volume_bounds_min.z,
+                };
+                if (ImGui::DragFloat3("Bounds Min", bounds_min, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
+                    g_editor.settings.irradiance_volume_bounds_min = {bounds_min[0], bounds_min[1], bounds_min[2]};
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                float bounds_max[3] = {
+                    g_editor.settings.irradiance_volume_bounds_max.x,
+                    g_editor.settings.irradiance_volume_bounds_max.y,
+                    g_editor.settings.irradiance_volume_bounds_max.z,
+                };
+                if (ImGui::DragFloat3("Bounds Max", bounds_max, 0.02f, -1000.0f, 1000.0f, "%.3f")) {
+                    g_editor.settings.irradiance_volume_bounds_max = {bounds_max[0], bounds_max[1], bounds_max[2]};
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                ImGui::EndDisabled();
+                ImGui::EndDisabled();
             }
-            ImGui::SeparatorText("Environment");
-            color_edit("Environment Color", g_editor.scene.environment.color, lt::RenderDirty::Environment);
-            if (ImGui::DragFloat("Strength", &g_editor.scene.environment.strength, 0.05f, 0.0f, 100.0f, "%.2f")) {
-                g_editor.scene.environment.strength = std::max(0.0f, g_editor.scene.environment.strength);
-                reset_accumulation(lt::RenderDirty::Environment);
+            if (ImGui::CollapsingHeader("Lightmap")) {
+                if (ImGui::Checkbox("Enable Lightmap", &g_editor.settings.use_lightmap)) {
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                ImGui::BeginDisabled(!g_editor.settings.use_lightmap);
+                if (ImGui::Checkbox("Lightmap Disk Cache", &g_editor.settings.lightmap_cache_enabled)) {
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::Checkbox("Lightmap Auto Update", &g_editor.settings.lightmap_auto_update)) {
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::Button("Update Lightmap")) {
+                    g_editor.settings.lightmap_force_rebake = true;
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                const std::string lightmap_cache_path = default_lightmap_cache_path();
+                ImGui::TextWrapped("Lightmap Cache: %s", lightmap_cache_path.c_str());
+                if (ImGui::DragInt("Lightmap Resolution", &g_editor.settings.lightmap_resolution, 16.0f, 16, 4096)) {
+                    g_editor.settings.lightmap_resolution = std::clamp(g_editor.settings.lightmap_resolution, 16, 16384);
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::DragInt("Lightmap Padding", &g_editor.settings.lightmap_padding, 1.0f, 0, 32)) {
+                    g_editor.settings.lightmap_padding = std::clamp(g_editor.settings.lightmap_padding, 0, 64);
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::DragInt("Lightmap Dilation", &g_editor.settings.lightmap_dilation, 1.0f, 0, 32)) {
+                    g_editor.settings.lightmap_dilation = std::clamp(g_editor.settings.lightmap_dilation, 0, 64);
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::DragInt("Lightmap Samples", &g_editor.settings.lightmap_bake_samples, 1.0f, 1, 32)) {
+                    g_editor.settings.lightmap_bake_samples = std::clamp(g_editor.settings.lightmap_bake_samples, 1, 256);
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::DragInt("Lightmap Bounces", &g_editor.settings.lightmap_bake_bounces, 1.0f, 1, 16)) {
+                    g_editor.settings.lightmap_bake_bounces = std::clamp(g_editor.settings.lightmap_bake_bounces, 1, 32);
+                    reset_accumulation(lt::RenderDirty::Lightmap);
+                }
+                if (ImGui::Checkbox("Lightmap Principled GI", &g_editor.settings.lightmap_principled_gi)) {
+                    reset_accumulation();
+                }
+                ImGui::EndDisabled();
             }
-            bool constant_environment = g_editor.scene.environment.constant && !g_editor.scene.environment.texture;
-            if (ImGui::Checkbox("Constant Environment", &constant_environment)) {
-                g_editor.scene.environment.constant = constant_environment;
-                if (constant_environment) {
+            if (ImGui::CollapsingHeader("NPR Sampling")) {
+                if (ImGui::DragInt("Style Samples", &g_editor.settings.stylized_samples, 1.0f, 1, 128)) {
+                    g_editor.settings.stylized_samples = std::clamp(g_editor.settings.stylized_samples, 1, 128);
+                    if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
+                        set_renderer(false);
+                    }
+                    reset_accumulation();
+                }
+                if (ImGui::DragInt("Style Depth", &g_editor.settings.stylized_max_depth, 1.0f, 0, 32)) {
+                    g_editor.settings.stylized_max_depth = std::clamp(g_editor.settings.stylized_max_depth, 0, 32);
+                    if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
+                        set_renderer(false);
+                    }
+                    reset_accumulation();
+                }
+            }
+            if (ImGui::CollapsingHeader("Environment")) {
+                color_edit("Environment Color", g_editor.scene.environment.color, lt::RenderDirty::Environment);
+                if (ImGui::DragFloat("Strength", &g_editor.scene.environment.strength, 0.05f, 0.0f, 100.0f, "%.2f")) {
+                    g_editor.scene.environment.strength = std::max(0.0f, g_editor.scene.environment.strength);
+                    reset_accumulation(lt::RenderDirty::Environment);
+                }
+                bool constant_environment = g_editor.scene.environment.constant && !g_editor.scene.environment.texture;
+                if (ImGui::Checkbox("Constant Environment", &constant_environment)) {
+                    g_editor.scene.environment.constant = constant_environment;
+                    if (constant_environment) {
+                        g_editor.scene.environment.texture = nullptr;
+                    }
+                    reset_accumulation(lt::RenderDirty::Environment);
+                }
+                ImGui::Text("HDRI: %s", g_editor.scene.environment.texture ? g_editor.scene.environment.texture->name.c_str() : "None");
+                if (ImGui::Button("Load HDRI")) {
+                    load_environment_texture_dialog();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear HDRI")) {
                     g_editor.scene.environment.texture = nullptr;
+                    g_editor.scene.environment.constant = false;
+                    reset_accumulation(lt::RenderDirty::Environment);
                 }
-                reset_accumulation(lt::RenderDirty::Environment);
-            }
-            ImGui::Text("HDRI: %s", g_editor.scene.environment.texture ? g_editor.scene.environment.texture->name.c_str() : "None");
-            if (ImGui::Button("Load HDRI")) {
-                load_environment_texture_dialog();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Clear HDRI")) {
-                g_editor.scene.environment.texture = nullptr;
-                g_editor.scene.environment.constant = false;
-                reset_accumulation(lt::RenderDirty::Environment);
             }
             ImGui::Checkbox("Pause", &g_editor.paused);
             ImGui::EndTabItem();
@@ -2999,19 +3104,6 @@ void draw_status_bar() {
     ImGui::SetNextWindowPos({viewport->Pos.x, viewport->Pos.y + viewport->Size.y - 26.0f});
     ImGui::SetNextWindowSize({viewport->Size.x, 26.0f});
     ImGui::Begin("Status", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-    size_t vertex_count = 0;
-    size_t triangle_count = 0;
-    for (const lt::Mesh& mesh : g_editor.scene.meshes) {
-        vertex_count += mesh.vertices.size();
-        triangle_count += mesh.indices.size() / 3;
-    }
-    ImGui::Text("Meshes: %d | Spheres: %d | Vertices: %zu | Triangles: %zu | %dx%d",
-                static_cast<int>(g_editor.scene.meshes.size()),
-                static_cast<int>(g_editor.scene.spheres.size()),
-                vertex_count,
-                triangle_count,
-                g_editor.settings.width,
-                g_editor.settings.height);
     ImGui::End();
 }
 
@@ -3158,6 +3250,390 @@ void draw_irradiance_volume_bake_overlay() {
     ImGui::PopStyleVar();
 }
 
+void draw_lightmap_bake_overlay() {
+    if (scene_load_in_progress() || !g_editor.lightmap_bake_progress) {
+        return;
+    }
+    lt::LightmapBakeProgress& progress = *g_editor.lightmap_bake_progress;
+    const auto phase = static_cast<lt::LightmapBakePhase>(progress.phase.load(std::memory_order_relaxed));
+    if (phase != lt::LightmapBakePhase::LoadingCache &&
+        phase != lt::LightmapBakePhase::Unwrapping &&
+        phase != lt::LightmapBakePhase::Baking &&
+        phase != lt::LightmapBakePhase::SavingCache) {
+        return;
+    }
+
+    const char* title = "Baking lightmap";
+    if (phase == lt::LightmapBakePhase::LoadingCache) {
+        title = "Loading lightmap";
+    } else if (phase == lt::LightmapBakePhase::Unwrapping) {
+        title = "Unwrapping lightmap";
+    } else if (phase == lt::LightmapBakePhase::SavingCache) {
+        title = "Saving lightmap";
+    }
+    const uint64_t total_texels = progress.total_texels.load(std::memory_order_relaxed);
+    const uint64_t completed_texels = progress.completed_texels.load(std::memory_order_relaxed);
+    const uint64_t total_rays = progress.total_rays.load(std::memory_order_relaxed);
+    const uint64_t traced_rays = progress.traced_rays.load(std::memory_order_relaxed);
+    const int width = progress.width.load(std::memory_order_relaxed);
+    const int height = progress.height.load(std::memory_order_relaxed);
+    const double elapsed_ms = progress.elapsed_ms.load(std::memory_order_relaxed);
+
+    const auto now = std::chrono::steady_clock::now();
+    const double animated = std::fmod(std::chrono::duration<double>(now.time_since_epoch()).count() * 0.45, 1.0);
+    float fraction = static_cast<float>(animated);
+    if (phase == lt::LightmapBakePhase::Baking && total_texels > 0) {
+        fraction = std::clamp(static_cast<float>(completed_texels) / static_cast<float>(total_texels), 0.0f, 1.0f);
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos({viewport->Pos.x + viewport->Size.x - 340.0f, viewport->Pos.y + 158.0f}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({312.0f, 108.0f}, ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.11f, 0.12f, 0.94f));
+    if (ImGui::Begin("LightmapBakeOverlay", nullptr, flags)) {
+        ImGui::TextUnformatted(title);
+        ImGui::ProgressBar(fraction, {-1.0f, 8.0f}, "");
+        ImGui::TextDisabled(
+            "Texels %llu / %llu  %dx%d",
+            static_cast<unsigned long long>(completed_texels),
+            static_cast<unsigned long long>(total_texels),
+            width,
+            height);
+        if (total_rays > 0) {
+            ImGui::TextDisabled(
+                "Rays %llu / %llu",
+                static_cast<unsigned long long>(traced_rays),
+                static_cast<unsigned long long>(total_rays));
+        } else if (elapsed_ms > 0.0) {
+            ImGui::TextDisabled("%.1f ms", elapsed_ms);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+void draw_statistics_panel() {
+    if (!g_editor.show_statistics_panel) return;
+
+    ImGui::SetNextWindowSize({460.0f, 520.0f}, ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Statistics", &g_editor.show_statistics_panel)) {
+        ImGui::End();
+        return;
+    }
+
+    char buf[128];
+    const lt::Scene& scene = g_editor.scene;
+
+    // Helpers
+    auto section = [](const char* title) {
+        ImGui::SeparatorText(title);
+    };
+    auto stat_row = [&](const char* label, const char* fmt, ...) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(label);
+        ImGui::TableSetColumnIndex(1);
+        va_list args;
+        va_start(args, fmt);
+        std::vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+        ImGui::TextUnformatted(buf);
+    };
+    auto begin_stats_table = []() {
+        ImGui::BeginTable("##stats", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV);
+        ImGui::TableSetupColumn("##label", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGui::TableSetupColumn("##value");
+    };
+    auto end_stats_table = []() {
+        ImGui::EndTable();
+    };
+
+    // --- Geometry ---
+    section("Geometry");
+
+    size_t total_verts = 0;
+    size_t total_tris = 0;
+    size_t total_light_tris = 0;
+    for (const lt::Mesh& m : scene.meshes) {
+        total_verts += m.vertices.size();
+        total_tris += m.indices.size() / 3;
+        if (m.light.enabled)
+            total_light_tris += m.indices.size() / 3;
+    }
+
+    begin_stats_table();
+    stat_row("Meshes", "%d", static_cast<int>(scene.meshes.size()));
+    stat_row("Spheres", "%d", static_cast<int>(scene.spheres.size()));
+    stat_row("Materials", "%d", static_cast<int>(scene.materials.size()));
+    stat_row("Textures", "%d", static_cast<int>(scene.textures.size()));
+    stat_row("Vertices", "%zu", total_verts);
+    stat_row("Triangles", "%zu", total_tris);
+    stat_row("Light Triangles", "%zu", total_light_tris);
+    stat_row("Directional Lights", "%d", static_cast<int>(scene.directional_lights.size()));
+    end_stats_table();
+
+    // Refresh pick cache for RenderScene stats if stale (once per generation)
+    if (g_pick_cache.scene_generation != g_editor.render_generation) {
+        g_pick_cache.render_scene = lt::build_render_scene(g_editor.scene);
+        g_pick_cache.scene_generation = g_editor.render_generation;
+    }
+    const lt::RenderScene& rs = g_pick_cache.render_scene;
+    const bool rs_valid = !rs.triangles.empty() || !rs.spheres.empty() ||
+        !rs.bvh_nodes.empty();
+
+    if (rs_valid) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("Render Scene (acceleration data)");
+        begin_stats_table();
+        stat_row("Render Triangles", "%zu", rs.triangles.size());
+        stat_row("BVH Nodes", "%zu", rs.bvh_nodes.size());
+        stat_row("TLAS Nodes", "%zu", rs.tlas_nodes.size());
+        stat_row("Mesh Instances", "%zu", rs.mesh_instances.size());
+        stat_row("Flat BVH Nodes", "%zu", rs.flat_bvh_nodes.size());
+        end_stats_table();
+    }
+
+    // --- Resolution / Renderer ---
+    section("Renderer");
+    begin_stats_table();
+    stat_row("Renderer", "%s", g_editor.renderer->name());
+    stat_row("Samples", "%u", g_editor.frame_index);
+    stat_row("Viewport", "%dx%d",
+        static_cast<int>(g_editor.viewport_size.x),
+        static_cast<int>(g_editor.viewport_size.y));
+    stat_row("Render Resolution", "%dx%d",
+        g_editor.settings.width, g_editor.settings.height);
+    stat_row("Sample Time", "%.2f ms", g_editor.last_sample_ms);
+    stat_row("Max Bounces", "%d", g_editor.settings.max_bounces);
+    stat_row("Samples/Frame", "%d", g_editor.settings.samples_per_pixel);
+    stat_row("Acceleration", "%s",
+        g_editor.settings.acceleration_structure == lt::AccelerationStructure::Auto ? "Auto" :
+        g_editor.settings.acceleration_structure == lt::AccelerationStructure::Flat ? "Flat BVH" :
+        "Two-level BVH");
+    end_stats_table();
+
+    // --- System RAM ---
+    section("System Memory");
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        bool ram_ok = GetProcessMemoryInfo(GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+        if (ram_ok) {
+            begin_stats_table();
+            format_bytes(pmc.WorkingSetSize, buf, sizeof(buf));
+            stat_row("Working Set", "%s", buf);
+            format_bytes(pmc.PrivateUsage, buf, sizeof(buf));
+            stat_row("Private Usage", "%s", buf);
+            format_bytes(pmc.PeakWorkingSetSize, buf, sizeof(buf));
+            stat_row("Peak Working Set", "%s", buf);
+            format_bytes(pmc.PagefileUsage, buf, sizeof(buf));
+            stat_row("Commit Size", "%s", buf);
+            end_stats_table();
+        } else {
+            ImGui::TextDisabled("Process memory query failed");
+        }
+    }
+
+    // --- GPU VRAM ---
+    section("GPU Memory");
+#if LT_HAS_CUDA
+    if (g_editor.cuda.available()) {
+        size_t vram_free = 0;
+        size_t vram_total = 0;
+        cudaError_t err = cudaMemGetInfo(&vram_free, &vram_total);
+        if (err == cudaSuccess) {
+            size_t vram_used = vram_total - vram_free;
+            begin_stats_table();
+            format_bytes(vram_used, buf, sizeof(buf));
+            stat_row("VRAM Used", "%s", buf);
+            format_bytes(vram_free, buf, sizeof(buf));
+            stat_row("VRAM Free", "%s", buf);
+            format_bytes(vram_total, buf, sizeof(buf));
+            stat_row("VRAM Total", "%s", buf);
+            std::snprintf(buf, sizeof(buf), "%.1f%%", vram_total > 0 ?
+                100.0 * static_cast<double>(vram_used) / static_cast<double>(vram_total) : 0.0);
+            stat_row("VRAM Usage", "%s", buf);
+            end_stats_table();
+        } else {
+            ImGui::TextDisabled("cudaMemGetInfo failed: %s",
+                cudaGetErrorString(err));
+        }
+    } else {
+        ImGui::TextDisabled("CUDA device not available (using CPU renderer)");
+    }
+#else
+    ImGui::TextDisabled("CUDA backend not built (CPU renderer only)");
+#endif
+
+    // --- Estimated Scene Memory ---
+    section("Estimated Scene Memory");
+    {
+        size_t mesh_vertex_bytes = 0;
+        size_t mesh_index_bytes = 0;
+        size_t mesh_normal_bytes = 0;
+        size_t mesh_uv_bytes = 0;
+        for (const lt::Mesh& m : scene.meshes) {
+            mesh_vertex_bytes += m.vertices.size() * sizeof(lt::Vec3);
+            mesh_index_bytes += m.indices.size() * sizeof(uint32_t);
+            mesh_normal_bytes += m.normals.size() * sizeof(lt::Vec3);
+            mesh_uv_bytes += m.texcoords.size() * sizeof(lt::Vec2);
+        }
+        size_t mesh_total = mesh_vertex_bytes + mesh_index_bytes +
+            mesh_normal_bytes + mesh_uv_bytes;
+
+        size_t tex_pixel_bytes = 0;
+        size_t tex_alpha_bytes = 0;
+        size_t tex_mip_bytes = 0;
+        size_t tex_encoded_bytes = 0;
+        for (const auto& tex : scene.textures) {
+            if (!tex) continue;
+            tex_pixel_bytes += tex->pixels.size() * sizeof(lt::Vec3);
+            tex_alpha_bytes += tex->alpha.size() * sizeof(float);
+            tex_encoded_bytes += tex->encoded_bytes.size();
+            for (const auto& mip : tex->mip_pixels)
+                tex_mip_bytes += mip.size() * sizeof(lt::Vec3);
+        }
+        size_t tex_total = tex_pixel_bytes + tex_alpha_bytes +
+            tex_mip_bytes + tex_encoded_bytes;
+
+        size_t framebuffer_bytes = static_cast<size_t>(g_editor.settings.width) *
+            static_cast<size_t>(g_editor.settings.height) * 4 * sizeof(float);
+
+        size_t mat_estimate = scene.materials.size() * 512; // rough per-material overhead
+        size_t sphere_bytes = scene.spheres.size() * sizeof(lt::Sphere);
+
+        size_t scene_total = mesh_total + tex_total + framebuffer_bytes +
+            mat_estimate + sphere_bytes;
+
+        begin_stats_table();
+        format_bytes(mesh_vertex_bytes, buf, sizeof(buf));
+        stat_row("  Vertices", "%s", buf);
+        format_bytes(mesh_index_bytes, buf, sizeof(buf));
+        stat_row("  Indices", "%s", buf);
+        format_bytes(mesh_normal_bytes, buf, sizeof(buf));
+        stat_row("  Normals", "%s", buf);
+        format_bytes(mesh_uv_bytes, buf, sizeof(buf));
+        stat_row("  UVs", "%s", buf);
+        format_bytes(mesh_total, buf, sizeof(buf));
+        stat_row("Mesh Subtotal", "%s", buf);
+        ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+        ImGui::TableSetColumnIndex(1); // spacer
+        format_bytes(tex_pixel_bytes, buf, sizeof(buf));
+        stat_row("  Pixels", "%s", buf);
+        format_bytes(tex_alpha_bytes, buf, sizeof(buf));
+        stat_row("  Alpha", "%s", buf);
+        format_bytes(tex_mip_bytes, buf, sizeof(buf));
+        stat_row("  Mips", "%s", buf);
+        format_bytes(tex_encoded_bytes, buf, sizeof(buf));
+        stat_row("  Encoded", "%s", buf);
+        format_bytes(tex_total, buf, sizeof(buf));
+        stat_row("Texture Subtotal", "%s", buf);
+        ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+        ImGui::TableSetColumnIndex(1); // spacer
+        format_bytes(framebuffer_bytes, buf, sizeof(buf));
+        stat_row("Framebuffer (RGBA32F)", "%s", buf);
+        format_bytes(mat_estimate, buf, sizeof(buf));
+        stat_row("Materials (est.)", "%s", buf);
+        format_bytes(sphere_bytes, buf, sizeof(buf));
+        stat_row("Spheres", "%s", buf);
+        ImGui::Separator();
+        format_bytes(scene_total, buf, sizeof(buf));
+        stat_row("Scene Total (est.)", "%s", buf);
+        end_stats_table();
+    }
+
+    // --- Estimated Acceleration / Cache Memory ---
+    section("Estimated Cache Memory");
+    {
+        size_t render_tri_bytes = 0;
+        size_t render_idx_bytes = 0;
+        size_t render_flat_idx_bytes = 0;
+        size_t render_bvh_bytes = 0;
+        size_t render_flat_bvh_bytes = 0;
+        size_t render_tlas_bytes = 0;
+        size_t render_instance_bytes = 0;
+        size_t render_light_idx_bytes = 0;
+        if (rs_valid) {
+            render_tri_bytes = rs.triangles.size() * sizeof(lt::Triangle);
+            render_idx_bytes = rs.triangle_indices.size() * sizeof(int);
+            render_flat_idx_bytes = rs.flat_triangle_indices.size() * sizeof(int);
+            render_bvh_bytes = rs.bvh_nodes.size() * sizeof(lt::BvhNode);
+            render_flat_bvh_bytes = rs.flat_bvh_nodes.size() * sizeof(lt::BvhNode);
+            render_tlas_bytes = rs.tlas_nodes.size() * sizeof(lt::BvhNode);
+            render_instance_bytes = rs.mesh_instances.size() * sizeof(lt::RenderScene::MeshInstance);
+            render_light_idx_bytes = rs.light_triangle_indices.size() * sizeof(int);
+        }
+        size_t render_total = render_tri_bytes + render_idx_bytes +
+            render_flat_idx_bytes + render_bvh_bytes + render_flat_bvh_bytes +
+            render_tlas_bytes + render_instance_bytes + render_light_idx_bytes;
+
+        // Lightmap estimate (RGBA32F per texel, from settings)
+        size_t lm_est = 0;
+        if (g_editor.settings.use_lightmap) {
+            lm_est = static_cast<size_t>(g_editor.settings.lightmap_resolution) *
+                static_cast<size_t>(g_editor.settings.lightmap_resolution) *
+                4 * sizeof(float);
+        }
+
+        // Irradiance volume estimate
+        size_t iv_est = 0;
+        if (g_editor.settings.use_irradiance_volume) {
+            const int g = g_editor.settings.irradiance_volume_grid_resolution;
+            const int s = g_editor.settings.irradiance_volume_subgrid_resolution;
+            const int d = g_editor.settings.irradiance_volume_direction_resolution;
+            const size_t cells = static_cast<size_t>(g) * g * g;
+            const size_t probes = static_cast<size_t>(s) * s * s;
+            const size_t dirs = static_cast<size_t>(d) * d;
+            // Each probe stores directions (Vec3) + irradiance (Vec3)
+            iv_est = cells * probes * dirs * 2 * sizeof(lt::Vec3);
+        }
+
+        begin_stats_table();
+        if (rs_valid) {
+            format_bytes(render_tri_bytes, buf, sizeof(buf));
+            stat_row("  Triangles", "%s", buf);
+            format_bytes(render_idx_bytes, buf, sizeof(buf));
+            stat_row("  Triangle Indices", "%s", buf);
+            format_bytes(render_flat_idx_bytes, buf, sizeof(buf));
+            stat_row("  Flat Indices", "%s", buf);
+            format_bytes(render_bvh_bytes, buf, sizeof(buf));
+            stat_row("  BVH Nodes", "%s", buf);
+            format_bytes(render_flat_bvh_bytes, buf, sizeof(buf));
+            stat_row("  Flat BVH Nodes", "%s", buf);
+            format_bytes(render_tlas_bytes, buf, sizeof(buf));
+            stat_row("  TLAS Nodes", "%s", buf);
+            format_bytes(render_instance_bytes, buf, sizeof(buf));
+            stat_row("  Mesh Instances", "%s", buf);
+            format_bytes(render_light_idx_bytes, buf, sizeof(buf));
+            stat_row("  Light Indices", "%s", buf);
+            format_bytes(render_total, buf, sizeof(buf));
+            stat_row("RenderScene Subtotal", "%s", buf);
+            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+            ImGui::TableSetColumnIndex(1); // spacer
+        } else {
+            ImGui::TextDisabled("(pick cache not yet populated)");
+        }
+        format_bytes(lm_est, buf, sizeof(buf));
+        stat_row("Lightmap (est., RGBA32F)", "%s%s",
+            buf, g_editor.settings.use_lightmap ? "" : " (disabled)");
+        format_bytes(iv_est, buf, sizeof(buf));
+        stat_row("Irradiance Volume (est.)", "%s%s",
+            buf, g_editor.settings.use_irradiance_volume ? "" : " (disabled)");
+        size_t cache_total = render_total + lm_est + iv_est;
+        ImGui::Separator();
+        format_bytes(cache_total, buf, sizeof(buf));
+        stat_row("Cache Total (est.)", "%s", buf);
+        end_stats_table();
+    }
+
+    ImGui::End();
+}
+
 void draw_log_panel() {
     if (!g_editor.show_log_panel) {
         return;
@@ -3214,6 +3690,7 @@ void draw_ui() {
     const ImVec2 layout_size = viewport->Size;
     if (g_window_minimized || IsIconic(g_hwnd) || layout_size.x <= 480.0f || layout_size.y <= 240.0f) {
         draw_log_panel();
+        draw_statistics_panel();
         return;
     }
     const float content_height = std::max(64.0f, layout_size.y - top - bottom);
@@ -3227,10 +3704,12 @@ void draw_ui() {
         ImGui::SetNextWindowPos({layout_pos.x, layout_pos.y + top}, ImGuiCond_Always);
         ImGui::SetNextWindowSize({layout_size.x, content_height}, ImGuiCond_Always);
         draw_viewport();
-        draw_status_bar();
         draw_loading_overlay();
         draw_irradiance_volume_bake_overlay();
+        draw_lightmap_bake_overlay();
         draw_log_panel();
+        draw_statistics_panel();
+        draw_status_bar();
         launch_render_task();
         return;
     }
@@ -3247,10 +3726,12 @@ void draw_ui() {
     ImGui::SetNextWindowSize({g_editor.properties_width, content_height - outliner_height}, ImGuiCond_Always);
     draw_properties();
     draw_layout_splitters(layout_pos, layout_size, top, content_height, viewport_width, outliner_height);
-    draw_status_bar();
     draw_loading_overlay();
     draw_irradiance_volume_bake_overlay();
+    draw_lightmap_bake_overlay();
     draw_log_panel();
+    draw_statistics_panel();
+    draw_status_bar();
     launch_render_task();
 }
 

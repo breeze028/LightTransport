@@ -1,6 +1,7 @@
 void CpuPathTracer::reset() {
     cached_render_scene_ = {};
     cached_irradiance_volume_.reset();
+    cached_lightmap_.reset();
     scene_uploaded_ = false;
 }
 
@@ -24,6 +25,27 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
         scene_uploaded_ = true;
     }
     const RenderScene& render_scene = cached_render_scene_;
+    std::shared_ptr<Lightmap> lightmap;
+    if (lightmap_rendering_enabled(settings)) {
+        const bool lightmap_dirty = has_dirty(settings.dirty, RenderDirty::Lightmap) ||
+            has_dirty(settings.dirty, RenderDirty::Geometry) ||
+            has_dirty(settings.dirty, RenderDirty::Transform) ||
+            has_dirty(settings.dirty, RenderDirty::Material) ||
+            has_dirty(settings.dirty, RenderDirty::Texture) ||
+            has_dirty(settings.dirty, RenderDirty::Environment);
+        bool lightmap_rebuilt = false;
+        lightmap = update_lightmap(
+            cached_lightmap_,
+            cached_render_scene_,
+            scene,
+            settings,
+            lightmap_dirty,
+            lightmap_rebuilt);
+    } else if (cached_lightmap_) {
+        cached_lightmap_.reset();
+        apply_lightmap_to_render_scene(nullptr, cached_render_scene_);
+        set_lightmap_progress_phase(settings, LightmapBakePhase::Idle);
+    }
     std::shared_ptr<IrradianceVolume> irradiance_volume;
     if (irradiance_volume_rendering_enabled(settings)) {
         const bool volume_dirty = has_dirty(settings.dirty, RenderDirty::IrradianceVolume) ||
@@ -67,7 +89,8 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
                         make_camera_ray(scene.camera, x, y, settings, rng),
                         rng,
                         settings,
-                        irradiance_volume.get());
+                        irradiance_volume.get(),
+                        lightmap.get());
                 }
                 sample = sample / static_cast<float>(settings.samples_per_pixel);
                 framebuffer.accumulation[idx] += sample;

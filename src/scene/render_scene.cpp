@@ -183,7 +183,7 @@ RenderScene build_render_scene(const Scene& scene) {
             const int triangle_index = static_cast<int>(render_scene.triangles.size());
             render_scene.triangles.push_back({
                 v0, v1, v2, normal, n0, n1, n2, tangent, bitangent, (v0 + v1 + v2) / 3.0f,
-                uv0, uv1, uv2, mesh.material, mesh_index,
+                uv0, uv1, uv2, {}, {}, {}, mesh.material, mesh_index, false,
             });
             render_scene.triangle_indices.push_back(triangle_index);
 

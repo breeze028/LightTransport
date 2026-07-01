@@ -12,7 +12,7 @@ bool use_two_level_accel(const RenderScene& render_scene, AccelerationStructure 
     return render_scene.mesh_instances.size() > 1;
 }
 
-bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuScene& packed) {
+bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& settings, const RenderScene& render_scene, PackedGpuScene& packed) {
     packed = {};
     GpuScene& gpu = packed.scene;
     gpu.camera = scene.camera;
@@ -218,7 +218,6 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
             return false;
         }
     }
-    const RenderScene render_scene = build_render_scene(scene);
     if (!size_fits_int(render_scene.triangles.size()) || !size_fits_int(render_scene.spheres.size()) ||
         !size_fits_int(render_scene.triangle_indices.size()) ||
         !size_fits_int(render_scene.flat_triangle_indices.size()) || !size_fits_int(render_scene.flat_bvh_nodes.size()) ||
@@ -268,7 +267,11 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
                 light_double_sided = light.double_sided ? 1 : 0;
             }
         }
-        packed.triangles[static_cast<size_t>(i)] = {tri.v0, tri.v1, tri.v2, tri.normal, tri.n0, tri.n1, tri.n2, tri.tangent, tri.bitangent, tri.centroid, emission, tri.uv0, tri.uv1, tri.uv2, tri.material, tri.mesh, light_double_sided};
+        packed.triangles[static_cast<size_t>(i)] = {
+            tri.v0, tri.v1, tri.v2, tri.normal, tri.n0, tri.n1, tri.n2, tri.tangent, tri.bitangent, tri.centroid,
+            emission, tri.uv0, tri.uv1, tri.uv2, tri.lightmap_uv0, tri.lightmap_uv1, tri.lightmap_uv2,
+            tri.material, tri.mesh, light_double_sided, tri.has_lightmap ? 1 : 0,
+        };
     }
     for (int i = 0; i < gpu.sphere_count; ++i) {
         const RenderSphere& sphere = render_scene.spheres[static_cast<size_t>(i)];
@@ -293,6 +296,10 @@ bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuSce
     }
     gpu.light_count = static_cast<int>(packed.light_indices.size());
     return true;
+}
+
+bool pack_scene(const Scene& scene, const RenderSettings& settings, PackedGpuScene& packed) {
+    return pack_scene_from_render_scene(scene, settings, build_render_scene(scene), packed);
 }
 
 template <typename T>

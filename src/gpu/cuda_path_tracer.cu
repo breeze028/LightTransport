@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include <xatlas.h>
+
 namespace lt {
 namespace {
 
@@ -29,8 +31,10 @@ namespace {
 #include "../cpu/types.inl"
 #include "../cpu/intersection.inl"
 #include "../cpu/irradiance_volume.inl"
+#include "../cpu/lightmap.inl"
 #include "../cpu/shading.inl"
 #include "../cpu/irradiance_volume_bake.inl"
+#include "../cpu/lightmap_bake.inl"
 
 struct PackedGpuIrradianceVolume {
     GpuIrradianceVolume volume;
@@ -39,6 +43,11 @@ struct PackedGpuIrradianceVolume {
     std::vector<GpuIrradianceVolumeGrid> grids;
     std::vector<int> cell_subgrid_indices;
     std::vector<GpuIrradianceVolumeDebugProbe> debug_probes;
+};
+
+struct PackedGpuLightmap {
+    GpuLightmap lightmap;
+    std::vector<Vec3> texels;
 };
 
 int flatten_irradiance_grid(const IrradianceVolumeGrid& grid, int direction_count, PackedGpuIrradianceVolume& packed) {
@@ -114,6 +123,20 @@ bool pack_irradiance_volume(const IrradianceVolume* volume, PackedGpuIrradianceV
     return true;
 }
 
+bool pack_lightmap(const Lightmap* lightmap, PackedGpuLightmap& packed) {
+    packed = {};
+    if (!lightmap || lightmap->width <= 0 || lightmap->height <= 0) {
+        return true;
+    }
+    if (!size_fits_int(lightmap->texels.size())) {
+        return false;
+    }
+    packed.texels = lightmap->texels;
+    packed.lightmap.width = lightmap->width;
+    packed.lightmap.height = lightmap->height;
+    return true;
+}
+
 const char* cuda_error_text(cudaError_t error) {
     return error == cudaSuccess ? nullptr : cudaGetErrorString(error);
 }
@@ -149,6 +172,7 @@ void CudaPathTracer::reset() {
     cudaFree(device_irradiance_volume_grids_);
     cudaFree(device_irradiance_volume_cells_);
     cudaFree(device_irradiance_volume_debug_probes_);
+    cudaFree(device_lightmap_texels_);
     device_accumulation_ = nullptr;
     device_rgba_ = nullptr;
     device_scene_ = nullptr;
@@ -168,8 +192,10 @@ void CudaPathTracer::reset() {
     device_irradiance_volume_grids_ = nullptr;
     device_irradiance_volume_cells_ = nullptr;
     device_irradiance_volume_debug_probes_ = nullptr;
+    device_lightmap_texels_ = nullptr;
     cached_render_scene_ = {};
     cached_irradiance_volume_.reset();
+    cached_lightmap_.reset();
     cached_pixels_ = 0;
     cached_materials_ = 0;
     cached_textures_ = 0;
@@ -187,9 +213,11 @@ void CudaPathTracer::reset() {
     cached_irradiance_volume_grids_ = 0;
     cached_irradiance_volume_cells_ = 0;
     cached_irradiance_volume_debug_probes_ = 0;
+    cached_lightmap_texels_ = 0;
     scene_uploaded_ = false;
     cached_render_scene_valid_ = false;
     cached_irradiance_volume_enabled_ = false;
+    cached_lightmap_enabled_ = false;
     release_texture_objects(texture_arrays_, texture_objects_);
 }
 
@@ -248,15 +276,39 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         has_dirty(settings.dirty, RenderDirty::Transform)) {
         cached_render_scene_valid_ = false;
     }
+    if ((lightmap_rendering_enabled(settings) || irradiance_volume_rendering_enabled(settings)) && !cached_render_scene_valid_) {
+        cached_render_scene_ = build_render_scene(scene);
+        cached_render_scene_valid_ = true;
+    }
+
+    std::shared_ptr<Lightmap> lightmap;
+    bool lightmap_rebuilt = false;
+    const bool lightmap_enabled_changed = cached_lightmap_enabled_ != settings.use_lightmap;
+    if (lightmap_rendering_enabled(settings)) {
+        const bool lightmap_dirty = has_dirty(settings.dirty, RenderDirty::Lightmap) ||
+            has_dirty(settings.dirty, RenderDirty::Geometry) ||
+            has_dirty(settings.dirty, RenderDirty::Transform) ||
+            has_dirty(settings.dirty, RenderDirty::Material) ||
+            has_dirty(settings.dirty, RenderDirty::Texture) ||
+            has_dirty(settings.dirty, RenderDirty::Environment);
+        lightmap = update_lightmap(
+            cached_lightmap_,
+            cached_render_scene_,
+            scene,
+            settings,
+            lightmap_dirty,
+            lightmap_rebuilt);
+    } else if (cached_lightmap_) {
+        cached_lightmap_.reset();
+        lightmap_rebuilt = true;
+        apply_lightmap_to_render_scene(nullptr, cached_render_scene_);
+        set_lightmap_progress_phase(settings, LightmapBakePhase::Idle);
+    }
 
     std::shared_ptr<IrradianceVolume> irradiance_volume;
     bool irradiance_volume_rebuilt = false;
     const bool irradiance_volume_enabled_changed = cached_irradiance_volume_enabled_ != settings.use_irradiance_volume;
     if (irradiance_volume_rendering_enabled(settings)) {
-        if (!cached_render_scene_valid_) {
-            cached_render_scene_ = build_render_scene(scene);
-            cached_render_scene_valid_ = true;
-        }
         const bool volume_dirty = has_dirty(settings.dirty, RenderDirty::IrradianceVolume) ||
             has_dirty(settings.dirty, RenderDirty::Geometry) ||
             has_dirty(settings.dirty, RenderDirty::Material) ||
@@ -280,8 +332,15 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         has_dirty(settings.dirty, RenderDirty::Transform) ||
         has_dirty(settings.dirty, RenderDirty::Material) ||
         has_dirty(settings.dirty, RenderDirty::Texture) ||
-        has_dirty(settings.dirty, RenderDirty::Environment);
+        has_dirty(settings.dirty, RenderDirty::Environment) ||
+        lightmap_rebuilt ||
+        lightmap_enabled_changed;
+    if (full_upload && !cached_render_scene_valid_) {
+        cached_render_scene_ = build_render_scene(scene);
+        cached_render_scene_valid_ = true;
+    }
     const bool irradiance_volume_upload = full_upload || irradiance_volume_rebuilt || irradiance_volume_enabled_changed;
+    const bool lightmap_upload = full_upload || lightmap_rebuilt || lightmap_enabled_changed;
     const auto upload_gpu_irradiance_volume = [&](const IrradianceVolume* volume, GpuIrradianceVolume& gpu_volume) {
         PackedGpuIrradianceVolume packed;
         if (!pack_irradiance_volume(volume, packed)) {
@@ -302,10 +361,22 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         gpu_volume.debug_probes = static_cast<GpuIrradianceVolumeDebugProbe*>(device_irradiance_volume_debug_probes_);
         return true;
     };
+    const auto upload_gpu_lightmap = [&](const Lightmap* source, GpuLightmap& gpu_lightmap) {
+        PackedGpuLightmap packed;
+        if (!pack_lightmap(source, packed)) {
+            return false;
+        }
+        if (!upload_buffer(device_lightmap_texels_, cached_lightmap_texels_, packed.texels)) {
+            return false;
+        }
+        gpu_lightmap = packed.lightmap;
+        gpu_lightmap.texels = static_cast<Vec3*>(device_lightmap_texels_);
+        return true;
+    };
 
     if (full_upload) {
         PackedGpuScene packed;
-        if (!pack_scene(scene, settings, packed)) {
+        if (!pack_scene_from_render_scene(scene, settings, cached_render_scene_, packed)) {
             render_cpu_fallback(scene, settings, framebuffer, "could not pack scene for CUDA");
             return;
         }
@@ -346,6 +417,11 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA irradiance volume");
             return;
         }
+        if (!upload_gpu_lightmap(lightmap.get(), packed.scene.lightmap)) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA lightmap");
+            return;
+        }
         cuda_error = cudaMemcpy(device_scene, &packed.scene, sizeof(GpuScene), cudaMemcpyHostToDevice);
         if (cuda_error != cudaSuccess) {
             reset();
@@ -354,6 +430,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         }
         scene_uploaded_ = true;
         cached_irradiance_volume_enabled_ = settings.use_irradiance_volume;
+        cached_lightmap_enabled_ = settings.use_lightmap;
     } else {
         if (has_dirty(settings.dirty, RenderDirty::Camera) && !upload_camera(device_scene, scene.camera)) {
             reset();
@@ -377,6 +454,16 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 return;
             }
             cached_irradiance_volume_enabled_ = settings.use_irradiance_volume;
+        }
+        if (lightmap_upload) {
+            GpuLightmap gpu_lightmap;
+            if (!upload_gpu_lightmap(lightmap.get(), gpu_lightmap) ||
+                !upload_scene_field(device_scene, offsetof(GpuScene, lightmap), gpu_lightmap)) {
+                reset();
+                render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA lightmap");
+                return;
+            }
+            cached_lightmap_enabled_ = settings.use_lightmap;
         }
     }
 

@@ -92,9 +92,11 @@ bool intersect_sphere(const RenderSphere& sphere, const Ray& ray, Hit& hit) {
     hit.tangent = tangent;
     hit.bitangent = bitangent;
     hit.uv = sphere_uv(outward_normal);
+    hit.lightmap_uv = {};
     hit.material = sphere.material;
     hit.mesh = -1;
     hit.triangle = -1;
+    hit.has_lightmap = false;
     return true;
 }
 
@@ -140,9 +142,11 @@ bool intersect_bvh_nodes(const RenderScene& render_scene, const std::vector<BvhN
                     hit.tangent = tri.tangent;
                     hit.bitangent = tri.bitangent;
                     hit.uv = tri.uv0 * (1.0f - u - v) + tri.uv1 * u + tri.uv2 * v;
+                    hit.lightmap_uv = tri.lightmap_uv0 * (1.0f - u - v) + tri.lightmap_uv1 * u + tri.lightmap_uv2 * v;
                     hit.material = tri.material;
                     hit.mesh = tri.mesh;
                     hit.triangle = tri_index;
+                    hit.has_lightmap = tri.has_lightmap;
                     found = true;
                 }
             }

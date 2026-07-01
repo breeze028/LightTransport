@@ -38,6 +38,7 @@ struct EditorState {
     RenderDirty dirty = RenderDirty::All;
     std::string scene_path = "scenes/cornell.lt";
     std::shared_ptr<IrradianceVolumeBakeProgress> irradiance_volume_bake_progress = std::make_shared<IrradianceVolumeBakeProgress>();
+    std::shared_ptr<LightmapBakeProgress> lightmap_bake_progress = std::make_shared<LightmapBakeProgress>();
     uint32_t frame_index = 0;
     uint64_t render_generation = 1;
     uint64_t content_generation = 1;
@@ -72,6 +73,7 @@ struct EditorState {
     bool viewport_fullscreen = false;
     bool hide_dirty_wireframes = false;
     bool show_log_panel = false;
+    bool show_statistics_panel = false;
     bool log_auto_scroll = true;
     LogLevel log_filter_level = LogLevel::Info;
     std::mutex log_mutex;

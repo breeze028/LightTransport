@@ -710,6 +710,33 @@ __device__ Vec3 query_irradiance_volume_gpu(const GpuIrradianceVolume& volume, V
     return query_irradiance_grid_gpu(volume, volume.grids[grid_index], direction_index, position);
 }
 
+__device__ Vec3 lightmap_texel_gpu(const GpuLightmap& lightmap, int x, int y) {
+    if (lightmap.width <= 0 || lightmap.height <= 0 || !lightmap.texels) {
+        return {};
+    }
+    x = iclamp_gpu(x, 0, lightmap.width - 1);
+    y = iclamp_gpu(y, 0, lightmap.height - 1);
+    return lightmap.texels[y * lightmap.width + x];
+}
+
+__device__ Vec3 query_lightmap_gpu(const GpuLightmap& lightmap, Vec2 uv) {
+    if (lightmap.width <= 0 || lightmap.height <= 0 || !lightmap.texels) {
+        return {};
+    }
+    const float sx = dclamp(uv.x, 0.0f, 1.0f) * static_cast<float>(lightmap.width - 1);
+    const float sy = dclamp(uv.y, 0.0f, 1.0f) * static_cast<float>(lightmap.height - 1);
+    const int x0 = iclamp_gpu(static_cast<int>(floorf(sx)), 0, lightmap.width - 1);
+    const int y0 = iclamp_gpu(static_cast<int>(floorf(sy)), 0, lightmap.height - 1);
+    const int x1 = x0 + 1 < lightmap.width ? x0 + 1 : lightmap.width - 1;
+    const int y1 = y0 + 1 < lightmap.height ? y0 + 1 : lightmap.height - 1;
+    const float fx = dclamp(sx - static_cast<float>(x0), 0.0f, 1.0f);
+    const float fy = dclamp(sy - static_cast<float>(y0), 0.0f, 1.0f);
+    return dlerp(
+        dlerp(lightmap_texel_gpu(lightmap, x0, y0), lightmap_texel_gpu(lightmap, x1, y0), fx),
+        dlerp(lightmap_texel_gpu(lightmap, x0, y1), lightmap_texel_gpu(lightmap, x1, y1), fx),
+        fy);
+}
+
 __device__ bool material_uses_irradiance_volume_gi_gpu(const RenderSettings& settings, const GpuMaterial& material) {
     if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
         return true;
@@ -720,6 +747,38 @@ __device__ bool material_uses_irradiance_volume_gi_gpu(const RenderSettings& set
     return settings.irradiance_volume_principled_gi &&
         (material.brdf_model == static_cast<int>(BrdfModel::Principled) ||
             material.brdf_model == static_cast<int>(BrdfModel::StandardSurface));
+}
+
+__device__ bool material_uses_lightmap_gi_gpu(const RenderSettings& settings, const GpuMaterial& material) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::Lambertian)) {
+        return true;
+    }
+    if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface) && material.transmission > 0.05f) {
+        return false;
+    }
+    return settings.lightmap_principled_gi &&
+        (material.brdf_model == static_cast<int>(BrdfModel::Principled) ||
+            material.brdf_model == static_cast<int>(BrdfModel::StandardSurface));
+}
+
+__device__ Vec3 shade_material_from_lightmap_gpu(
+    const GpuScene& scene,
+    const RenderSettings& settings,
+    const GpuMaterial& material,
+    const GpuHit& hit,
+    Vec3 wo,
+    uint32_t& rng) {
+    const Vec3 base_color = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, hit.uv)));
+    const float diffuse_scale = material.brdf_model == static_cast<int>(BrdfModel::Principled)
+        ? 1.0f - material_metallic_gpu(scene, material, hit.uv)
+        : material.brdf_model == static_cast<int>(BrdfModel::StandardSurface)
+            ? (1.0f - material_metallic_gpu(scene, material, hit.uv)) * (1.0f - material_transmission_gpu(scene, material, hit.uv))
+        : 1.0f;
+    const Vec3 irradiance = query_lightmap_gpu(scene.lightmap, hit.lightmap_uv);
+    const Vec3 indirect = mul(mul(base_color, diffuse_scale), divv(irradiance, kPi));
+    const Vec3 direct_lights = estimate_direct_gpu(scene, hit, material, wo, rng, settings);
+    const Vec3 direct_environment = estimate_direct_environment_gpu(scene, hit, material, wo, rng, settings);
+    return add(add(direct_lights, direct_environment), indirect);
 }
 
 __device__ Vec3 shade_material_from_irradiance_volume_gpu(
@@ -837,6 +896,12 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
             break;
         }
         const Vec3 wo = mul(ray.direction, -1.0f);
+        if (settings.use_lightmap && hit.has_lightmap && material_uses_lightmap_gi_gpu(settings, material)) {
+            radiance = add(radiance, clamp_sample_radiance_gpu(
+                mul(throughput, shade_material_from_lightmap_gpu(scene, settings, material, hit, wo, rng)),
+                sample_clamp));
+            break;
+        }
         if (settings.use_irradiance_volume && material_uses_irradiance_volume_gi_gpu(settings, material)) {
             radiance = add(radiance, clamp_sample_radiance_gpu(
                 mul(throughput, shade_material_from_irradiance_volume_gpu(scene, settings, material, hit, wo, rng)),

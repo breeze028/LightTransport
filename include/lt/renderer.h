@@ -31,6 +31,16 @@ enum class IrradianceVolumeBakePhase : int {
     Failed = 5,
 };
 
+enum class LightmapBakePhase : int {
+    Idle = 0,
+    LoadingCache = 1,
+    Unwrapping = 2,
+    Baking = 3,
+    SavingCache = 4,
+    Complete = 5,
+    Failed = 6,
+};
+
 struct IrradianceVolumeBakeProgress {
     std::atomic<int> phase{static_cast<int>(IrradianceVolumeBakePhase::Idle)};
     std::atomic<uint64_t> total_samples{0};
@@ -38,6 +48,17 @@ struct IrradianceVolumeBakeProgress {
     std::atomic<uint64_t> total_rays{0};
     std::atomic<uint64_t> traced_rays{0};
     std::atomic<int> direction_count{0};
+    std::atomic<double> elapsed_ms{0.0};
+};
+
+struct LightmapBakeProgress {
+    std::atomic<int> phase{static_cast<int>(LightmapBakePhase::Idle)};
+    std::atomic<uint64_t> total_texels{0};
+    std::atomic<uint64_t> completed_texels{0};
+    std::atomic<uint64_t> total_rays{0};
+    std::atomic<uint64_t> traced_rays{0};
+    std::atomic<int> width{0};
+    std::atomic<int> height{0};
     std::atomic<double> elapsed_ms{0.0};
 };
 
@@ -51,7 +72,8 @@ enum class RenderDirty : uint32_t {
     Environment = 1u << 5u,
     IrradianceVolume = 1u << 6u,
     Transform = 1u << 7u,
-    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u) | (1u << 6u) | (1u << 7u),
+    Lightmap = 1u << 8u,
+    All = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u) | (1u << 4u) | (1u << 5u) | (1u << 6u) | (1u << 7u) | (1u << 8u),
 };
 
 constexpr RenderDirty operator|(RenderDirty a, RenderDirty b) {
@@ -95,6 +117,19 @@ struct RenderSettings {
     bool irradiance_volume_manual_bounds = false;
     Vec3 irradiance_volume_bounds_min = {-1.0f, -1.0f, -1.0f};
     Vec3 irradiance_volume_bounds_max = {1.0f, 1.0f, 1.0f};
+    bool use_lightmap = false;
+    int lightmap_resolution = 1024;
+    int lightmap_padding = 2;
+    int lightmap_dilation = 4;
+    int lightmap_bake_samples = 4;
+    int lightmap_bake_bounces = 4;
+    bool lightmap_principled_gi = false;
+    bool lightmap_cache_enabled = true;
+    bool lightmap_auto_update = true;
+    bool lightmap_force_rebake = false;
+    char lightmap_cache_path[1024] = {};
+    char lightmap_cache_key[1024] = {};
+    LightmapBakeProgress* lightmap_bake_progress = nullptr;
     uint32_t frame_index = 0;
     RenderDirty dirty = RenderDirty::All;
 };
@@ -114,6 +149,10 @@ inline bool stylized_rendering_enabled(const RenderSettings& settings, const Sce
 
 inline bool irradiance_volume_rendering_enabled(const RenderSettings& settings) {
     return settings.use_irradiance_volume;
+}
+
+inline bool lightmap_rendering_enabled(const RenderSettings& settings) {
+    return settings.use_lightmap;
 }
 
 struct Framebuffer {
@@ -161,6 +200,7 @@ public:
 private:
     RenderScene cached_render_scene_;
     std::shared_ptr<void> cached_irradiance_volume_;
+    std::shared_ptr<void> cached_lightmap_;
     bool scene_uploaded_ = false;
 };
 
@@ -199,10 +239,12 @@ private:
     void* device_irradiance_volume_grids_ = nullptr;
     void* device_irradiance_volume_cells_ = nullptr;
     void* device_irradiance_volume_debug_probes_ = nullptr;
+    void* device_lightmap_texels_ = nullptr;
     std::vector<void*> texture_arrays_;
     std::vector<uint64_t> texture_objects_;
     RenderScene cached_render_scene_;
     std::shared_ptr<void> cached_irradiance_volume_;
+    std::shared_ptr<void> cached_lightmap_;
     size_t cached_pixels_ = 0;
     int cached_materials_ = 0;
     int cached_textures_ = 0;
@@ -220,9 +262,11 @@ private:
     int cached_irradiance_volume_grids_ = 0;
     int cached_irradiance_volume_cells_ = 0;
     int cached_irradiance_volume_debug_probes_ = 0;
+    int cached_lightmap_texels_ = 0;
     bool scene_uploaded_ = false;
     bool cached_render_scene_valid_ = false;
     bool cached_irradiance_volume_enabled_ = false;
+    bool cached_lightmap_enabled_ = false;
     std::vector<std::string> reported_fallback_reasons_;
 };
 

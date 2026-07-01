@@ -63,10 +63,12 @@ __device__ bool intersect_sphere_gpu(const GpuSphere& sphere, const Ray& ray, Gp
     hit.tangent = tangent;
     hit.bitangent = bitangent;
     hit.uv = sphere_uv_gpu(outward_normal);
+    hit.lightmap_uv = {};
     hit.material = sphere.material;
     hit.mesh = -1;
     hit.triangle = -1;
     hit.sphere = sphere.sphere;
+    hit.has_lightmap = false;
     hit.emission = {};
     return true;
 }
@@ -160,9 +162,11 @@ __device__ bool intersect_bvh_gpu(const GpuScene& scene, const GpuBvhNode* nodes
                     hit.tangent = tri.tangent;
                     hit.bitangent = tri.bitangent;
                     hit.uv = add(add(mul(tri.uv0, 1.0f - u - v), mul(tri.uv1, u)), mul(tri.uv2, v));
+                    hit.lightmap_uv = add(add(mul(tri.lightmap_uv0, 1.0f - u - v), mul(tri.lightmap_uv1, u)), mul(tri.lightmap_uv2, v));
                     hit.material = tri.material;
                     hit.mesh = tri.mesh;
                     hit.triangle = tri_index;
+                    hit.has_lightmap = tri.has_lightmap != 0;
                     hit.emission = tri.emission;
                     found = true;
                 }
@@ -256,4 +260,3 @@ __device__ bool intersect_gpu(const GpuScene& scene, const Ray& ray, GpuHit& hit
     found = intersect_spheres_gpu(scene, ray, hit) || found;
     return found;
 }
-

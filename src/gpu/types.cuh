@@ -65,9 +65,13 @@ struct GpuTriangle {
     Vec2 uv0;
     Vec2 uv1;
     Vec2 uv2;
+    Vec2 lightmap_uv0;
+    Vec2 lightmap_uv1;
+    Vec2 lightmap_uv2;
     int material = 0;
     int mesh = -1;
     int light_double_sided = 0;
+    int has_lightmap = 0;
 };
 
 struct GpuSphere {
@@ -120,6 +124,12 @@ struct GpuIrradianceVolume {
     GpuIrradianceVolumeDebugProbe* debug_probes = nullptr;
 };
 
+struct GpuLightmap {
+    int width = 0;
+    int height = 0;
+    Vec3* texels = nullptr;
+};
+
 struct GpuScene {
     Camera camera;
     int material_count = 0;
@@ -152,6 +162,7 @@ struct GpuScene {
     int* mesh_instance_indices = nullptr;
     GpuBvhNode* tlas_nodes = nullptr;
     GpuIrradianceVolume irradiance_volume;
+    GpuLightmap lightmap;
 };
 
 struct PackedGpuScene {
@@ -176,11 +187,13 @@ struct GpuHit {
     Vec3 tangent;
     Vec3 bitangent;
     Vec2 uv;
+    Vec2 lightmap_uv;
     int material = -1;
     int mesh = -1;
     int triangle = -1;
     int sphere = -1;
     Vec3 emission;
+    bool has_lightmap = false;
     bool front_face = true;
 };
 

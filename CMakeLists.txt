@@ -10,6 +10,7 @@ option(LT_ENABLE_OPENCOLORIO "Enable OpenColorIO color management when the SDK i
 option(LT_FETCH_IMGUI "Fetch Dear ImGui when building the editor" ON)
 option(LT_FETCH_SPDLOG "Fetch spdlog when it is not provided by the system" ON)
 option(LT_FETCH_STB "Fetch stb header-only image utilities when they are not provided by the system" ON)
+option(LT_FETCH_XATLAS "Fetch xatlas when it is not provided by the system" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,7 +64,27 @@ if(LT_ENABLE_OPENCOLORIO)
     find_package(OpenColorIO CONFIG QUIET)
 endif()
 
+find_path(XATLAS_INCLUDE_DIR xatlas.h PATH_SUFFIXES xatlas)
+find_library(XATLAS_LIBRARY NAMES xatlas)
+set(LT_XATLAS_SOURCES)
+if(NOT XATLAS_INCLUDE_DIR OR NOT XATLAS_LIBRARY)
+    if(LT_FETCH_XATLAS)
+        include(FetchContent)
+        FetchContent_Declare(
+            xatlas
+            URL https://github.com/jpcy/xatlas/archive/refs/heads/master.zip
+            URL_HASH SHA256=8D13E2D2C68B640417F182A7B3A8BBDF0E724A3B78A073E594F6D7941A73C971
+        )
+        FetchContent_MakeAvailable(xatlas)
+        set(XATLAS_INCLUDE_DIR ${xatlas_SOURCE_DIR}/source/xatlas)
+        set(LT_XATLAS_SOURCES ${xatlas_SOURCE_DIR}/source/xatlas/xatlas.cpp)
+    else()
+        message(FATAL_ERROR "xatlas was not found. Enable LT_FETCH_XATLAS or provide XATLAS_INCLUDE_DIR/XATLAS_LIBRARY.")
+    endif()
+endif()
+
 add_library(lt_core
+    ${LT_XATLAS_SOURCES}
     external/ufbx/ufbx.c
     src/log.cpp
     src/cpu/path_tracer.cpp
@@ -83,7 +104,11 @@ add_library(lt_core
 target_include_directories(lt_core PUBLIC include)
 target_include_directories(lt_core PRIVATE ${STB_INCLUDE_DIR})
 target_include_directories(lt_core PRIVATE external/ufbx)
+target_include_directories(lt_core PRIVATE ${XATLAS_INCLUDE_DIR})
 target_link_libraries(lt_core PUBLIC ${LT_SPDLOG_TARGET})
+if(XATLAS_LIBRARY)
+    target_link_libraries(lt_core PUBLIC ${XATLAS_LIBRARY})
+endif()
 set_source_files_properties(external/ufbx/ufbx.c PROPERTIES LANGUAGE CXX)
 
 if(MaterialX_FOUND)
@@ -187,6 +212,6 @@ if(LT_BUILD_EDITOR AND WIN32)
         src/editor/editor_platform.cpp
         src/editor/editor_state.cpp
     )
-    target_link_libraries(lt_editor PRIVATE lt_core imgui user32 gdi32 comdlg32 shell32 d3d11 dxgi)
+    target_link_libraries(lt_editor PRIVATE lt_core imgui user32 gdi32 comdlg32 shell32 d3d11 dxgi psapi)
     target_compile_definitions(lt_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

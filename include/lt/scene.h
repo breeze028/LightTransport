@@ -83,6 +83,15 @@ struct SceneRenderSettings {
     bool irradiance_volume_manual_bounds = false;
     Vec3 irradiance_volume_bounds_min = {-1.0f, -1.0f, -1.0f};
     Vec3 irradiance_volume_bounds_max = {1.0f, 1.0f, 1.0f};
+    bool use_lightmap = false;
+    int lightmap_resolution = 1024;
+    int lightmap_padding = 2;
+    int lightmap_dilation = 4;
+    int lightmap_bake_samples = 4;
+    int lightmap_bake_bounces = 4;
+    bool lightmap_principled_gi = false;
+    bool lightmap_cache_enabled = true;
+    bool lightmap_auto_update = true;
 };
 
 struct Scene {
@@ -118,8 +127,12 @@ struct Triangle {
     Vec2 uv0;
     Vec2 uv1;
     Vec2 uv2;
+    Vec2 lightmap_uv0;
+    Vec2 lightmap_uv1;
+    Vec2 lightmap_uv2;
     int material = 0;
     int mesh = -1;
+    bool has_lightmap = false;
 };
 
 struct RenderSphere {
