@@ -251,7 +251,7 @@ Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scen
                     if (!blocked && std::isfinite(light_pdf) && light_pdf > 0.0f && has_light_emission(emission)) {
                         const float bsdf_pdf = material.pdf(hit.normal, wo, light_dir, hit.uv);
                         if (std::isfinite(bsdf_pdf) && bsdf_pdf >= 0.0f) {
-                            const float weight = settings.use_mis ? mis_weight(light_pdf, bsdf_pdf, settings.mis_heuristic) : 1.0f;
+                            const float weight = uses_multiple_importance_sampling(settings) ? mis_weight(light_pdf, bsdf_pdf, settings.mis_heuristic) : 1.0f;
                             direct += clamp_sample_radiance(material.evaluate(hit.normal, wo, light_dir, hit.uv) * emission * (ndotl / light_pdf) * weight);
                         }
                     }
@@ -571,11 +571,14 @@ Vec3 trace_stylized_radiance(
         if (bounce == 0 || previous_delta) {
             return clamp_sample_radiance(emission, sample_clamp);
         }
-        if (settings.use_mis && hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
+        if (uses_multiple_importance_sampling(settings) && hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
             const Triangle& light = render_scene.triangles[static_cast<size_t>(hit.triangle)];
             const float light_pmf = render_scene.light_triangle_indices.empty() ? 0.0f : 1.0f / static_cast<float>(render_scene.light_triangle_indices.size());
             const float light_pdf = light_pdf_solid_angle(scene, light, previous_position, hit.position, light_pmf);
             return clamp_sample_radiance(emission * mis_weight(previous_bsdf_pdf, light_pdf, settings.mis_heuristic), sample_clamp);
+        }
+        if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+            return clamp_sample_radiance(emission, sample_clamp);
         }
         return {};
     }
@@ -590,7 +593,9 @@ Vec3 trace_stylized_radiance(
     const Vec3 wo = -ray.direction;
     Vec3 estimate;
     for (int i = 0; i < sample_count; ++i) {
-        Vec3 outgoing = estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings);
+        Vec3 outgoing = uses_next_event_estimation(settings)
+            ? estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings)
+            : Vec3{};
         if (bounce + 1 < settings.max_bounces) {
             const MaterialSample sample = material->sample(hit.normal, wo, hit.uv, hit.front_face, rng);
             if (std::isfinite(sample.pdf) && sample.pdf > 0.0f && is_finite(sample.weight) && dot(sample.weight, sample.weight) > 0.0f) {
@@ -684,7 +689,9 @@ Vec3 shade_material_from_lightmap(
     Rng& rng) {
     const Vec3 irradiance = query_lightmap(lightmap, hit.lightmap_uv);
     const Vec3 indirect = material.base_color(hit.uv) * diffuse_gi_scale_for_irradiance_volume(material, hit.uv) * (irradiance / kPi);
-    const Vec3 direct_lights = estimate_direct_lighting(render_scene, scene, hit, material, wo, rng, settings);
+    const Vec3 direct_lights = uses_next_event_estimation(settings)
+        ? estimate_direct_lighting(render_scene, scene, hit, material, wo, rng, settings)
+        : Vec3{};
     const Vec3 direct_environment = estimate_direct_environment(render_scene, scene, settings, material, hit, wo, rng);
     return material.emitted(hit.uv) + direct_lights + direct_environment + indirect;
 }
@@ -700,7 +707,9 @@ Vec3 shade_material_from_irradiance_volume(
     Rng& rng) {
     const Vec3 irradiance = query_irradiance_volume(volume, hit.position, hit.normal);
     const Vec3 indirect = material.base_color(hit.uv) * diffuse_gi_scale_for_irradiance_volume(material, hit.uv) * (irradiance / kPi);
-    const Vec3 direct_lights = estimate_direct_lighting(render_scene, scene, hit, material, wo, rng, settings);
+    const Vec3 direct_lights = uses_next_event_estimation(settings)
+        ? estimate_direct_lighting(render_scene, scene, hit, material, wo, rng, settings)
+        : Vec3{};
     const Vec3 direct_environment = estimate_direct_environment(render_scene, scene, settings, material, hit, wo, rng);
     return material.emitted(hit.uv) + direct_lights + direct_environment + indirect;
 }
@@ -759,11 +768,13 @@ Vec3 trace_path(
                 radiance += clamp_sample_radiance(throughput * emission, sample_clamp);
             } else if (previous_delta) {
                 radiance += clamp_sample_radiance(throughput * emission, sample_clamp);
-            } else if (settings.use_mis && hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
+            } else if (uses_multiple_importance_sampling(settings) && hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
                 const Triangle& light = render_scene.triangles[static_cast<size_t>(hit.triangle)];
                 const float light_pmf = render_scene.light_triangle_indices.empty() ? 0.0f : 1.0f / static_cast<float>(render_scene.light_triangle_indices.size());
                 const float light_pdf = light_pdf_solid_angle(scene, light, previous_position, hit.position, light_pmf);
                 radiance += clamp_sample_radiance(throughput * emission * mis_weight(previous_bsdf_pdf, light_pdf, settings.mis_heuristic), sample_clamp);
+            } else if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+                radiance += clamp_sample_radiance(throughput * emission, sample_clamp);
             }
             break;
         }
@@ -801,7 +812,9 @@ Vec3 trace_path(
         }
 
         const Vec3 wo = -ray.direction;
-        radiance += clamp_sample_radiance(throughput * estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings), sample_clamp);
+        if (uses_next_event_estimation(settings)) {
+            radiance += clamp_sample_radiance(throughput * estimate_direct_lighting(render_scene, scene, hit, *material, wo, rng, settings), sample_clamp);
+        }
 
         if (shading_bounce >= 3) {
             const float p = std::clamp(std::max({throughput.x, throughput.y, throughput.z}), 0.05f, 0.95f);

@@ -50,7 +50,7 @@ uint64_t lightmap_fingerprint(const RenderScene& render_scene, const Scene& scen
     uint64_t hash = kFnvOffsetBasis;
     hash_string(hash, "lt_lightmap_cache_v1");
     hash_c_string(hash, settings.lightmap_cache_key);
-    hash_value(hash, settings.use_mis);
+    hash_value(hash, static_cast<int>(settings.sampling_mode));
     hash_value(hash, static_cast<int>(settings.mis_heuristic));
     hash_value(hash, std::max(1, settings.lightmap_resolution));
     hash_value(hash, std::max(0, settings.lightmap_padding));

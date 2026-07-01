@@ -643,7 +643,7 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                     if (!blocked && isfinite(light_pdf) && light_pdf > 0.0f && has_light_emission_gpu(light_emission)) {
                         const float bsdf_pdf = material_pdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv);
                         if (isfinite(bsdf_pdf) && bsdf_pdf >= 0.0f) {
-                            const float weight = settings.use_mis ? mis_weight_gpu(light_pdf, bsdf_pdf, static_cast<int>(settings.mis_heuristic)) : 1.0f;
+                            const float weight = settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling ? mis_weight_gpu(light_pdf, bsdf_pdf, static_cast<int>(settings.mis_heuristic)) : 1.0f;
                             direct = add(direct, clamp_sample_radiance_gpu(mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv), light_emission), ndotl * weight / light_pdf)));
                         }
                     }
@@ -996,10 +996,12 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
                 radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, emission), sample_clamp));
             } else if (previous_delta) {
                 radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, emission), sample_clamp));
-            } else if (settings.use_mis && hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
+            } else if (settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling && hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
                 const float light_pmf = scene.light_count > 0 ? 1.0f / static_cast<float>(scene.light_count) : 0.0f;
                 const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, previous_position, hit.position, light_pmf);
                 radiance = add(radiance, clamp_sample_radiance_gpu(mul(mul(throughput, emission), mis_weight_gpu(previous_bsdf_pdf, light_pdf, static_cast<int>(settings.mis_heuristic))), sample_clamp));
+            } else if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+                radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, emission), sample_clamp));
             }
             break;
         }
@@ -1016,7 +1018,9 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
                 sample_clamp));
             break;
         }
-        radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, estimate_direct_gpu(scene, hit, material, wo, rng, settings)), sample_clamp));
+        if (settings.sampling_mode != PathSamplingMode::Unidirectional) {
+            radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, estimate_direct_gpu(scene, hit, material, wo, rng, settings)), sample_clamp));
+        }
         if (shading_bounce >= 3) {
             const float p = dclamp(fmaxf(throughput.x, fmaxf(throughput.y, throughput.z)), 0.05f, 0.95f);
             if (rng_float(rng) > p) {

@@ -16,6 +16,12 @@ enum class MisHeuristic {
     Power = 1,
 };
 
+enum class PathSamplingMode {
+    Unidirectional = 0,
+    NextEventEstimation = 1,
+    MultipleImportanceSampling = 2,
+};
+
 enum class AccelerationStructure {
     Auto = 0,
     Flat = 1,
@@ -93,7 +99,7 @@ struct RenderSettings {
     int height = 720;
     int samples_per_pixel = 1;
     int max_bounces = 6;
-    bool use_mis = false;
+    PathSamplingMode sampling_mode = PathSamplingMode::NextEventEstimation;
     MisHeuristic mis_heuristic = MisHeuristic::Power;
     AccelerationStructure acceleration_structure = AccelerationStructure::Auto;
     int stylized_samples = 8;
@@ -153,6 +159,15 @@ inline bool irradiance_volume_rendering_enabled(const RenderSettings& settings) 
 
 inline bool lightmap_rendering_enabled(const RenderSettings& settings) {
     return settings.use_lightmap;
+}
+
+inline bool uses_next_event_estimation(const RenderSettings& settings) {
+    return settings.sampling_mode == PathSamplingMode::NextEventEstimation ||
+        settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling;
+}
+
+inline bool uses_multiple_importance_sampling(const RenderSettings& settings) {
+    return settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling;
 }
 
 struct Framebuffer {

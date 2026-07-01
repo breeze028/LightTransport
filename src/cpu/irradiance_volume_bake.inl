@@ -273,7 +273,7 @@ uint64_t irradiance_volume_fingerprint(const RenderScene& render_scene, const Sc
     uint64_t hash = kFnvOffsetBasis;
     hash_string(hash, "lt_irradiance_volume_cache_v2");
     hash_c_string(hash, settings.irradiance_volume_cache_key);
-    hash_value(hash, settings.use_mis);
+    hash_value(hash, static_cast<int>(settings.sampling_mode));
     hash_value(hash, static_cast<int>(settings.mis_heuristic));
     hash_value(hash, std::max(2, settings.irradiance_volume_grid_resolution));
     hash_value(hash, std::max(2, settings.irradiance_volume_subgrid_resolution));

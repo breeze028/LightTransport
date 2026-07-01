@@ -637,6 +637,8 @@ bool rewrite_texture_paths_for_save_as(lt::Scene& scene, const std::string& sour
 
 lt::SceneRenderSettings capture_scene_render_settings() {
     lt::SceneRenderSettings settings;
+    settings.sampling_mode = static_cast<int>(g_editor.settings.sampling_mode);
+    settings.mis_heuristic = static_cast<int>(g_editor.settings.mis_heuristic);
     settings.stylized_samples = g_editor.settings.stylized_samples;
     settings.stylized_max_depth = g_editor.settings.stylized_max_depth;
     settings.use_irradiance_volume = g_editor.settings.use_irradiance_volume;
@@ -676,6 +678,8 @@ void apply_scene_render_settings(const lt::Scene& scene) {
         return;
     }
     const lt::SceneRenderSettings& settings = scene.render_settings;
+    g_editor.settings.sampling_mode = static_cast<lt::PathSamplingMode>(settings.sampling_mode);
+    g_editor.settings.mis_heuristic = static_cast<lt::MisHeuristic>(settings.mis_heuristic);
     g_editor.settings.stylized_samples = settings.stylized_samples;
     g_editor.settings.stylized_max_depth = settings.stylized_max_depth;
     g_editor.settings.use_irradiance_volume = settings.use_irradiance_volume;
@@ -2786,10 +2790,13 @@ void draw_properties() {
                 ImGui::EndDisabled();
                 ImGui::EndCombo();
             }
-            if (ImGui::Checkbox("Multiple importance sampling", &g_editor.settings.use_mis)) {
+            const char* sampling_modes[] = {"UNI", "NEE", "MIS"};
+            int sampling_mode = static_cast<int>(g_editor.settings.sampling_mode);
+            if (ImGui::Combo("Sampling", &sampling_mode, sampling_modes, IM_ARRAYSIZE(sampling_modes))) {
+                g_editor.settings.sampling_mode = static_cast<lt::PathSamplingMode>(sampling_mode);
                 reset_accumulation();
             }
-            ImGui::BeginDisabled(!g_editor.settings.use_mis);
+            ImGui::BeginDisabled(!lt::uses_multiple_importance_sampling(g_editor.settings));
             const char* heuristics[] = {"Balance", "Power"};
             int heuristic = static_cast<int>(g_editor.settings.mis_heuristic);
             if (ImGui::Combo("MIS heuristic", &heuristic, heuristics, IM_ARRAYSIZE(heuristics))) {

@@ -70,10 +70,19 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.log_file_path = argv[++i];
         } else if (argument == "--no-log-file") {
             options.log_file_enabled = false;
+        } else if (argument == "--sampling" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "uni") {
+                options.settings.sampling_mode = PathSamplingMode::Unidirectional;
+            } else if (mode == "nee") {
+                options.settings.sampling_mode = PathSamplingMode::NextEventEstimation;
+            } else {
+                options.settings.sampling_mode = PathSamplingMode::MultipleImportanceSampling;
+            }
         } else if (argument == "--mis") {
-            options.settings.use_mis = true;
+            options.settings.sampling_mode = PathSamplingMode::MultipleImportanceSampling;
         } else if (argument == "--no-mis") {
-            options.settings.use_mis = false;
+            options.settings.sampling_mode = PathSamplingMode::NextEventEstimation;
         } else if (argument == "--mis-heuristic" && i + 1 < argc) {
             const std::string heuristic = argv[++i];
             options.settings.mis_heuristic = heuristic == "balance" ? MisHeuristic::Balance : MisHeuristic::Power;
