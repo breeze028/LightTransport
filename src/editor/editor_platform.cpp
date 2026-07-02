@@ -1,8 +1,10 @@
 #include "editor_platform.h"
 
 #include "editor_state.h"
+#include "solid_preview.h"
 
 #include <algorithm>
+#include <future>
 
 namespace lt::editor {
 
@@ -87,6 +89,7 @@ bool create_device(HWND hwnd) {
 
 void cleanup_device() {
     release_preview_texture();
+    release_solid_preview(g_solid_preview);
     cleanup_render_target();
     if (g_swap_chain) {
         g_swap_chain->Release();
@@ -122,6 +125,60 @@ void release_editor_memory() {
     g_bounds_cache = {};
     g_pick_cache = {};
     g_load_task = {};
+    g_solid_preview.scene_generation = 0;
+    g_solid_preview.content_generation = 0;
+}
+
+void reset_accumulation(lt::RenderDirty dirty) {
+    g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
+    ++g_editor.render_generation;
+    if (lt::has_dirty(dirty, lt::RenderDirty::Transform) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Material) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Texture) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Geometry) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Environment) ||
+        lt::has_dirty(dirty, lt::RenderDirty::IrradianceVolume) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Lightmap)) {
+        ++g_editor.content_generation;
+    }
+    g_editor.frame_index = 0;
+    g_editor.framebuffer.clear_accumulation();
+}
+
+void release_rendered_preview_resources(bool release_renderer_cache, bool release_framebuffer) {
+    if (g_render_future.valid()) {
+        g_render_future.wait();
+        (void)g_render_future.get();
+    }
+    release_preview_texture();
+    if (release_renderer_cache) {
+        g_editor.cuda.reset();
+    }
+    if (release_framebuffer) {
+        g_editor.framebuffer = {};
+    }
+}
+
+void release_realtime_preview_resources(bool release_shaders) {
+    (void)release_shaders;
+    release_solid_preview(g_solid_preview);
+}
+
+void set_viewport_preview_mode(ViewportPreviewMode mode) {
+    if (g_editor.viewport_preview_mode == mode) return;
+
+    const ViewportPreviewMode old_mode = g_editor.viewport_preview_mode;
+    g_editor.viewport_preview_mode = mode;
+
+    if (old_mode == ViewportPreviewMode::Rendered) {
+        release_rendered_preview_resources(/*release_renderer_cache=*/true,
+                                           /*release_framebuffer=*/false);
+    } else {
+        if (mode == ViewportPreviewMode::Rendered) {
+            release_realtime_preview_resources(/*release_shaders=*/true);
+            reset_accumulation();
+        }
+    }
 }
 
 } // namespace lt::editor

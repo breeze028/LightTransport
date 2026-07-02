@@ -20,6 +20,7 @@ enum class ToolMode { Select, Move, Rotate, Scale };
 enum class TransformSpace { Local, World };
 enum class GizmoHandle { None, AxisX, AxisY, AxisZ, PlaneXY, PlaneYZ, PlaneZX, Uniform };
 enum class SelectionKind { None, Mesh, Sphere };
+enum class ViewportPreviewMode { Rendered, Solid, Wireframe };
 
 struct GpuPreview {
     ID3D11Texture2D* texture = nullptr;
@@ -70,6 +71,7 @@ struct EditorState {
     float toolbar_width = 74.0f;
     float properties_width = 340.0f;
     float outliner_fraction = 0.38f;
+    ViewportPreviewMode viewport_preview_mode = ViewportPreviewMode::Rendered;
     bool viewport_fullscreen = false;
     bool hide_dirty_wireframes = false;
     bool show_log_panel = false;

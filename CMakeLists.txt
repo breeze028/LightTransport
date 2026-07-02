@@ -211,7 +211,8 @@ if(LT_BUILD_EDITOR AND WIN32)
         src/editor_win32.cpp
         src/editor/editor_platform.cpp
         src/editor/editor_state.cpp
+        src/editor/solid_preview.cpp
     )
-    target_link_libraries(lt_editor PRIVATE lt_core imgui user32 gdi32 comdlg32 shell32 d3d11 dxgi psapi)
+    target_link_libraries(lt_editor PRIVATE lt_core imgui user32 gdi32 comdlg32 shell32 d3d11 d3dcompiler dxgi psapi)
     target_compile_definitions(lt_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

@@ -3,6 +3,7 @@
 #include "lt/materialx_adapter.h"
 #include "editor/editor_platform.h"
 #include "editor/editor_state.h"
+#include "editor/solid_preview.h"
 
 #include <windows.h>
 #include <commdlg.h>
@@ -156,21 +157,6 @@ struct EditorLoggingScope {
         shutdown_editor_logging();
     }
 };
-
-void reset_accumulation(lt::RenderDirty dirty = lt::RenderDirty::Render) {
-    g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
-    ++g_editor.render_generation;
-    if (lt::has_dirty(dirty, lt::RenderDirty::Material) ||
-        lt::has_dirty(dirty, lt::RenderDirty::Texture) ||
-        lt::has_dirty(dirty, lt::RenderDirty::Geometry) ||
-        lt::has_dirty(dirty, lt::RenderDirty::Environment) ||
-        lt::has_dirty(dirty, lt::RenderDirty::IrradianceVolume) ||
-        lt::has_dirty(dirty, lt::RenderDirty::Lightmap)) {
-        ++g_editor.content_generation;
-    }
-    g_editor.frame_index = 0;
-    g_editor.framebuffer.clear_accumulation();
-}
 
 void set_renderer(bool use_cuda) {
     const bool can_use_cuda = use_cuda &&
@@ -1111,6 +1097,7 @@ void poll_render_result() {
 
 void launch_render_task() {
     if (g_editor.paused || scene_load_in_progress() || g_render_future.valid()) return;
+    if (g_editor.viewport_preview_mode != ViewportPreviewMode::Rendered) return;
     lt::Scene scene = g_editor.scene;
     lt::RenderSettings settings = g_editor.settings;
     lt::Framebuffer framebuffer = g_editor.framebuffer;
@@ -2011,9 +1998,10 @@ void draw_scene_reference_outlines(ImDrawList* draw_list) {
 void draw_gizmo_overlay() {
     if (!has_selection()) return;
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const bool draw_selection_reference = g_editor.viewport_preview_mode == ViewportPreviewMode::Rendered;
     if (has_sphere_selection()) {
         const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
-        if (!g_editor.hide_dirty_wireframes)
+        if (draw_selection_reference && !g_editor.hide_dirty_wireframes)
             draw_sphere_outline(draw_list, g_editor.selected_sphere, IM_COL32(255, 150, 35, 255), 2.0f);
         if (g_editor.tool_mode == ToolMode::Move) {
             draw_move_gizmo_handles(
@@ -2032,7 +2020,7 @@ void draw_gizmo_overlay() {
     ImVec2 center{};
     if (!project_point(center3, center)) return;
     if (g_editor.tool_mode == ToolMode::Select) {
-        if (!g_editor.hide_dirty_wireframes)
+        if (draw_selection_reference && !g_editor.hide_dirty_wireframes)
             draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, IM_COL32(255, 150, 35, 255), 2.0f);
     }
     if (g_editor.tool_mode == ToolMode::Move || g_editor.tool_mode == ToolMode::Scale) {
@@ -3057,6 +3045,63 @@ bool point_in_rect(ImVec2 p, ImVec2 min, ImVec2 max) {
     return p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y;
 }
 
+// Helper overlay: draw subtle bounding-box outlines for all objects.
+void draw_solid_overlay_outlines(ImDrawList* draw_list) {
+    const ImU32 mesh_color = IM_COL32(100, 108, 118, 90);
+    for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
+        // Skip selection; it is drawn separately in draw_solid_selection_outline.
+        if (g_editor.selection_kind == SelectionKind::Mesh && i == g_editor.selected_mesh) continue;
+        draw_mesh_bounds_outline(draw_list, i, mesh_color, 0.8f);
+    }
+    for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
+        if (g_editor.selection_kind == SelectionKind::Sphere && i == g_editor.selected_sphere) continue;
+        draw_sphere_outline(draw_list, i, mesh_color, 0.8f);
+    }
+}
+
+// Helper overlay: highlight area-light meshes and show directional-light indicators.
+void draw_solid_light_helpers(ImDrawList* draw_list) {
+    const ImU32 area_light_color = IM_COL32(255, 210, 90, 180);
+    const ImU32 dir_light_color = IM_COL32(255, 200, 70, 200);
+
+    // Area light meshes: highlight their bounding boxes
+    for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
+        if (g_editor.scene.meshes[static_cast<size_t>(i)].light.enabled) {
+            draw_mesh_bounds_outline(draw_list, i, area_light_color, 1.5f);
+        }
+    }
+
+    // Directional lights: draw a line from origin toward light direction
+    for (const auto& dl : g_editor.scene.directional_lights) {
+        // Compute a world-space origin point roughly in view
+        const lt::Vec3 origin = g_editor.scene.camera.target - lt::normalize(dl.direction) * 2.0f;
+        const lt::Vec3 tip = origin + lt::normalize(dl.direction) * 1.5f;
+        ImVec2 s_origin{}, s_tip{};
+        if (project_point(origin, s_origin) && project_point(tip, s_tip)) {
+            draw_list->AddLine(s_origin, s_tip, dir_light_color, 1.8f);
+            // Arrowhead
+            const ImVec2 dir = {s_tip.x - s_origin.x, s_tip.y - s_origin.y};
+            const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+            if (len > 0.0f) {
+                const ImVec2 nd = {dir.x / len, dir.y / len};
+                const ImVec2 perp = {-nd.y * 8.0f, nd.x * 8.0f};
+                draw_list->AddLine(s_tip, {s_tip.x - nd.x * 14.0f + perp.x, s_tip.y - nd.y * 14.0f + perp.y}, dir_light_color, 1.8f);
+                draw_list->AddLine(s_tip, {s_tip.x - nd.x * 14.0f - perp.x, s_tip.y - nd.y * 14.0f - perp.y}, dir_light_color, 1.8f);
+            }
+        }
+    }
+}
+
+// Helper overlay: draw selection outline (orange bounds or sphere circle).
+void draw_solid_selection_outline(ImDrawList* draw_list) {
+    const ImU32 sel_color = IM_COL32(255, 150, 35, 240);
+    if (g_editor.selection_kind == SelectionKind::Mesh) {
+        draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, sel_color, 2.2f);
+    } else if (g_editor.selection_kind == SelectionKind::Sphere) {
+        draw_sphere_outline(draw_list, g_editor.selected_sphere, sel_color, 2.2f);
+    }
+}
+
 void draw_viewport() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -3064,40 +3109,135 @@ void draw_viewport() {
     available.x = std::max(64.0f, available.x);
     available.y = std::max(64.0f, available.y);
     g_editor.viewport_size = available;
-    prepare_render_preview();
-    if (g_preview.srv) {
+
+    auto handle_selection_click = []() {
+        if (g_editor.viewport_hovered && g_editor.tool_mode == ToolMode::Select && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            SelectionKind kind = SelectionKind::None;
+            int index = -1;
+            if (pick_object(ImGui::GetIO().MousePos, kind, index)) {
+                kind == SelectionKind::Sphere ? select_sphere(index) : select_mesh(index);
+            } else {
+                select_mesh(-1);
+            }
+        }
+    };
+
+    const bool realtime_preview =
+        g_editor.viewport_preview_mode == ViewportPreviewMode::Solid ||
+        g_editor.viewport_preview_mode == ViewportPreviewMode::Wireframe;
+    bool handled_input_early = false;
+
+    if (realtime_preview) {
         g_editor.viewport_image_min = ImGui::GetCursorScreenPos();
-        ImGui::Image(reinterpret_cast<ImTextureID>(g_preview.srv), available);
         g_editor.viewport_image_max = {g_editor.viewport_image_min.x + available.x, g_editor.viewport_image_min.y + available.y};
-    }
-    g_editor.viewport_hovered = ImGui::IsItemHovered();
-    g_editor.viewport_focused = ImGui::IsWindowFocused();
-    if (g_editor.viewport_hovered && g_editor.tool_mode == ToolMode::Select && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        SelectionKind kind = SelectionKind::None;
-        int index = -1;
-        if (pick_object(ImGui::GetIO().MousePos, kind, index)) {
-            kind == SelectionKind::Sphere ? select_sphere(index) : select_mesh(index);
+        g_editor.viewport_hovered = ImGui::IsWindowHovered() && point_in_rect(ImGui::GetIO().MousePos, g_editor.viewport_image_min, g_editor.viewport_image_max);
+        g_editor.viewport_focused = ImGui::IsWindowFocused();
+
+        handle_selection_click();
+        handle_gizmo_drag();
+        handle_viewport_input();
+        handled_input_early = true;
+
+        // D3D11 real-time preview. Camera-only motion updates constants, while
+        // geometry buffers rebuild only when content_generation changes.
+        const int w = std::max(64, static_cast<int>(available.x));
+        const int h = std::max(64, static_cast<int>(available.y));
+        init_solid_preview(g_solid_preview);
+        resize_solid_preview(g_solid_preview, w, h);
+        update_solid_preview_buffers(g_solid_preview, g_editor.scene);
+        render_solid_preview(g_solid_preview, g_editor.scene, available, g_editor.viewport_preview_mode);
+        if (g_solid_preview.srv) {
+            ImGui::Image(reinterpret_cast<ImTextureID>(g_solid_preview.srv), available);
         } else {
-            select_mesh(-1);
+            ImGui::Dummy(available);
+        }
+    } else {
+        // Rendered mode: path tracer preview
+        prepare_render_preview();
+        if (g_preview.srv) {
+            g_editor.viewport_image_min = ImGui::GetCursorScreenPos();
+            ImGui::Image(reinterpret_cast<ImTextureID>(g_preview.srv), available);
+            g_editor.viewport_image_max = {g_editor.viewport_image_min.x + available.x, g_editor.viewport_image_min.y + available.y};
+        } else {
+            g_editor.viewport_image_min = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(available);
+            g_editor.viewport_image_max = {g_editor.viewport_image_min.x + available.x, g_editor.viewport_image_min.y + available.y};
         }
     }
-    handle_gizmo_drag();
-    if (!g_editor.hide_dirty_wireframes && g_editor.dirty != lt::RenderDirty::None) {
-        draw_scene_reference_outlines(ImGui::GetWindowDrawList());
+
+    g_editor.viewport_hovered = ImGui::IsItemHovered();
+    g_editor.viewport_focused = ImGui::IsWindowFocused();
+    if (!handled_input_early) {
+        handle_selection_click();
+        handle_gizmo_drag();
     }
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    if (g_editor.viewport_preview_mode == ViewportPreviewMode::Rendered) {
+        // Rendered mode: dirty reference outlines only when accumulating.
+        if (!g_editor.hide_dirty_wireframes && g_editor.dirty != lt::RenderDirty::None) {
+            draw_scene_reference_outlines(draw_list);
+        }
+    }
+
     draw_gizmo_overlay();
     if (g_editor.viewport_hovered) {
         if (g_editor.tool_mode == ToolMode::Move) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         if (g_editor.tool_mode == ToolMode::Rotate) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (g_editor.tool_mode == ToolMode::Scale) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
     }
-    handle_viewport_input();
+    if (!handled_input_early) {
+        handle_viewport_input();
+    }
     const char* hint = g_editor.tool_mode == ToolMode::Move && has_selection()
         ? "LMB drag gizmo | WASD/QE move object | RMB look"
         : "LMB select/drag | RMB look | WASD/QE fly";
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
     const float button_size = 28.0f;
-    const ImVec2 button_min = {g_editor.viewport_image_max.x - button_size - 10.0f, g_editor.viewport_image_min.y + 10.0f};
+    const float padding = 10.0f;
+
+    // Preview mode segmented buttons.
+    {
+        const float gap = 4.0f;
+        const float render_w = 66.0f;
+        const float solid_w = 48.0f;
+        const float wire_w = 44.0f;
+        const float total_w = render_w + solid_w + wire_w + gap * 2.0f;
+        float x = g_editor.viewport_image_max.x - button_size - total_w - padding - 8.0f;
+        const float y = g_editor.viewport_image_min.y + padding;
+
+        auto set_preview_mode = [](ViewportPreviewMode mode) {
+            set_viewport_preview_mode(mode);
+        };
+
+        auto draw_mode_button = [&](const char* label, const char* tooltip, ViewportPreviewMode mode, float width) {
+            const ImVec2 min = {x, y};
+            const ImVec2 max = {x + width, y + button_size};
+            const bool active = g_editor.viewport_preview_mode == mode;
+            const bool hovered = point_in_rect(ImGui::GetIO().MousePos, min, max);
+            const ImU32 fill = active ? IM_COL32(70, 96, 150, 235) : IM_COL32(18, 18, 20, 210);
+            const ImU32 border = hovered || active ? IM_COL32(140, 160, 205, 240) : IM_COL32(95, 100, 110, 230);
+            draw_list->AddRectFilled(min, max, fill, 4.0f);
+            draw_list->AddRect(min, max, border, 4.0f);
+            const ImVec2 text_size = ImGui::CalcTextSize(label);
+            draw_list->AddText({min.x + (width - text_size.x) * 0.5f, min.y + (button_size - text_size.y) * 0.5f},
+                IM_COL32(225, 228, 235, 255), label);
+            if (hovered) {
+                ImGui::SetTooltip("%s", tooltip);
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    set_preview_mode(mode);
+                }
+            }
+            x += width + gap;
+        };
+
+        draw_mode_button("Render", "Rendered path tracer preview", ViewportPreviewMode::Rendered, render_w);
+        draw_mode_button("Solid", "Solid viewport preview", ViewportPreviewMode::Solid, solid_w);
+        draw_mode_button("Wire", "Wireframe-only viewport preview", ViewportPreviewMode::Wireframe, wire_w);
+    }
+
+    // Fullscreen button
+    const ImVec2 button_min = {g_editor.viewport_image_max.x - button_size - padding, g_editor.viewport_image_min.y + padding};
     const ImVec2 button_max = {button_min.x + button_size, button_min.y + button_size};
     draw_list->AddRectFilled(button_min, button_max, IM_COL32(18, 18, 20, 210), 4.0f);
     draw_list->AddRect(button_min, button_max, IM_COL32(95, 100, 110, 230), 4.0f);
@@ -3112,6 +3252,7 @@ void draw_viewport() {
             g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen;
         }
     }
+
     const ImVec2 text_size = ImGui::CalcTextSize(hint);
     const ImVec2 text_pos = {g_editor.viewport_image_min.x + 8.0f, g_editor.viewport_image_max.y - text_size.y - 8.0f};
     draw_list->AddRectFilled({text_pos.x - 6.0f, text_pos.y - 4.0f}, {text_pos.x + text_size.x + 6.0f, text_pos.y + text_size.y + 4.0f}, IM_COL32(18, 18, 20, 180), 3.0f);
@@ -3664,6 +3805,33 @@ void draw_statistics_panel() {
         ImGui::Separator();
         format_bytes(cache_total, buf, sizeof(buf));
         stat_row("Cache Total (est.)", "%s", buf);
+        end_stats_table();
+    }
+
+    // --- Viewport Preview ---
+    section("Viewport Preview");
+    {
+        begin_stats_table();
+
+        const char* mode_name = "Unknown";
+        switch (g_editor.viewport_preview_mode) {
+            case ViewportPreviewMode::Rendered:  mode_name = "Rendered"; break;
+            case ViewportPreviewMode::Solid:     mode_name = "Solid"; break;
+            case ViewportPreviewMode::Wireframe: mode_name = "Wireframe"; break;
+        }
+        stat_row("Preview Mode", "%s", mode_name);
+
+        stat_row("Preview Texture",
+            "%s (%dx%d)",
+            g_preview.texture ? "allocated" : "released",
+            g_preview.width, g_preview.height);
+
+        stat_row("Solid Preview Verts", "%u", g_solid_preview.vertex_count);
+        stat_row("Solid Preview Indices", "%u", g_solid_preview.index_count);
+
+        stat_row("CPU Cache", "%s", g_editor.cpu.has_cached_data() ? "loaded" : "empty");
+        stat_row("CUDA Cache", "%s", g_editor.cuda.has_cached_data() ? "loaded" : "empty");
+
         end_stats_table();
     }
 

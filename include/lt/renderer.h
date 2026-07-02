@@ -220,6 +220,7 @@ public:
     virtual const char* name() const = 0;
     virtual bool available() const = 0;
     virtual void reset() = 0;
+    virtual bool has_cached_data() const { return false; }
     virtual void render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) = 0;
 };
 
@@ -228,6 +229,7 @@ public:
     const char* name() const override { return "CPU Path Tracer"; }
     bool available() const override { return true; }
     void reset() override;
+    bool has_cached_data() const override { return scene_uploaded_; }
     void render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) override;
 
 private:
@@ -243,6 +245,7 @@ public:
     const char* name() const override { return "CUDA Path Tracer"; }
     bool available() const override;
     void reset() override;
+    bool has_cached_data() const override { return scene_uploaded_; }
     void render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) override;
 
 private:
