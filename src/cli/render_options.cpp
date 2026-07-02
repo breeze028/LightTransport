@@ -141,6 +141,10 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.settings.irradiance_volume_auto_update = false;
         } else if (argument == "--ivol-force-bake") {
             options.settings.irradiance_volume_force_rebake = true;
+        } else if (argument == "--ivol-bake-backend" && i + 1 < argc) {
+            const std::string backend = argv[++i];
+            options.settings.irradiance_volume_bake_backend =
+                backend == "cpu" ? IrradianceVolumeBakeBackend::Cpu : IrradianceVolumeBakeBackend::Gpu;
         } else if (argument == "--ivol-bounds" && i + 6 < argc) {
             options.settings.irradiance_volume_manual_bounds = true;
             options.settings.irradiance_volume_bounds_min = {

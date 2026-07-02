@@ -885,7 +885,24 @@ std::shared_ptr<IrradianceVolume> update_irradiance_volume(
     }
 
     reset_irradiance_volume_progress(settings, IrradianceVolumeBakePhase::Baking);
-    std::shared_ptr<IrradianceVolume> volume = build_irradiance_volume(*bake_render_scene, *bake_scene, settings);
+    std::shared_ptr<IrradianceVolume> volume;
+    if (settings.irradiance_volume_bake_backend == IrradianceVolumeBakeBackend::Gpu) {
+        std::shared_ptr<void> result = build_irradiance_volume_gpu(*bake_render_scene, *bake_scene, settings);
+        volume = std::static_pointer_cast<IrradianceVolume>(result);
+    } else {
+        volume = build_irradiance_volume(*bake_render_scene, *bake_scene, settings);
+    }
+
+    if (!volume) {
+        set_irradiance_volume_progress_phase(settings, IrradianceVolumeBakePhase::Failed);
+        LT_LOG_WARN("Irradiance volume bake failed with {} backend; keeping previous volume",
+            settings.irradiance_volume_bake_backend == IrradianceVolumeBakeBackend::Gpu ? "GPU" : "CPU");
+        if (cached_irradiance_volume) {
+            return std::static_pointer_cast<IrradianceVolume>(cached_irradiance_volume);
+        }
+        return nullptr;
+    }
+
     cached_irradiance_volume = volume;
     volume_rebuilt = true;
     save_irradiance_volume_cache(*volume, settings, fingerprint);

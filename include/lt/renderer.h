@@ -37,6 +37,11 @@ enum class IrradianceVolumeBakePhase : int {
     Failed = 5,
 };
 
+enum class IrradianceVolumeBakeBackend : int {
+    Gpu = 0,
+    Cpu = 1,
+};
+
 enum class LightmapBakePhase : int {
     Idle = 0,
     LoadingCache = 1,
@@ -111,6 +116,7 @@ struct RenderSettings {
     int irradiance_volume_bake_samples = 1;
     int irradiance_volume_bake_bounces = 4;
     float irradiance_volume_bounds_inset = 0.01f;
+    IrradianceVolumeBakeBackend irradiance_volume_bake_backend = IrradianceVolumeBakeBackend::Gpu;
     bool irradiance_volume_principled_gi = false;
     bool irradiance_volume_debug_probes = false;
     float irradiance_volume_debug_probe_radius_scale = 0.10f;
@@ -195,6 +201,9 @@ struct Framebuffer {
         std::fill(accumulation.begin(), accumulation.end(), Vec3{});
     }
 };
+
+std::shared_ptr<void> build_irradiance_volume_gpu(
+    const RenderScene& render_scene, const Scene& scene, const RenderSettings& settings);
 
 class IRenderer {
 public:

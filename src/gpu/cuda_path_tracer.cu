@@ -141,7 +141,286 @@ const char* cuda_error_text(cudaError_t error) {
     return error == cudaSuccess ? nullptr : cudaGetErrorString(error);
 }
 
+#include "irradiance_volume_bake.cuh"
+
 } // namespace
+
+std::shared_ptr<void> build_irradiance_volume_gpu(
+    const RenderScene& render_scene,
+    const Scene& scene,
+    const RenderSettings& settings)
+{
+    const auto begin = std::chrono::steady_clock::now();
+
+    // 1. Build volume layout on CPU (directions, weights, sparse grid).
+    auto volume = std::make_shared<IrradianceVolume>();
+    volume->grid_resolution = std::max(2, settings.irradiance_volume_grid_resolution);
+    volume->subgrid_resolution = std::max(2, settings.irradiance_volume_subgrid_resolution);
+    volume->direction_resolution = std::max(1, settings.irradiance_volume_direction_resolution);
+    volume->bake_samples = std::max(1, settings.irradiance_volume_bake_samples);
+    volume->bake_bounces = std::max(1, settings.irradiance_volume_bake_bounces);
+    volume->bounds = scene_irradiance_bounds(render_scene, settings);
+    volume->directions = make_irradiance_volume_directions(volume->direction_resolution);
+    volume->cosine_weights = make_irradiance_volume_weights(volume->directions);
+
+    initialize_irradiance_grid(*volume, volume->grid, render_scene,
+        volume->bounds, volume->grid_resolution, true);
+    collect_debug_probes_from_grid(*volume, volume->grid);
+    volume->unique_debug_probe_count = volume->debug_probes.size();
+
+    // Collect flat probe position list.
+    std::vector<Vec3> probe_positions;
+    probe_positions.reserve(volume->spatial_sample_count);
+    collect_probe_positions(volume->grid, probe_positions);
+
+    const int probe_count = static_cast<int>(probe_positions.size());
+    const int direction_count = static_cast<int>(volume->directions.size());
+    if (probe_count == 0 || direction_count == 0) {
+        const auto end = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        if (settings.irradiance_volume_bake_progress) {
+            IrradianceVolumeBakeProgress& p = *settings.irradiance_volume_bake_progress;
+            p.total_samples.store(volume->spatial_sample_count, std::memory_order_relaxed);
+            p.completed_samples.store(volume->spatial_sample_count, std::memory_order_relaxed);
+            p.direction_count.store(direction_count, std::memory_order_relaxed);
+            p.elapsed_ms.store(elapsed_ms, std::memory_order_relaxed);
+            p.phase.store(static_cast<int>(IrradianceVolumeBakePhase::Complete), std::memory_order_relaxed);
+        }
+        return volume;
+    }
+
+    // 2. Pack and upload the bake scene to GPU.
+    PackedGpuScene packed;
+    if (!pack_scene_from_render_scene(scene, settings, render_scene, packed)) {
+        LT_LOG_ERROR("GPU irradiance volume bake: failed to pack scene");
+        return nullptr;
+    }
+
+    // Temporary device pointers (separate from CudaPathTracer's cache).
+    void* dev_scene = nullptr;
+    void* dev_materials = nullptr;
+    void* dev_triangles = nullptr;
+    void* dev_spheres = nullptr;
+    void* dev_triangle_indices = nullptr;
+    void* dev_light_indices = nullptr;
+    void* dev_directional_lights = nullptr;
+    void* dev_bvh_nodes = nullptr;
+    void* dev_mesh_instances = nullptr;
+    void* dev_mesh_instance_indices = nullptr;
+    void* dev_tlas_nodes = nullptr;
+    void* dev_textures_buf = nullptr;
+    int hint_materials = 0, hint_triangles = 0, hint_spheres = 0;
+    int hint_triangle_indices = 0, hint_light_indices = 0;
+    int hint_directional_lights = 0, hint_bvh_nodes = 0;
+    int hint_mesh_instances = 0, hint_mesh_instance_indices = 0;
+    int hint_tlas_nodes = 0, hint_textures = 0;
+    std::vector<void*> texture_arrays;
+    std::vector<uint64_t> texture_objects;
+
+    cudaError_t cuda_error = cudaSuccess;
+    auto cleanup_scene = [&]() {
+        cudaFree(dev_scene);
+        cudaFree(dev_materials);
+        cudaFree(dev_triangles);
+        cudaFree(dev_spheres);
+        cudaFree(dev_triangle_indices);
+        cudaFree(dev_light_indices);
+        cudaFree(dev_directional_lights);
+        cudaFree(dev_bvh_nodes);
+        cudaFree(dev_mesh_instances);
+        cudaFree(dev_mesh_instance_indices);
+        cudaFree(dev_tlas_nodes);
+        cudaFree(dev_textures_buf);
+        release_texture_objects(texture_arrays, texture_objects);
+    };
+
+    if ((cuda_error = cudaMalloc(&dev_scene, sizeof(GpuScene))) != cudaSuccess) {
+        LT_LOG_ERROR("GPU irradiance volume bake: cudaMalloc scene failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_scene();
+        return nullptr;
+    }
+
+    if (!upload_buffer(dev_materials, hint_materials, packed.materials) ||
+        !upload_buffer(dev_triangles, hint_triangles, packed.triangles) ||
+        !upload_buffer(dev_spheres, hint_spheres, packed.spheres) ||
+        !upload_buffer(dev_triangle_indices, hint_triangle_indices, packed.triangle_indices) ||
+        !upload_buffer(dev_light_indices, hint_light_indices, packed.light_indices) ||
+        !upload_buffer(dev_directional_lights, hint_directional_lights, packed.directional_lights) ||
+        !upload_buffer(dev_bvh_nodes, hint_bvh_nodes, packed.bvh_nodes) ||
+        !upload_buffer(dev_mesh_instances, hint_mesh_instances, packed.mesh_instances) ||
+        !upload_buffer(dev_mesh_instance_indices, hint_mesh_instance_indices, packed.mesh_instance_indices) ||
+        !upload_buffer(dev_tlas_nodes, hint_tlas_nodes, packed.tlas_nodes) ||
+        !upload_buffer(dev_textures_buf, hint_textures, packed.textures) ||
+        !upload_texture_objects(scene, packed, texture_arrays, texture_objects)) {
+        LT_LOG_ERROR("GPU irradiance volume bake: scene upload failed");
+        cleanup_scene();
+        return nullptr;
+    }
+
+    packed.scene.materials = static_cast<GpuMaterial*>(dev_materials);
+    packed.scene.textures = static_cast<GpuTexture*>(dev_textures_buf);
+    packed.scene.triangles = static_cast<GpuTriangle*>(dev_triangles);
+    packed.scene.spheres = static_cast<GpuSphere*>(dev_spheres);
+    packed.scene.triangle_indices = static_cast<int*>(dev_triangle_indices);
+    packed.scene.light_indices = static_cast<int*>(dev_light_indices);
+    packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(dev_directional_lights);
+    packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(dev_bvh_nodes);
+    packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(dev_mesh_instances);
+    packed.scene.mesh_instance_indices = static_cast<int*>(dev_mesh_instance_indices);
+    packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(dev_tlas_nodes);
+
+    cuda_error = cudaMemcpy(static_cast<GpuScene*>(dev_scene), &packed.scene,
+        sizeof(GpuScene), cudaMemcpyHostToDevice);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU irradiance volume bake: scene header upload failed: {}",
+            cudaGetErrorString(cuda_error));
+        cleanup_scene();
+        return nullptr;
+    }
+
+    // 3. Upload probe data.
+    void* dev_probe_positions = nullptr;
+    void* dev_directions = nullptr;
+    void* dev_cosine_weights = nullptr;
+    void* dev_probe_radiance = nullptr;
+    void* dev_probe_irradiance = nullptr;
+    int hint_probes = 0, hint_dirs = 0, hint_weights = 0;
+
+    auto cleanup_all = [&]() {
+        cleanup_scene();
+        cudaFree(dev_probe_positions);
+        cudaFree(dev_directions);
+        cudaFree(dev_cosine_weights);
+        cudaFree(dev_probe_radiance);
+        cudaFree(dev_probe_irradiance);
+    };
+
+    if (!upload_buffer(dev_probe_positions, hint_probes, probe_positions) ||
+        !upload_buffer(dev_directions, hint_dirs, volume->directions) ||
+        !upload_buffer(dev_cosine_weights, hint_weights, volume->cosine_weights)) {
+        LT_LOG_ERROR("GPU irradiance volume bake: probe data upload failed");
+        cleanup_all();
+        return nullptr;
+    }
+
+    const size_t radiance_count = static_cast<size_t>(probe_count) * static_cast<size_t>(direction_count);
+    if ((cuda_error = cudaMalloc(&dev_probe_radiance, radiance_count * sizeof(Vec3))) != cudaSuccess ||
+        (cuda_error = cudaMalloc(&dev_probe_irradiance, radiance_count * sizeof(Vec3))) != cudaSuccess) {
+        LT_LOG_ERROR("GPU irradiance volume bake: radiance buffer alloc failed: {}",
+            cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    // 4. Set progress.
+    if (settings.irradiance_volume_bake_progress) {
+        IrradianceVolumeBakeProgress& p = *settings.irradiance_volume_bake_progress;
+        p.total_samples.store(static_cast<uint64_t>(probe_count), std::memory_order_relaxed);
+        p.completed_samples.store(0, std::memory_order_relaxed);
+        p.total_rays.store(static_cast<uint64_t>(probe_count) * static_cast<uint64_t>(direction_count) *
+            static_cast<uint64_t>(volume->bake_samples), std::memory_order_relaxed);
+        p.traced_rays.store(0, std::memory_order_relaxed);
+        p.direction_count.store(direction_count, std::memory_order_relaxed);
+        p.elapsed_ms.store(0.0, std::memory_order_relaxed);
+        p.phase.store(static_cast<int>(IrradianceVolumeBakePhase::Baking), std::memory_order_relaxed);
+    }
+
+    // 5. Launch radiance kernel.
+    const int total_threads = probe_count * direction_count;
+    const int block_size = 256;
+    const int grid_size = (total_threads + block_size - 1) / block_size;
+    bake_radiance_kernel<<<grid_size, block_size>>>(
+        static_cast<const GpuScene*>(dev_scene),
+        static_cast<const Vec3*>(dev_probe_positions),
+        probe_count,
+        static_cast<const Vec3*>(dev_directions),
+        direction_count,
+        volume->bake_samples,
+        volume->bake_bounces,
+        static_cast<int>(settings.sampling_mode),
+        static_cast<int>(settings.mis_heuristic),
+        static_cast<int>(settings.acceleration_structure),
+        static_cast<Vec3*>(dev_probe_radiance));
+
+    cuda_error = cudaDeviceSynchronize();
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU irradiance volume bake: radiance kernel failed: {}",
+            cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    // Update progress after radiance pass.
+    if (settings.irradiance_volume_bake_progress) {
+        IrradianceVolumeBakeProgress& p = *settings.irradiance_volume_bake_progress;
+        p.traced_rays.store(static_cast<uint64_t>(probe_count) *
+            static_cast<uint64_t>(direction_count) * static_cast<uint64_t>(volume->bake_samples),
+            std::memory_order_relaxed);
+        p.completed_samples.store(static_cast<uint64_t>(probe_count), std::memory_order_relaxed);
+    }
+
+    // 6. Launch reduce kernel.
+    reduce_irradiance_kernel<<<grid_size, block_size>>>(
+        static_cast<const Vec3*>(dev_probe_radiance),
+        probe_count,
+        direction_count,
+        static_cast<const float*>(dev_cosine_weights),
+        static_cast<Vec3*>(dev_probe_irradiance),
+        1024.0f);
+
+    cuda_error = cudaDeviceSynchronize();
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU irradiance volume bake: reduce kernel failed: {}",
+            cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    // 7. Download results and populate volume.
+    std::vector<Vec3> irradiance_results(radiance_count);
+    cuda_error = cudaMemcpy(irradiance_results.data(), dev_probe_irradiance,
+        radiance_count * sizeof(Vec3), cudaMemcpyDeviceToHost);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU irradiance volume bake: result download failed: {}",
+            cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    int sample_idx = 0;
+    populate_irradiance_results(volume->grid, irradiance_results, direction_count, sample_idx);
+
+    // 8. Cleanup temporary device allocations.
+    cleanup_all();
+
+    // 9. Final progress and log.
+    const auto end = std::chrono::steady_clock::now();
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+    if (settings.irradiance_volume_bake_progress) {
+        IrradianceVolumeBakeProgress& p = *settings.irradiance_volume_bake_progress;
+        p.elapsed_ms.store(elapsed_ms, std::memory_order_relaxed);
+        p.phase.store(static_cast<int>(IrradianceVolumeBakePhase::Complete), std::memory_order_relaxed);
+    }
+
+    const size_t irradiance_bytes = volume->spatial_sample_count *
+        static_cast<size_t>(direction_count) * sizeof(Vec3);
+    const size_t weight_bytes = volume->cosine_weights.size() * sizeof(float);
+    const uint64_t total_rays = static_cast<uint64_t>(probe_count) * static_cast<uint64_t>(direction_count) *
+        static_cast<uint64_t>(volume->bake_samples);
+    LT_LOG_INFO(
+        "Irradiance volume baked on GPU: samples={} debug_probes={} first_cells={} subgrids={} directions={} rays={} memory_kib={} elapsed_ms={} elapsed_s={}",
+        volume->spatial_sample_count,
+        volume->unique_debug_probe_count,
+        volume->first_level_cell_count,
+        volume->subgrid_count,
+        direction_count,
+        total_rays,
+        (irradiance_bytes + weight_bytes) / 1024u,
+        format_decimal(elapsed_ms, 3),
+        format_decimal(elapsed_ms * 0.001, 2));
+
+    return volume;
+}
 
 bool CudaPathTracer::available() const {
     int count = 0;

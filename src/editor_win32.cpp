@@ -656,6 +656,7 @@ lt::SceneRenderSettings capture_scene_render_settings() {
     settings.irradiance_volume_manual_bounds = g_editor.settings.irradiance_volume_manual_bounds;
     settings.irradiance_volume_bounds_min = g_editor.settings.irradiance_volume_bounds_min;
     settings.irradiance_volume_bounds_max = g_editor.settings.irradiance_volume_bounds_max;
+    settings.irradiance_volume_bake_backend = static_cast<int>(g_editor.settings.irradiance_volume_bake_backend);
     settings.use_lightmap = g_editor.settings.use_lightmap;
     settings.lightmap_resolution = g_editor.settings.lightmap_resolution;
     settings.lightmap_padding = g_editor.settings.lightmap_padding;
@@ -697,6 +698,7 @@ void apply_scene_render_settings(const lt::Scene& scene) {
     g_editor.settings.irradiance_volume_manual_bounds = settings.irradiance_volume_manual_bounds;
     g_editor.settings.irradiance_volume_bounds_min = settings.irradiance_volume_bounds_min;
     g_editor.settings.irradiance_volume_bounds_max = settings.irradiance_volume_bounds_max;
+    g_editor.settings.irradiance_volume_bake_backend = static_cast<lt::IrradianceVolumeBakeBackend>(settings.irradiance_volume_bake_backend);
     g_editor.settings.use_lightmap = settings.use_lightmap;
     g_editor.settings.lightmap_resolution = settings.lightmap_resolution;
     g_editor.settings.lightmap_padding = settings.lightmap_padding;
@@ -2854,6 +2856,11 @@ void draw_properties() {
                 }
                 if (ImGui::DragInt("Bake Bounces", &g_editor.settings.irradiance_volume_bake_bounces, 1.0f, 1, 16)) {
                     g_editor.settings.irradiance_volume_bake_bounces = std::clamp(g_editor.settings.irradiance_volume_bake_bounces, 1, 32);
+                    reset_accumulation(lt::RenderDirty::IrradianceVolume);
+                }
+                int bake_backend = static_cast<int>(g_editor.settings.irradiance_volume_bake_backend);
+                if (ImGui::Combo("Bake Backend", &bake_backend, "GPU\0CPU\0\0")) {
+                    g_editor.settings.irradiance_volume_bake_backend = static_cast<lt::IrradianceVolumeBakeBackend>(bake_backend);
                     reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
                 if (ImGui::DragFloat("Bounds Inset", &g_editor.settings.irradiance_volume_bounds_inset, 0.002f, 0.0f, 0.45f, "%.3f")) {

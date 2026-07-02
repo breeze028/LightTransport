@@ -638,6 +638,12 @@ SceneLoadResult load_scene(const std::string& path) {
             scene.render_settings.irradiance_volume_cache_enabled = cache_enabled != 0;
             scene.render_settings.irradiance_volume_auto_update = auto_update != 0;
             scene.render_settings.irradiance_volume_manual_bounds = manual_bounds != 0;
+            int bake_backend = 0;
+            if (!(input >> bake_backend)) {
+                input.clear();  // old file format; default to GPU
+                bake_backend = 0;
+            }
+            scene.render_settings.irradiance_volume_bake_backend = std::clamp(bake_backend, 0, 1);
             scene.has_render_settings = true;
         } else if (tag == "irradiance_volume_bounds") {
             input >> scene.render_settings.irradiance_volume_bounds_min.x
@@ -1155,7 +1161,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             << settings.irradiance_volume_debug_probe_radius_scale << ' '
             << (settings.irradiance_volume_cache_enabled ? 1 : 0) << ' '
             << (settings.irradiance_volume_auto_update ? 1 : 0) << ' '
-            << (settings.irradiance_volume_manual_bounds ? 1 : 0) << '\n';
+            << (settings.irradiance_volume_manual_bounds ? 1 : 0) << ' '
+            << settings.irradiance_volume_bake_backend << '\n';
         if (settings.irradiance_volume_manual_bounds) {
             output << "irradiance_volume_bounds "
                 << settings.irradiance_volume_bounds_min.x << ' '

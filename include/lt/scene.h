@@ -77,6 +77,7 @@ struct SceneRenderSettings {
     int irradiance_volume_bake_samples = 1;
     int irradiance_volume_bake_bounces = 4;
     float irradiance_volume_bounds_inset = 0.01f;
+    int irradiance_volume_bake_backend = 0; // IrradianceVolumeBakeBackend::Gpu
     bool irradiance_volume_principled_gi = false;
     bool irradiance_volume_debug_probes = false;
     float irradiance_volume_debug_probe_radius_scale = 0.10f;
