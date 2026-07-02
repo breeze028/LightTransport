@@ -168,7 +168,7 @@ RenderOptions parse_render_options(int argc, char** argv) {
         } else if (argument == "--lightmap-dilation" && i + 1 < argc) {
             options.settings.lightmap_dilation = std::clamp(std::atoi(argv[++i]), 0, 64);
         } else if (argument == "--lightmap-bake-samples" && i + 1 < argc) {
-            options.settings.lightmap_bake_samples = std::max(1, std::atoi(argv[++i]));
+            options.settings.lightmap_bake_samples = std::clamp(std::atoi(argv[++i]), 1, 1024);
         } else if (argument == "--lightmap-bake-bounces" && i + 1 < argc) {
             options.settings.lightmap_bake_bounces = std::max(1, std::atoi(argv[++i]));
         } else if (argument == "--lightmap-principled-gi") {
@@ -186,6 +186,10 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.settings.lightmap_auto_update = false;
         } else if (argument == "--lightmap-force-bake") {
             options.settings.lightmap_force_rebake = true;
+        } else if (argument == "--lightmap-bake-backend" && i + 1 < argc) {
+            const std::string backend = argv[++i];
+            options.settings.lightmap_bake_backend =
+                backend == "cpu" ? LightmapBakeBackend::Cpu : LightmapBakeBackend::Gpu;
         } else if (argument == "--style" && i + 1 < argc) {
             options.global_style = parse_npr_style(argv[++i]);
             options.global_style_set = true;

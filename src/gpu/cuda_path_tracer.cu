@@ -142,6 +142,7 @@ const char* cuda_error_text(cudaError_t error) {
 }
 
 #include "irradiance_volume_bake.cuh"
+#include "lightmap_bake.cuh"
 
 } // namespace
 
@@ -420,6 +421,302 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
         format_decimal(elapsed_ms * 0.001, 2));
 
     return volume;
+}
+
+std::shared_ptr<void> build_lightmap_gpu(
+    const RenderScene& render_scene,
+    const Scene& scene,
+    const RenderSettings& settings)
+{
+    const auto begin = std::chrono::steady_clock::now();
+
+    // 1. UV unwrap on CPU using xatlas.
+    auto lightmap = std::make_shared<Lightmap>();
+    if (!generate_lightmap_uvs(render_scene, settings, *lightmap)) {
+        return nullptr;
+    }
+
+    // 2. Raster texels to get world positions and normals.
+    std::vector<GpuLightmapBakeTexel> bake_texels = raster_lightmap_texels(*lightmap, render_scene);
+    const int texel_count = static_cast<int>(bake_texels.size());
+    if (texel_count == 0) {
+        // No valid texels — return empty lightmap.
+        const auto end = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+        if (settings.lightmap_bake_progress) {
+            LightmapBakeProgress& p = *settings.lightmap_bake_progress;
+            p.total_texels.store(0, std::memory_order_relaxed);
+            p.completed_texels.store(0, std::memory_order_relaxed);
+            p.width.store(lightmap->width, std::memory_order_relaxed);
+            p.height.store(lightmap->height, std::memory_order_relaxed);
+            p.elapsed_ms.store(elapsed_ms, std::memory_order_relaxed);
+            p.phase.store(static_cast<int>(LightmapBakePhase::Complete), std::memory_order_relaxed);
+        }
+        return lightmap;
+    }
+
+    // 3. Pack and upload the bake scene to GPU.
+    PackedGpuScene packed;
+    if (!pack_scene_from_render_scene(scene, settings, render_scene, packed)) {
+        LT_LOG_ERROR("GPU lightmap bake: failed to pack scene");
+        return nullptr;
+    }
+
+    void* dev_scene = nullptr;
+    void* dev_materials = nullptr;
+    void* dev_triangles = nullptr;
+    void* dev_spheres = nullptr;
+    void* dev_triangle_indices = nullptr;
+    void* dev_light_indices = nullptr;
+    void* dev_directional_lights = nullptr;
+    void* dev_bvh_nodes = nullptr;
+    void* dev_mesh_instances = nullptr;
+    void* dev_mesh_instance_indices = nullptr;
+    void* dev_tlas_nodes = nullptr;
+    void* dev_textures_buf = nullptr;
+    int hint_materials = 0, hint_triangles = 0, hint_spheres = 0;
+    int hint_triangle_indices = 0, hint_light_indices = 0;
+    int hint_directional_lights = 0, hint_bvh_nodes = 0;
+    int hint_mesh_instances = 0, hint_mesh_instance_indices = 0;
+    int hint_tlas_nodes = 0, hint_textures = 0;
+    std::vector<void*> texture_arrays;
+    std::vector<uint64_t> texture_objects;
+
+    cudaError_t cuda_error = cudaSuccess;
+    auto cleanup_scene = [&]() {
+        cudaFree(dev_scene);
+        cudaFree(dev_materials);
+        cudaFree(dev_triangles);
+        cudaFree(dev_spheres);
+        cudaFree(dev_triangle_indices);
+        cudaFree(dev_light_indices);
+        cudaFree(dev_directional_lights);
+        cudaFree(dev_bvh_nodes);
+        cudaFree(dev_mesh_instances);
+        cudaFree(dev_mesh_instance_indices);
+        cudaFree(dev_tlas_nodes);
+        cudaFree(dev_textures_buf);
+        release_texture_objects(texture_arrays, texture_objects);
+    };
+
+    if ((cuda_error = cudaMalloc(&dev_scene, sizeof(GpuScene))) != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: cudaMalloc scene failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_scene();
+        return nullptr;
+    }
+
+    if (!upload_buffer(dev_materials, hint_materials, packed.materials) ||
+        !upload_buffer(dev_triangles, hint_triangles, packed.triangles) ||
+        !upload_buffer(dev_spheres, hint_spheres, packed.spheres) ||
+        !upload_buffer(dev_triangle_indices, hint_triangle_indices, packed.triangle_indices) ||
+        !upload_buffer(dev_light_indices, hint_light_indices, packed.light_indices) ||
+        !upload_buffer(dev_directional_lights, hint_directional_lights, packed.directional_lights) ||
+        !upload_buffer(dev_bvh_nodes, hint_bvh_nodes, packed.bvh_nodes) ||
+        !upload_buffer(dev_mesh_instances, hint_mesh_instances, packed.mesh_instances) ||
+        !upload_buffer(dev_mesh_instance_indices, hint_mesh_instance_indices, packed.mesh_instance_indices) ||
+        !upload_buffer(dev_tlas_nodes, hint_tlas_nodes, packed.tlas_nodes) ||
+        !upload_buffer(dev_textures_buf, hint_textures, packed.textures) ||
+        !upload_texture_objects(scene, packed, texture_arrays, texture_objects)) {
+        LT_LOG_ERROR("GPU lightmap bake: scene upload failed");
+        cleanup_scene();
+        return nullptr;
+    }
+
+    packed.scene.materials = static_cast<GpuMaterial*>(dev_materials);
+    packed.scene.textures = static_cast<GpuTexture*>(dev_textures_buf);
+    packed.scene.triangles = static_cast<GpuTriangle*>(dev_triangles);
+    packed.scene.spheres = static_cast<GpuSphere*>(dev_spheres);
+    packed.scene.triangle_indices = static_cast<int*>(dev_triangle_indices);
+    packed.scene.light_indices = static_cast<int*>(dev_light_indices);
+    packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(dev_directional_lights);
+    packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(dev_bvh_nodes);
+    packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(dev_mesh_instances);
+    packed.scene.mesh_instance_indices = static_cast<int*>(dev_mesh_instance_indices);
+    packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(dev_tlas_nodes);
+
+    cuda_error = cudaMemcpy(static_cast<GpuScene*>(dev_scene), &packed.scene,
+        sizeof(GpuScene), cudaMemcpyHostToDevice);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: scene header upload failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_scene();
+        return nullptr;
+    }
+
+    // 4. Upload texel records.
+    void* dev_bake_texels = nullptr;
+    void* dev_lightmap_texels = nullptr;
+    void* dev_lightmap_valid = nullptr;
+    int hint_bake_texels = 0;
+    const size_t lm_size = lightmap->texels.size();
+    const size_t texels_bytes = lm_size * sizeof(Vec3);
+    const size_t valid_bytes = lm_size * sizeof(uint8_t);
+
+    auto cleanup_all = [&]() {
+        cleanup_scene();
+        cudaFree(dev_bake_texels);
+        cudaFree(dev_lightmap_texels);
+        cudaFree(dev_lightmap_valid);
+    };
+
+    if (!upload_buffer(dev_bake_texels, hint_bake_texels, bake_texels)) {
+        LT_LOG_ERROR("GPU lightmap bake: texel record upload failed");
+        cleanup_all();
+        return nullptr;
+    }
+
+    if ((cuda_error = cudaMalloc(&dev_lightmap_texels, texels_bytes)) != cudaSuccess ||
+        (cuda_error = cudaMalloc(&dev_lightmap_valid, valid_bytes)) != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: output buffer alloc failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+    cuda_error = cudaMemset(dev_lightmap_texels, 0, texels_bytes);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: memset failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+    cuda_error = cudaMemset(dev_lightmap_valid, 0, valid_bytes);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: memset valid failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    // 5. Set progress.
+    if (settings.lightmap_bake_progress) {
+        LightmapBakeProgress& p = *settings.lightmap_bake_progress;
+        p.total_texels.store(static_cast<uint64_t>(texel_count), std::memory_order_relaxed);
+        p.completed_texels.store(0, std::memory_order_relaxed);
+        p.total_rays.store(static_cast<uint64_t>(texel_count) * static_cast<uint64_t>(lightmap->bake_samples) * 2u,
+            std::memory_order_relaxed);
+        p.width.store(lightmap->width, std::memory_order_relaxed);
+        p.height.store(lightmap->height, std::memory_order_relaxed);
+        p.phase.store(static_cast<int>(LightmapBakePhase::Baking), std::memory_order_relaxed);
+    }
+
+    // 6. Launch bake kernel.
+    const int block_size = 256;
+    const int grid_size = (texel_count + block_size - 1) / block_size;
+    bake_lightmap_texels_kernel<<<grid_size, block_size>>>(
+        static_cast<const GpuScene*>(dev_scene),
+        static_cast<const GpuLightmapBakeTexel*>(dev_bake_texels),
+        texel_count,
+        lightmap->bake_samples,
+        lightmap->bake_bounces,
+        static_cast<int>(settings.sampling_mode),
+        static_cast<int>(settings.mis_heuristic),
+        static_cast<int>(settings.acceleration_structure),
+        static_cast<Vec3*>(dev_lightmap_texels),
+        static_cast<uint8_t*>(dev_lightmap_valid));
+
+    cuda_error = cudaDeviceSynchronize();
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: bake kernel failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    // Update progress.
+    if (settings.lightmap_bake_progress) {
+        LightmapBakeProgress& p = *settings.lightmap_bake_progress;
+        p.completed_texels.store(static_cast<uint64_t>(texel_count), std::memory_order_relaxed);
+        p.traced_rays.store(static_cast<uint64_t>(texel_count) * static_cast<uint64_t>(lightmap->bake_samples) * 2u,
+            std::memory_order_relaxed);
+    }
+
+    // 7. Dilation passes (ping-pong with one extra buffer).
+    const int dilation_iters = std::clamp(settings.lightmap_dilation, 0, 64);
+    if (dilation_iters > 0) {
+        void* dev_alt_texels = nullptr;
+        void* dev_alt_valid = nullptr;
+        if ((cuda_error = cudaMalloc(&dev_alt_texels, texels_bytes)) != cudaSuccess ||
+            (cuda_error = cudaMalloc(&dev_alt_valid, valid_bytes)) != cudaSuccess) {
+            LT_LOG_ERROR("GPU lightmap bake: dilation buffer alloc failed: {}", cudaGetErrorString(cuda_error));
+            cudaFree(dev_alt_texels); cudaFree(dev_alt_valid);
+            cleanup_all();
+            return nullptr;
+        }
+
+        const int lm_grid_size = (static_cast<int>(lm_size) + block_size - 1) / block_size;
+        void* src_texels = dev_lightmap_texels;
+        void* src_valid = dev_lightmap_valid;
+        void* dst_texels = dev_alt_texels;
+        void* dst_valid = dev_alt_valid;
+
+        for (int iter = 0; iter < dilation_iters; ++iter) {
+            dilate_lightmap_kernel<<<lm_grid_size, block_size>>>(
+                static_cast<Vec3*>(src_texels),
+                static_cast<uint8_t*>(src_valid),
+                lightmap->width,
+                lightmap->height,
+                static_cast<Vec3*>(dst_texels),
+                static_cast<uint8_t*>(dst_valid));
+
+            cuda_error = cudaDeviceSynchronize();
+            if (cuda_error != cudaSuccess) {
+                LT_LOG_ERROR("GPU lightmap bake: dilation kernel failed at iter {}: {}", iter, cudaGetErrorString(cuda_error));
+                cudaFree(dev_alt_texels); cudaFree(dev_alt_valid);
+                cleanup_all();
+                return nullptr;
+            }
+            // Swap src and dst for next iteration.
+            std::swap(src_texels, dst_texels);
+            std::swap(src_valid, dst_valid);
+        }
+        // After the loop, the final result is in src_texels/src_valid.
+        if (src_texels != dev_lightmap_texels) {
+            cudaMemcpy(dev_lightmap_texels, src_texels, texels_bytes, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(dev_lightmap_valid, src_valid, valid_bytes, cudaMemcpyDeviceToDevice);
+        }
+
+        cudaFree(dev_alt_texels); cudaFree(dev_alt_valid);
+    }
+
+    // 8. Download results.
+    std::vector<Vec3> host_texels(lm_size);
+    std::vector<uint8_t> host_valid(lm_size);
+    cuda_error = cudaMemcpy(host_texels.data(), dev_lightmap_texels, texels_bytes, cudaMemcpyDeviceToHost);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: texel download failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+    cuda_error = cudaMemcpy(host_valid.data(), dev_lightmap_valid, valid_bytes, cudaMemcpyDeviceToHost);
+    if (cuda_error != cudaSuccess) {
+        LT_LOG_ERROR("GPU lightmap bake: valid download failed: {}", cudaGetErrorString(cuda_error));
+        cleanup_all();
+        return nullptr;
+    }
+
+    lightmap->texels = std::move(host_texels);
+    lightmap->valid = std::move(host_valid);
+    lightmap->baked_texel_count = 0;
+    for (uint8_t v : lightmap->valid) {
+        if (v) ++lightmap->baked_texel_count;
+    }
+
+    // 9. Cleanup temporary device allocations.
+    cleanup_all();
+
+    // 10. Final progress and log.
+    const auto end = std::chrono::steady_clock::now();
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+    if (settings.lightmap_bake_progress) {
+        LightmapBakeProgress& p = *settings.lightmap_bake_progress;
+        p.elapsed_ms.store(elapsed_ms, std::memory_order_relaxed);
+        p.phase.store(static_cast<int>(LightmapBakePhase::Complete), std::memory_order_relaxed);
+    }
+
+    LT_LOG_INFO("Lightmap baked on GPU: size={}x{} texels={} memory_kib={} elapsed_ms={} elapsed_s={}",
+        lightmap->width,
+        lightmap->height,
+        lightmap->baked_texel_count,
+        (lightmap->texels.size() * sizeof(Vec3)) / 1024u,
+        format_decimal(elapsed_ms, 3),
+        format_decimal(elapsed_ms * 0.001, 2));
+
+    return lightmap;
 }
 
 bool CudaPathTracer::available() const {

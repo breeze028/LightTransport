@@ -681,8 +681,23 @@ std::shared_ptr<Lightmap> update_lightmap(
         LT_LOG_WARN("Lightmap auto update disabled, but no usable cached lightmap exists; baking initial lightmap");
     }
 
-    std::shared_ptr<Lightmap> lightmap = build_lightmap(render_scene, scene, settings);
+    std::shared_ptr<Lightmap> lightmap;
+    if (settings.lightmap_bake_backend == LightmapBakeBackend::Gpu) {
+        std::shared_ptr<void> result = build_lightmap_gpu(render_scene, scene, settings);
+        lightmap = std::static_pointer_cast<Lightmap>(result);
+    } else {
+        lightmap = build_lightmap(render_scene, scene, settings);
+    }
+
     if (!lightmap) {
+        if (cached_lightmap) {
+            LT_LOG_WARN("Lightmap bake failed with {} backend; keeping previous lightmap",
+                settings.lightmap_bake_backend == LightmapBakeBackend::Gpu ? "GPU" : "CPU");
+            set_lightmap_progress_phase(settings, LightmapBakePhase::Failed);
+            std::shared_ptr<Lightmap> prev = std::static_pointer_cast<Lightmap>(cached_lightmap);
+            apply_lightmap_to_render_scene(prev.get(), render_scene);
+            return prev;
+        }
         cached_lightmap.reset();
         apply_lightmap_to_render_scene(nullptr, render_scene);
         lightmap_rebuilt = true;

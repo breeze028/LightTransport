@@ -93,6 +93,7 @@ struct SceneRenderSettings {
     int lightmap_bake_samples = 4;
     int lightmap_bake_bounces = 4;
     bool lightmap_principled_gi = false;
+    int lightmap_bake_backend = 0; // LightmapBakeBackend::Gpu
     bool lightmap_cache_enabled = true;
     bool lightmap_auto_update = true;
 };

@@ -42,6 +42,11 @@ enum class IrradianceVolumeBakeBackend : int {
     Cpu = 1,
 };
 
+enum class LightmapBakeBackend : int {
+    Gpu = 0,
+    Cpu = 1,
+};
+
 enum class LightmapBakePhase : int {
     Idle = 0,
     LoadingCache = 1,
@@ -136,6 +141,7 @@ struct RenderSettings {
     int lightmap_bake_samples = 4;
     int lightmap_bake_bounces = 4;
     bool lightmap_principled_gi = false;
+    LightmapBakeBackend lightmap_bake_backend = LightmapBakeBackend::Gpu;
     bool lightmap_cache_enabled = true;
     bool lightmap_auto_update = true;
     bool lightmap_force_rebake = false;
@@ -203,6 +209,9 @@ struct Framebuffer {
 };
 
 std::shared_ptr<void> build_irradiance_volume_gpu(
+    const RenderScene& render_scene, const Scene& scene, const RenderSettings& settings);
+
+std::shared_ptr<void> build_lightmap_gpu(
     const RenderScene& render_scene, const Scene& scene, const RenderSettings& settings);
 
 class IRenderer {

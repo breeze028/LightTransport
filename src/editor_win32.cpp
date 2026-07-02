@@ -666,6 +666,7 @@ lt::SceneRenderSettings capture_scene_render_settings() {
     settings.lightmap_principled_gi = g_editor.settings.lightmap_principled_gi;
     settings.lightmap_cache_enabled = g_editor.settings.lightmap_cache_enabled;
     settings.lightmap_auto_update = g_editor.settings.lightmap_auto_update;
+    settings.lightmap_bake_backend = static_cast<int>(g_editor.settings.lightmap_bake_backend);
     return settings;
 }
 
@@ -708,6 +709,7 @@ void apply_scene_render_settings(const lt::Scene& scene) {
     g_editor.settings.lightmap_principled_gi = settings.lightmap_principled_gi;
     g_editor.settings.lightmap_cache_enabled = settings.lightmap_cache_enabled;
     g_editor.settings.lightmap_auto_update = settings.lightmap_auto_update;
+    g_editor.settings.lightmap_bake_backend = static_cast<lt::LightmapBakeBackend>(settings.lightmap_bake_backend);
 }
 
 void load_texture_dialog(lt::Material& material) {
@@ -2935,8 +2937,8 @@ void draw_properties() {
                     g_editor.settings.lightmap_dilation = std::clamp(g_editor.settings.lightmap_dilation, 0, 64);
                     reset_accumulation(lt::RenderDirty::Lightmap);
                 }
-                if (ImGui::DragInt("Lightmap Samples", &g_editor.settings.lightmap_bake_samples, 1.0f, 1, 32)) {
-                    g_editor.settings.lightmap_bake_samples = std::clamp(g_editor.settings.lightmap_bake_samples, 1, 256);
+                if (ImGui::DragInt("Lightmap Samples", &g_editor.settings.lightmap_bake_samples, 1.0f, 1, 1024)) {
+                    g_editor.settings.lightmap_bake_samples = std::clamp(g_editor.settings.lightmap_bake_samples, 1, 1024);
                     reset_accumulation(lt::RenderDirty::Lightmap);
                 }
                 if (ImGui::DragInt("Lightmap Bounces", &g_editor.settings.lightmap_bake_bounces, 1.0f, 1, 16)) {
@@ -2945,6 +2947,11 @@ void draw_properties() {
                 }
                 if (ImGui::Checkbox("Lightmap Principled GI", &g_editor.settings.lightmap_principled_gi)) {
                     reset_accumulation();
+                }
+                int lm_bake_backend = static_cast<int>(g_editor.settings.lightmap_bake_backend);
+                if (ImGui::Combo("Lightmap Bake Backend", &lm_bake_backend, "GPU\0CPU\0\0")) {
+                    g_editor.settings.lightmap_bake_backend = static_cast<lt::LightmapBakeBackend>(lm_bake_backend);
+                    reset_accumulation(lt::RenderDirty::Lightmap);
                 }
                 ImGui::EndDisabled();
             }
@@ -3292,11 +3299,14 @@ void draw_lightmap_bake_overlay() {
     const int width = progress.width.load(std::memory_order_relaxed);
     const int height = progress.height.load(std::memory_order_relaxed);
     const double elapsed_ms = progress.elapsed_ms.load(std::memory_order_relaxed);
+    const bool gpu_bake_in_progress =
+        phase == lt::LightmapBakePhase::Baking &&
+        g_editor.settings.lightmap_bake_backend == lt::LightmapBakeBackend::Gpu;
 
     const auto now = std::chrono::steady_clock::now();
     const double animated = std::fmod(std::chrono::duration<double>(now.time_since_epoch()).count() * 0.45, 1.0);
     float fraction = static_cast<float>(animated);
-    if (phase == lt::LightmapBakePhase::Baking && total_texels > 0) {
+    if (!gpu_bake_in_progress && phase == lt::LightmapBakePhase::Baking && total_texels > 0) {
         fraction = std::clamp(static_cast<float>(completed_texels) / static_cast<float>(total_texels), 0.0f, 1.0f);
     }
 
@@ -3310,13 +3320,25 @@ void draw_lightmap_bake_overlay() {
     if (ImGui::Begin("LightmapBakeOverlay", nullptr, flags)) {
         ImGui::TextUnformatted(title);
         ImGui::ProgressBar(fraction, {-1.0f, 8.0f}, "");
-        ImGui::TextDisabled(
-            "Texels %llu / %llu  %dx%d",
-            static_cast<unsigned long long>(completed_texels),
-            static_cast<unsigned long long>(total_texels),
-            width,
-            height);
-        if (total_rays > 0) {
+        if (gpu_bake_in_progress) {
+            ImGui::TextDisabled(
+                "GPU texels queued %llu  %dx%d",
+                static_cast<unsigned long long>(total_texels),
+                width,
+                height);
+        } else {
+            ImGui::TextDisabled(
+                "Texels %llu / %llu  %dx%d",
+                static_cast<unsigned long long>(completed_texels),
+                static_cast<unsigned long long>(total_texels),
+                width,
+                height);
+        }
+        if (gpu_bake_in_progress && total_rays > 0) {
+            ImGui::TextDisabled(
+                "Estimated rays %llu",
+                static_cast<unsigned long long>(total_rays));
+        } else if (total_rays > 0) {
             ImGui::TextDisabled(
                 "Rays %llu / %llu",
                 static_cast<unsigned long long>(traced_rays),

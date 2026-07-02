@@ -677,11 +677,17 @@ SceneLoadResult load_scene(const std::string& path) {
             scene.render_settings.lightmap_resolution = std::clamp(scene.render_settings.lightmap_resolution, 16, 16384);
             scene.render_settings.lightmap_padding = std::clamp(scene.render_settings.lightmap_padding, 0, 64);
             scene.render_settings.lightmap_dilation = std::clamp(scene.render_settings.lightmap_dilation, 0, 64);
-            scene.render_settings.lightmap_bake_samples = std::clamp(scene.render_settings.lightmap_bake_samples, 1, 256);
+            scene.render_settings.lightmap_bake_samples = std::clamp(scene.render_settings.lightmap_bake_samples, 1, 1024);
             scene.render_settings.lightmap_bake_bounces = std::clamp(scene.render_settings.lightmap_bake_bounces, 1, 32);
             scene.render_settings.lightmap_principled_gi = principled_gi != 0;
             scene.render_settings.lightmap_cache_enabled = cache_enabled != 0;
             scene.render_settings.lightmap_auto_update = auto_update != 0;
+            int lm_bake_backend = 0;
+            if (!(input >> lm_bake_backend)) {
+                input.clear();  // old file format; default to GPU
+                lm_bake_backend = 0;
+            }
+            scene.render_settings.lightmap_bake_backend = std::clamp(lm_bake_backend, 0, 1);
             scene.has_render_settings = true;
         } else if (tag == "material") {
             std::string material_name;
@@ -1181,7 +1187,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             << settings.lightmap_bake_bounces << ' '
             << (settings.lightmap_principled_gi ? 1 : 0) << ' '
             << (settings.lightmap_cache_enabled ? 1 : 0) << ' '
-            << (settings.lightmap_auto_update ? 1 : 0) << '\n';
+            << (settings.lightmap_auto_update ? 1 : 0) << ' '
+            << settings.lightmap_bake_backend << '\n';
         output << '\n';
     }
 

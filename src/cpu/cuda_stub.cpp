@@ -39,6 +39,13 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
     return nullptr;
 }
 
+std::shared_ptr<void> build_lightmap_gpu(
+    const RenderScene&, const Scene&, const RenderSettings&) {
+    LT_LOG_WARN("GPU lightmap bake requested but CUDA is not available. "
+                "Rebuild with CUDA support or switch to CPU bake backend.");
+    return nullptr;
+}
+
 } // namespace lt
 
 #endif
