@@ -184,6 +184,69 @@ std::string lower(std::string value) {
     return value;
 }
 
+bool pbrt_named_spectrum_rgb(const std::string& name, Vec3& value) {
+    // PBRT stores these as spectral curves. LightTransport is RGB, so use a
+    // 650/550/450 nm channel approximation sampled from PBRT v4's named spectra.
+    const std::string key = lower(name);
+    if (key == "metal-ag-eta") {
+        value = {0.139410f, 0.124777f, 0.151691f};
+        return true;
+    }
+    if (key == "metal-ag-k") {
+        value = {4.128773f, 3.339600f, 2.470420f};
+        return true;
+    }
+    if (key == "metal-al-eta") {
+        value = {1.474770f, 0.958569f, 0.617953f};
+        return true;
+    }
+    if (key == "metal-al-k") {
+        value = {7.794109f, 6.686968f, 5.469423f};
+        return true;
+    }
+    if (key == "metal-au-eta") {
+        value = {0.167790f, 0.350409f, 1.508458f};
+        return true;
+    }
+    if (key == "metal-au-k") {
+        value = {3.137816f, 2.714063f, 1.878850f};
+        return true;
+    }
+    if (key == "metal-cu-eta") {
+        value = {0.216561f, 0.958162f, 1.165808f};
+        return true;
+    }
+    if (key == "metal-cu-k") {
+        value = {3.637741f, 2.577065f, 2.393857f};
+        return true;
+    }
+    if (key == "metal-cuzn-eta") {
+        value = {0.444000f, 0.527000f, 1.094000f};
+        return true;
+    }
+    if (key == "metal-cuzn-k") {
+        value = {3.695000f, 2.765000f, 1.829000f};
+        return true;
+    }
+    if (key == "metal-mgo-eta") {
+        value = {1.733676f, 1.740468f, 1.752446f};
+        return true;
+    }
+    if (key == "metal-mgo-k") {
+        value = {0.0f, 0.0f, 0.0f};
+        return true;
+    }
+    if (key == "metal-tio2-eta") {
+        value = {2.859940f, 2.954974f, 3.164990f};
+        return true;
+    }
+    if (key == "metal-tio2-k") {
+        value = {0.0f, 0.0f, 0.0f};
+        return true;
+    }
+    return false;
+}
+
 std::filesystem::path resolve_path(const std::filesystem::path& base, const std::string& path) {
     std::filesystem::path p(path);
     return p.is_absolute() ? p : base / p;
@@ -284,7 +347,9 @@ Vec3 vec3_param(const std::vector<Param>& params, const std::string& name, Vec3 
     if (!param || param->values.empty()) return fallback;
     if (param->values.size() == 1) {
         float value = 0.0f;
-        return parse_float(param->values[0], value) ? Vec3{value} : fallback;
+        if (parse_float(param->values[0], value)) return Vec3{value};
+        Vec3 spectrum = fallback;
+        return pbrt_named_spectrum_rgb(param->values[0], spectrum) ? spectrum : fallback;
     }
     Vec3 value = fallback;
     parse_float(param->values[0], value.x);
@@ -318,13 +383,21 @@ float roughness_param(const std::vector<Param>& params, float fallback = 0.5f, f
     return std::clamp(float_param(params, "roughness", float_param(params, "uroughness", float_param(params, "vroughness", fallback))), min_value, 1.0f);
 }
 
+float prefixed_roughness_param(const std::vector<Param>& params, const std::string& prefix, float fallback = 0.5f, float min_value = 0.02f) {
+    const std::string roughness_name = prefix + "roughness";
+    const std::string u_name = prefix + "uroughness";
+    const std::string v_name = prefix + "vroughness";
+    const bool has_u = has_param(params, u_name);
+    const bool has_v = has_param(params, v_name);
+    if (has_u && has_v) {
+        return std::clamp(0.5f * (float_param(params, u_name, fallback) + float_param(params, v_name, fallback)), min_value, 1.0f);
+    }
+    return std::clamp(float_param(params, roughness_name, float_param(params, u_name, float_param(params, v_name, fallback))), min_value, 1.0f);
+}
+
 float pbrt_roughness_to_alpha(float roughness) {
-    const float r = std::max(roughness, 1.0e-3f);
-    const float x = std::log(r);
-    return std::clamp(
-        1.62142f + 0.819955f * x + 0.1734f * x * x + 0.0171201f * x * x * x + 0.000640711f * x * x * x * x,
-        0.001f,
-        1.0f);
+    // PBRT v4 maps material roughness to Trowbridge-Reitz alpha with sqrt().
+    return std::sqrt(std::clamp(roughness, 0.0f, 1.0f));
 }
 
 Vec3 conductor_k_from_reflectance(Vec3 reflectance) {
@@ -813,7 +886,7 @@ private:
             principled->clearcoat_roughness = std::clamp(float_param(params, "interface.roughness", roughness), 0.02f, 1.0f);
             material = principled;
         } else if (type == "conductor") {
-            float conductor_alpha = roughness_param(params, 0.5f, 0.0f);
+            float conductor_alpha = roughness_param(params, 0.0f, 0.0f);
             if (bool_param(params, "remaproughness", true)) {
                 conductor_alpha = pbrt_roughness_to_alpha(conductor_alpha);
             }
@@ -828,10 +901,20 @@ private:
             }
             material = std::make_shared<ConductorMaterial>(name, Vec3{1.0f, 1.0f, 1.0f}, conductor_alpha, eta, k);
         } else if (type == "coatedconductor") {
-            auto principled = std::make_shared<PrincipledMaterial>(name, color, std::clamp(float_param(params, "conductor.roughness", roughness), 0.02f, 1.0f), 1.0f);
-            principled->clearcoat = 1.0f;
-            principled->clearcoat_roughness = std::clamp(float_param(params, "interface.roughness", 0.02f), 0.02f, 1.0f);
-            material = principled;
+            float conductor_alpha = prefixed_roughness_param(params, "conductor.", 0.0f, 0.0f);
+            if (bool_param(params, "conductor.remaproughness", bool_param(params, "remaproughness", true))) {
+                conductor_alpha = pbrt_roughness_to_alpha(conductor_alpha);
+            }
+            const bool has_eta = has_param(params, "conductor.eta") || has_param(params, "eta");
+            const bool has_k = has_param(params, "conductor.k") || has_param(params, "k");
+            Vec3 eta = vec3_param(params, "conductor.eta", vec3_param(params, "eta", {0.200438f, 0.924033f, 1.102212f}));
+            Vec3 k = vec3_param(params, "conductor.k", vec3_param(params, "k", {3.912949f, 2.452848f, 2.142188f}));
+            if (!has_eta && !has_k) {
+                const Vec3 reflectance = vec3_param(params, "conductor.reflectance", vec3_param(params, "reflectance", vec3_param(params, "color", {0.5f, 0.5f, 0.5f})));
+                eta = {1.0f, 1.0f, 1.0f};
+                k = conductor_k_from_reflectance(reflectance);
+            }
+            material = std::make_shared<ConductorMaterial>(name, Vec3{1.0f, 1.0f, 1.0f}, conductor_alpha, eta, k);
         } else if (type == "diffuse" || type == "matte") {
             material = make_material(name, color, BrdfModel::Lambertian, roughness, 0.0f);
         } else {
