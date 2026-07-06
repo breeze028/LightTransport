@@ -43,6 +43,7 @@ struct EditorState {
     uint32_t frame_index = 0;
     uint64_t render_generation = 1;
     uint64_t content_generation = 1;
+    uint64_t geometry_generation = 1;
     SelectionKind selection_kind = SelectionKind::Mesh;
     int selected_mesh = 0;
     int selected_sphere = -1;

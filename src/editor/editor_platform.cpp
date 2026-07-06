@@ -126,14 +126,17 @@ void release_editor_memory() {
     g_pick_cache = {};
     g_load_task = {};
     g_solid_preview.scene_generation = 0;
-    g_solid_preview.content_generation = 0;
+    g_solid_preview.geometry_generation = 0;
 }
 
 void reset_accumulation(lt::RenderDirty dirty) {
     g_editor.dirty = g_editor.dirty | dirty | lt::RenderDirty::Render;
     ++g_editor.render_generation;
     if (lt::has_dirty(dirty, lt::RenderDirty::Transform) ||
-        lt::has_dirty(dirty, lt::RenderDirty::Material) ||
+        lt::has_dirty(dirty, lt::RenderDirty::Geometry)) {
+        ++g_editor.geometry_generation;
+    }
+    if (lt::has_dirty(dirty, lt::RenderDirty::Material) ||
         lt::has_dirty(dirty, lt::RenderDirty::Texture) ||
         lt::has_dirty(dirty, lt::RenderDirty::Geometry) ||
         lt::has_dirty(dirty, lt::RenderDirty::Environment) ||

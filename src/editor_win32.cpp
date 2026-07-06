@@ -72,6 +72,92 @@ const char* tool_mode_icon(ToolMode mode) {
     }
 }
 
+enum class EditorIcon {
+    Select,
+    Move,
+    Rotate,
+    Scale,
+    LocalSpace,
+    WorldSpace,
+    Mesh,
+    Sphere,
+    Cube,
+    Plane,
+    Light,
+    Material,
+    Texture,
+    Bake,
+    Volume,
+    Lightmap,
+    Environment,
+    Camera,
+    Render,
+    Object,
+    Add,
+    Clear,
+    Duplicate,
+    Delete,
+    Cpu,
+    Gpu,
+    RenderedPreview,
+    SolidPreview,
+    WireframePreview,
+    Fullscreen,
+    ExitFullscreen,
+};
+
+struct EditorIconInfo {
+    const char* fallback;
+    const char* blender_source;
+};
+
+const EditorIconInfo& editor_icon_info(EditorIcon icon) {
+    static const EditorIconInfo infos[] = {
+        {"S", "ops.generic.select.dat"},
+        {"M", "ops.transform.translate.dat"},
+        {"R", "ops.transform.rotate.dat"},
+        {"K", "ops.transform.resize.dat"},
+        {"L", nullptr},
+        {"W", nullptr},
+        {"M", "ops.mesh.primitive_cube_add_gizmo.dat"},
+        {"O", "ops.mesh.primitive_sphere_add_gizmo.dat"},
+        {"C", "ops.mesh.primitive_cube_add_gizmo.dat"},
+        {"P", "ops.mesh.primitive_grid_add_gizmo.dat"},
+        {"L", nullptr},
+        {"M", nullptr},
+        {"T", "brush.paint_texture.fill.dat"},
+        {"B", nullptr},
+        {"V", nullptr},
+        {"U", nullptr},
+        {"E", nullptr},
+        {"C", nullptr},
+        {"R", nullptr},
+        {"O", nullptr},
+        {"+", nullptr},
+        {"X", nullptr},
+        {"D", nullptr},
+        {"Del", nullptr},
+        {"C", nullptr},
+        {"G", nullptr},
+        {"R", nullptr},
+        {"S", nullptr},
+        {"W", nullptr},
+        {"F", nullptr},
+        {"X", nullptr},
+    };
+    return infos[static_cast<int>(icon)];
+}
+
+EditorIcon tool_mode_editor_icon(ToolMode mode) {
+    switch (mode) {
+    case ToolMode::Select: return EditorIcon::Select;
+    case ToolMode::Move: return EditorIcon::Move;
+    case ToolMode::Rotate: return EditorIcon::Rotate;
+    case ToolMode::Scale: return EditorIcon::Scale;
+    default: return EditorIcon::Select;
+    }
+}
+
 void format_bytes(size_t bytes, char* buf, size_t buf_size) {
     if (bytes >= 1024ull * 1024ull * 1024ull)
         std::snprintf(buf, buf_size, "%.2f GiB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
@@ -1212,7 +1298,7 @@ bool intersect_sphere_pick(const lt::RenderSphere& sphere, const lt::Ray& ray, f
     return t > 0.001f;
 }
 
-bool pick_object(ImVec2 mouse, SelectionKind& kind, int& object_index) {
+bool pick_object_cpu(ImVec2 mouse, SelectionKind& kind, int& object_index) {
     const lt::Ray ray = make_view_ray_from_screen(mouse);
     if (g_pick_cache.scene_generation != g_editor.render_generation) {
         g_pick_cache.render_scene = lt::build_render_scene(g_editor.scene);
@@ -1238,6 +1324,25 @@ bool pick_object(ImVec2 mouse, SelectionKind& kind, int& object_index) {
         }
     }
     return kind != SelectionKind::None && object_index >= 0;
+}
+
+bool pick_object(ImVec2 mouse, SelectionKind& kind, int& object_index) {
+    const GpuPickResult gpu_pick = pick_solid_preview_object(
+        g_solid_preview,
+        g_editor.scene,
+        g_editor.viewport_size,
+        g_editor.viewport_image_min,
+        g_editor.viewport_image_max,
+        mouse,
+        kind,
+        object_index);
+    if (gpu_pick == GpuPickResult::Hit) {
+        return true;
+    }
+    if (gpu_pick == GpuPickResult::Miss) {
+        return false;
+    }
+    return pick_object_cpu(mouse, kind, object_index);
 }
 
 void mesh_center_radius(const lt::Mesh& mesh, lt::Vec3& center, float& radius) {
@@ -1984,21 +2089,24 @@ void draw_move_gizmo_handles(ImDrawList* draw_list, lt::Vec3 center3, lt::Vec3 a
 
 void draw_scene_reference_outlines(ImDrawList* draw_list) {
     const ImU32 mesh_color = IM_COL32(150, 170, 190, 130);
-    const ImU32 selected_color = IM_COL32(255, 150, 35, 230);
     for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
         const bool selected = g_editor.selection_kind == SelectionKind::Mesh && i == g_editor.selected_mesh;
-        draw_mesh_bounds_outline(draw_list, i, selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
+        if (!selected) {
+            draw_mesh_bounds_outline(draw_list, i, mesh_color, 1.0f);
+        }
     }
     for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
         const bool selected = g_editor.selection_kind == SelectionKind::Sphere && i == g_editor.selected_sphere;
-        draw_sphere_outline(draw_list, i, selected ? selected_color : mesh_color, selected ? 2.0f : 1.0f);
+        if (!selected) {
+            draw_sphere_outline(draw_list, i, mesh_color, 1.0f);
+        }
     }
 }
 
 void draw_gizmo_overlay() {
     if (!has_selection()) return;
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const bool draw_selection_reference = g_editor.viewport_preview_mode == ViewportPreviewMode::Rendered;
+    const bool draw_selection_reference = false;
     if (has_sphere_selection()) {
         const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(g_editor.selected_sphere)];
         if (draw_selection_reference && !g_editor.hide_dirty_wireframes)
@@ -2254,19 +2362,343 @@ void apply_blender_style() {
     c[ImGuiCol_SliderGrabActive] = ImVec4(1.0f, 0.62f, 0.25f, 1.0f);
 }
 
+void draw_editor_icon(ImDrawList* draw_list, EditorIcon icon, ImVec2 min, ImVec2 max, ImU32 color, ImU32 accent = 0) {
+    if (!draw_list) return;
+    const float w = max.x - min.x;
+    const float h = max.y - min.y;
+    const float s = std::min(w, h);
+    const ImVec2 c{(min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f};
+    const float lw = std::max(1.3f, s * 0.09f);
+    if (accent == 0) accent = ImGui::GetColorU32(ImGuiCol_CheckMark);
+
+    auto p = [&](float x, float y) { return ImVec2{min.x + x * w, min.y + y * h}; };
+    auto line = [&](float ax, float ay, float bx, float by, ImU32 col = 0, float thick = 0.0f) {
+        draw_list->AddLine(p(ax, ay), p(bx, by), col ? col : color, thick > 0.0f ? thick : lw);
+    };
+    auto rect = [&](float ax, float ay, float bx, float by, ImU32 col = 0) {
+        draw_list->AddRect(p(ax, ay), p(bx, by), col ? col : color, 1.5f, 0, lw);
+    };
+    auto circle = [&](float x, float y, float r, ImU32 col = 0, int segments = 24) {
+        draw_list->AddCircle(p(x, y), r * s, col ? col : color, segments, lw);
+    };
+    auto filled_circle = [&](float x, float y, float r, ImU32 col) {
+        draw_list->AddCircleFilled(p(x, y), r * s, col, 24);
+    };
+
+    switch (icon) {
+    case EditorIcon::Select:
+        draw_list->AddTriangleFilled(p(0.24f, 0.14f), p(0.76f, 0.48f), p(0.45f, 0.56f), color);
+        line(0.46f, 0.55f, 0.64f, 0.84f, color);
+        line(0.55f, 0.68f, 0.72f, 0.61f, color);
+        break;
+    case EditorIcon::Move:
+        line(0.18f, 0.50f, 0.82f, 0.50f);
+        line(0.50f, 0.18f, 0.50f, 0.82f);
+        draw_list->AddTriangleFilled(p(0.82f, 0.50f), p(0.66f, 0.40f), p(0.66f, 0.60f), accent);
+        draw_list->AddTriangleFilled(p(0.18f, 0.50f), p(0.34f, 0.40f), p(0.34f, 0.60f), color);
+        draw_list->AddTriangleFilled(p(0.50f, 0.18f), p(0.40f, 0.34f), p(0.60f, 0.34f), color);
+        draw_list->AddTriangleFilled(p(0.50f, 0.82f), p(0.40f, 0.66f), p(0.60f, 0.66f), color);
+        break;
+    case EditorIcon::Rotate:
+        draw_list->PathArcTo(c, s * 0.34f, -2.30f, 0.70f, 28);
+        draw_list->PathStroke(color, 0, lw);
+        draw_list->AddTriangleFilled(p(0.75f, 0.36f), p(0.88f, 0.55f), p(0.66f, 0.56f), accent);
+        draw_list->PathArcTo(c, s * 0.24f, 0.95f, 3.40f, 22);
+        draw_list->PathStroke(color, 0, lw);
+        break;
+    case EditorIcon::Scale:
+        rect(0.24f, 0.24f, 0.76f, 0.76f);
+        line(0.24f, 0.76f, 0.08f, 0.92f, accent);
+        line(0.76f, 0.24f, 0.92f, 0.08f, accent);
+        draw_list->AddRectFilled(p(0.05f, 0.85f), p(0.18f, 0.98f), accent, 1.5f);
+        draw_list->AddRectFilled(p(0.82f, 0.02f), p(0.95f, 0.15f), accent, 1.5f);
+        break;
+    case EditorIcon::LocalSpace:
+        line(0.24f, 0.76f, 0.76f, 0.24f, accent);
+        line(0.24f, 0.76f, 0.57f, 0.76f);
+        line(0.24f, 0.76f, 0.24f, 0.43f);
+        break;
+    case EditorIcon::WorldSpace:
+        circle(0.50f, 0.50f, 0.34f);
+        line(0.16f, 0.50f, 0.84f, 0.50f, accent);
+        line(0.50f, 0.16f, 0.50f, 0.84f);
+        break;
+    case EditorIcon::Mesh:
+    case EditorIcon::Cube:
+        line(0.26f, 0.34f, 0.52f, 0.20f);
+        line(0.52f, 0.20f, 0.76f, 0.35f);
+        line(0.76f, 0.35f, 0.51f, 0.50f);
+        line(0.51f, 0.50f, 0.26f, 0.34f);
+        line(0.26f, 0.34f, 0.26f, 0.64f);
+        line(0.51f, 0.50f, 0.51f, 0.80f, accent);
+        line(0.76f, 0.35f, 0.76f, 0.65f);
+        line(0.26f, 0.64f, 0.51f, 0.80f);
+        line(0.51f, 0.80f, 0.76f, 0.65f);
+        break;
+    case EditorIcon::Plane:
+        line(0.18f, 0.64f, 0.40f, 0.32f);
+        line(0.40f, 0.32f, 0.86f, 0.38f);
+        line(0.86f, 0.38f, 0.62f, 0.72f);
+        line(0.62f, 0.72f, 0.18f, 0.64f);
+        break;
+    case EditorIcon::Sphere:
+        circle(0.50f, 0.50f, 0.34f);
+        circle(0.50f, 0.50f, 0.20f, accent);
+        line(0.18f, 0.50f, 0.82f, 0.50f, accent, lw * 0.8f);
+        break;
+    case EditorIcon::Light:
+        filled_circle(0.50f, 0.40f, 0.15f, accent);
+        line(0.50f, 0.58f, 0.50f, 0.82f);
+        line(0.34f, 0.82f, 0.66f, 0.82f);
+        line(0.24f, 0.40f, 0.12f, 0.40f, accent, lw * 0.8f);
+        line(0.76f, 0.40f, 0.88f, 0.40f, accent, lw * 0.8f);
+        line(0.34f, 0.24f, 0.24f, 0.14f, accent, lw * 0.8f);
+        line(0.66f, 0.24f, 0.76f, 0.14f, accent, lw * 0.8f);
+        break;
+    case EditorIcon::Material:
+        filled_circle(0.40f, 0.42f, 0.17f, ImGui::GetColorU32(ImVec4(0.92f, 0.48f, 0.16f, 1.0f)));
+        filled_circle(0.60f, 0.42f, 0.17f, ImGui::GetColorU32(ImVec4(0.25f, 0.58f, 0.95f, 1.0f)));
+        filled_circle(0.50f, 0.61f, 0.17f, ImGui::GetColorU32(ImVec4(0.42f, 0.78f, 0.40f, 1.0f)));
+        circle(0.50f, 0.50f, 0.34f, color);
+        break;
+    case EditorIcon::Texture:
+        rect(0.22f, 0.24f, 0.78f, 0.76f);
+        line(0.22f, 0.38f, 0.78f, 0.38f, accent, lw * 0.75f);
+        line(0.38f, 0.24f, 0.38f, 0.76f, accent, lw * 0.75f);
+        line(0.58f, 0.24f, 0.58f, 0.76f, accent, lw * 0.75f);
+        break;
+    case EditorIcon::Bake:
+    case EditorIcon::Volume:
+        rect(0.22f, 0.28f, 0.78f, 0.78f);
+        line(0.30f, 0.28f, 0.42f, 0.13f, accent);
+        line(0.50f, 0.28f, 0.62f, 0.13f, accent);
+        line(0.70f, 0.28f, 0.82f, 0.13f, accent);
+        break;
+    case EditorIcon::Lightmap:
+        rect(0.18f, 0.20f, 0.82f, 0.80f);
+        line(0.18f, 0.50f, 0.82f, 0.50f, accent, lw * 0.8f);
+        line(0.50f, 0.20f, 0.50f, 0.80f, accent, lw * 0.8f);
+        filled_circle(0.34f, 0.36f, 0.07f, accent);
+        break;
+    case EditorIcon::Environment:
+        circle(0.50f, 0.50f, 0.34f);
+        line(0.18f, 0.55f, 0.36f, 0.40f, accent);
+        line(0.36f, 0.40f, 0.52f, 0.58f, accent);
+        line(0.52f, 0.58f, 0.78f, 0.34f, accent);
+        break;
+    case EditorIcon::Camera:
+        rect(0.18f, 0.34f, 0.62f, 0.68f);
+        draw_list->AddTriangle(p(0.62f, 0.42f), p(0.86f, 0.30f), p(0.86f, 0.76f), color, lw);
+        filled_circle(0.38f, 0.51f, 0.08f, accent);
+        break;
+    case EditorIcon::Render:
+        rect(0.18f, 0.24f, 0.82f, 0.76f);
+        draw_list->AddTriangleFilled(p(0.43f, 0.36f), p(0.43f, 0.64f), p(0.66f, 0.50f), accent);
+        break;
+    case EditorIcon::Object:
+        circle(0.50f, 0.50f, 0.34f);
+        line(0.30f, 0.30f, 0.70f, 0.70f, accent);
+        line(0.70f, 0.30f, 0.30f, 0.70f, accent);
+        break;
+    case EditorIcon::Add:
+        line(0.50f, 0.20f, 0.50f, 0.80f, accent, lw * 1.2f);
+        line(0.20f, 0.50f, 0.80f, 0.50f, accent, lw * 1.2f);
+        break;
+    case EditorIcon::Clear:
+    case EditorIcon::Delete:
+        line(0.26f, 0.26f, 0.74f, 0.74f, accent, lw * 1.1f);
+        line(0.74f, 0.26f, 0.26f, 0.74f, accent, lw * 1.1f);
+        break;
+    case EditorIcon::Duplicate:
+        rect(0.18f, 0.30f, 0.58f, 0.70f);
+        rect(0.38f, 0.18f, 0.78f, 0.58f, accent);
+        break;
+    case EditorIcon::Cpu:
+    case EditorIcon::Gpu:
+        rect(0.24f, 0.24f, 0.76f, 0.76f);
+        line(0.34f, 0.14f, 0.34f, 0.24f);
+        line(0.50f, 0.14f, 0.50f, 0.24f);
+        line(0.66f, 0.14f, 0.66f, 0.24f);
+        line(0.34f, 0.76f, 0.34f, 0.86f);
+        line(0.50f, 0.76f, 0.50f, 0.86f);
+        line(0.66f, 0.76f, 0.66f, 0.86f);
+        if (icon == EditorIcon::Gpu) line(0.34f, 0.50f, 0.66f, 0.50f, accent);
+        break;
+    case EditorIcon::RenderedPreview:
+        filled_circle(0.50f, 0.50f, 0.32f, ImGui::GetColorU32(ImVec4(0.36f, 0.58f, 0.92f, 1.0f)));
+        circle(0.50f, 0.50f, 0.32f, color);
+        filled_circle(0.39f, 0.37f, 0.08f, ImGui::GetColorU32(ImVec4(0.88f, 0.94f, 1.0f, 0.92f)));
+        break;
+    case EditorIcon::SolidPreview:
+        filled_circle(0.50f, 0.50f, 0.32f, ImGui::GetColorU32(ImVec4(0.58f, 0.60f, 0.64f, 1.0f)));
+        draw_list->PathArcTo(p(0.50f, 0.50f), s * 0.32f, -1.57f, 1.57f, 18);
+        draw_list->PathLineTo(p(0.50f, 0.82f));
+        draw_list->PathLineTo(p(0.50f, 0.18f));
+        draw_list->PathFillConvex(ImGui::GetColorU32(ImVec4(0.34f, 0.35f, 0.38f, 1.0f)));
+        circle(0.50f, 0.50f, 0.32f, color);
+        break;
+    case EditorIcon::WireframePreview:
+        circle(0.50f, 0.50f, 0.32f, color);
+        circle(0.50f, 0.50f, 0.18f, accent);
+        line(0.18f, 0.50f, 0.82f, 0.50f, accent, lw * 0.75f);
+        line(0.50f, 0.18f, 0.50f, 0.82f, accent, lw * 0.75f);
+        break;
+    case EditorIcon::Fullscreen:
+        line(0.22f, 0.40f, 0.22f, 0.22f);
+        line(0.22f, 0.22f, 0.40f, 0.22f);
+        line(0.60f, 0.22f, 0.78f, 0.22f);
+        line(0.78f, 0.22f, 0.78f, 0.40f);
+        line(0.78f, 0.60f, 0.78f, 0.78f);
+        line(0.78f, 0.78f, 0.60f, 0.78f);
+        line(0.40f, 0.78f, 0.22f, 0.78f);
+        line(0.22f, 0.78f, 0.22f, 0.60f);
+        break;
+    case EditorIcon::ExitFullscreen:
+        line(0.18f, 0.34f, 0.34f, 0.34f);
+        line(0.34f, 0.34f, 0.34f, 0.18f);
+        line(0.66f, 0.18f, 0.66f, 0.34f);
+        line(0.66f, 0.34f, 0.82f, 0.34f);
+        line(0.82f, 0.66f, 0.66f, 0.66f);
+        line(0.66f, 0.66f, 0.66f, 0.82f);
+        line(0.34f, 0.82f, 0.34f, 0.66f);
+        line(0.34f, 0.66f, 0.18f, 0.66f);
+        break;
+    }
+}
+
+void draw_editor_icon(EditorIcon icon, ImVec2 min, float size, ImU32 color, ImU32 accent = 0) {
+    draw_editor_icon(ImGui::GetWindowDrawList(), icon, min, {min.x + size, min.y + size}, color, accent);
+}
+
+bool icon_button(const char* id, EditorIcon icon, const char* tooltip, ImVec2 size, bool active = false) {
+    ImGui::PushID(id);
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##icon_button", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    const ImU32 bg = ImGui::GetColorU32(active || held ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
+    const ImU32 border = ImGui::GetColorU32(ImGuiCol_Border);
+    const ImU32 color = ImGui::GetColorU32(active ? ImVec4(1.0f, 0.93f, 0.82f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+    draw_list->AddRectFilled(pos, {pos.x + size.x, pos.y + size.y}, bg, 4.0f);
+    draw_list->AddRect(pos, {pos.x + size.x, pos.y + size.y}, border, 4.0f);
+    const float icon_size = std::min(size.x, size.y) - 12.0f;
+    const ImVec2 icon_min{pos.x + (size.x - icon_size) * 0.5f, pos.y + (size.y - icon_size) * 0.5f};
+    draw_editor_icon(draw_list, icon, icon_min, {icon_min.x + icon_size, icon_min.y + icon_size}, color);
+    if (hovered && tooltip && tooltip[0]) {
+        const EditorIconInfo& info = editor_icon_info(icon);
+        if (info.blender_source) {
+            ImGui::SetTooltip("%s\nBlender icon: %s", tooltip, info.blender_source);
+        } else {
+            ImGui::SetTooltip("%s", tooltip);
+        }
+    }
+    ImGui::PopID();
+    return clicked;
+}
+
+bool icon_text_button(const char* label, EditorIcon icon, ImVec2 size = {0.0f, 0.0f}) {
+    const std::string text = std::string("     ") + label;
+    const bool clicked = ImGui::Button(text.c_str(), size);
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_size = ImGui::GetItemRectSize();
+    const float icon_size = std::max(12.0f, ImGui::GetFrameHeight() - 8.0f);
+    draw_editor_icon(icon, {item_min.x + 7.0f, item_min.y + (item_size.y - icon_size) * 0.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_Text));
+    return clicked;
+}
+
+void draw_menu_icon(EditorIcon icon) {
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float icon_size = ImGui::GetFrameHeight() - 7.0f;
+    draw_editor_icon(icon, {pos.x + 2.0f, pos.y + 3.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_Text));
+    ImGui::Dummy({icon_size + 6.0f, ImGui::GetFrameHeight()});
+    ImGui::SameLine(0.0f, 0.0f);
+}
+
+bool icon_menu_item(EditorIcon icon, const char* label, const char* shortcut = nullptr, bool enabled = true) {
+    draw_menu_icon(icon);
+    return ImGui::MenuItem(label, shortcut, false, enabled);
+}
+
+bool begin_icon_tab_item(const char* label, EditorIcon icon) {
+    const std::string tab_label = std::string("      ") + label;
+    const bool open = ImGui::BeginTabItem(tab_label.c_str());
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_size = ImGui::GetItemRectSize();
+    const float icon_size = std::max(12.0f, ImGui::GetFrameHeight() - 8.0f);
+    draw_editor_icon(icon, {item_min.x + 7.0f, item_min.y + (item_size.y - icon_size) * 0.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_Text));
+    return open;
+}
+
+enum class PropertiesPanel { Object, Material, Camera, Render };
+
+const char* properties_panel_name(PropertiesPanel panel) {
+    switch (panel) {
+    case PropertiesPanel::Object: return "Object";
+    case PropertiesPanel::Material: return "Material";
+    case PropertiesPanel::Camera: return "Camera";
+    case PropertiesPanel::Render: return "Render";
+    default: return "Properties";
+    }
+}
+
+constexpr float kPropertiesIconBarWidth = 40.0f;
+constexpr float kPropertiesIconButtonSize = 28.0f;
+constexpr float kPropertiesIconBarPaddingX = (kPropertiesIconBarWidth - kPropertiesIconButtonSize) * 0.5f;
+
+EditorIcon properties_panel_icon(PropertiesPanel panel) {
+    switch (panel) {
+    case PropertiesPanel::Object: return EditorIcon::Object;
+    case PropertiesPanel::Material: return EditorIcon::Material;
+    case PropertiesPanel::Camera: return EditorIcon::Camera;
+    case PropertiesPanel::Render: return EditorIcon::Render;
+    default: return EditorIcon::Object;
+    }
+}
+
+void properties_panel_button(PropertiesPanel panel, PropertiesPanel& active_panel) {
+    const bool active = active_panel == panel;
+    if (icon_button(properties_panel_name(panel), properties_panel_icon(panel), properties_panel_name(panel), ImVec2(kPropertiesIconButtonSize, kPropertiesIconButtonSize), active)) {
+        active_panel = panel;
+    }
+}
+
+bool icon_tree_node(EditorIcon icon, const char* label, ImGuiTreeNodeFlags flags) {
+    const std::string tree_label = std::string("   ") + label;
+    const bool open = ImGui::TreeNodeEx(tree_label.c_str(), flags);
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_size = ImGui::GetItemRectSize();
+    const float icon_size = std::max(12.0f, ImGui::GetFrameHeight() - 8.0f);
+    draw_editor_icon(icon, {item_min.x + 20.0f, item_min.y + (item_size.y - icon_size) * 0.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_Text));
+    return open;
+}
+
+bool icon_selectable(EditorIcon icon, const char* label, bool selected, bool light_badge = false) {
+    const std::string item_label = std::string("     ") + label;
+    const bool clicked = ImGui::Selectable(item_label.c_str(), selected);
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_size = ImGui::GetItemRectSize();
+    const float icon_size = std::max(12.0f, ImGui::GetFrameHeight() - 8.0f);
+    draw_editor_icon(icon, {item_min.x + 5.0f, item_min.y + (item_size.y - icon_size) * 0.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_Text));
+    if (light_badge) {
+        draw_editor_icon(EditorIcon::Light, {item_min.x + item_size.x - icon_size - 6.0f, item_min.y + (item_size.y - icon_size) * 0.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    }
+    return clicked;
+}
+
+bool icon_collapsing_header(EditorIcon icon, const char* label, ImGuiTreeNodeFlags flags = 0) {
+    const std::string header_label = std::string("   ") + label;
+    const bool open = ImGui::CollapsingHeader(header_label.c_str(), flags);
+    const ImVec2 item_min = ImGui::GetItemRectMin();
+    const ImVec2 item_size = ImGui::GetItemRectSize();
+    const float icon_size = std::max(12.0f, ImGui::GetFrameHeight() - 8.0f);
+    draw_editor_icon(icon, {item_min.x + 21.0f, item_min.y + (item_size.y - icon_size) * 0.5f}, icon_size, ImGui::GetColorU32(ImGuiCol_Text));
+    return open;
+}
+
 bool toolbar_button(ToolMode mode) {
     const bool active = g_editor.tool_mode == mode;
-    if (active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.95f, 0.50f, 0.16f, 0.58f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.93f, 0.82f, 1.0f));
-    }
-    const bool clicked = ImGui::Button(tool_mode_icon(mode), ImVec2(36.0f, 34.0f));
-    if (active) {
-        ImGui::PopStyleColor(2);
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", tool_mode_name(mode));
-    }
+    const bool clicked = icon_button(tool_mode_name(mode), tool_mode_editor_icon(mode), tool_mode_name(mode), ImVec2(36.0f, 34.0f), active);
     if (clicked) {
         g_editor.tool_mode = mode;
     }
@@ -2277,7 +2709,7 @@ float draw_top_bar() {
     const float height = ImGui::GetFrameHeight();
     if (!ImGui::BeginMainMenuBar()) return height;
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open", "O")) open_scene_dialog();
+        if (ImGui::MenuItem("Open")) open_scene_dialog();
         if (ImGui::MenuItem("Save", "Ctrl+S")) save_scene();
         if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) save_scene_as_dialog();
         if (ImGui::MenuItem("Exit", "Esc")) PostQuitMessage(0);
@@ -2285,16 +2717,16 @@ float draw_top_bar() {
     }
     if (ImGui::BeginMenu("Object")) {
         if (ImGui::BeginMenu("Add Mesh")) {
-            if (ImGui::MenuItem("Cube")) add_cube_mesh();
-            if (ImGui::MenuItem("Plane")) add_plane_mesh();
-            if (ImGui::MenuItem("UV Sphere")) add_uv_sphere_mesh();
-            if (ImGui::MenuItem("Analytic Sphere")) add_analytic_sphere();
+            if (icon_menu_item(EditorIcon::Cube, "Cube")) add_cube_mesh();
+            if (icon_menu_item(EditorIcon::Plane, "Plane")) add_plane_mesh();
+            if (icon_menu_item(EditorIcon::Sphere, "UV Sphere")) add_uv_sphere_mesh();
+            if (icon_menu_item(EditorIcon::Sphere, "Analytic Sphere")) add_analytic_sphere();
             ImGui::Separator();
-            if (ImGui::MenuItem("Area Light")) add_area_light_mesh();
+            if (icon_menu_item(EditorIcon::Light, "Area Light")) add_area_light_mesh();
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Duplicate", nullptr, false, has_selection())) duplicate_selected();
-        if (ImGui::MenuItem("Delete", "Del", false, has_selection())) delete_selected();
+        if (icon_menu_item(EditorIcon::Duplicate, "Duplicate", nullptr, has_selection())) duplicate_selected();
+        if (icon_menu_item(EditorIcon::Delete, "Delete", "Del", has_selection())) delete_selected();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Render")) {
@@ -2329,33 +2761,30 @@ void draw_toolbar() {
     ImGui::PopStyleVar();
     ImGui::Separator();
     const bool world = g_editor.move_space == TransformSpace::World;
-    if (ImGui::Button(world ? "World" : "Local", ImVec2(56.0f, 28.0f))) {
+    if (icon_button("TransformSpace", world ? EditorIcon::WorldSpace : EditorIcon::LocalSpace, world ? "World move gizmo space" : "Local move gizmo space", ImVec2(36.0f, 30.0f), world)) {
         g_editor.move_space = world ? TransformSpace::Local : TransformSpace::World;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Move gizmo space");
     }
     ImGui::End();
 }
 
 void draw_outliner() {
     ImGui::Begin("Scene Collection", nullptr, ImGuiWindowFlags_NoCollapse);
-    if (ImGui::TreeNodeEx("Meshes", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (icon_tree_node(EditorIcon::Mesh, "Meshes", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (int i = 0; i < static_cast<int>(g_editor.scene.meshes.size()); ++i) {
             const bool selected = g_editor.selection_kind == SelectionKind::Mesh && g_editor.selected_mesh == i;
             const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(i)];
             ImGui::PushID(i);
-            if (ImGui::Selectable(mesh.name.c_str(), selected)) select_mesh(i);
+            if (icon_selectable(mesh.light.enabled ? EditorIcon::Light : EditorIcon::Mesh, mesh.name.c_str(), selected, mesh.light.enabled)) select_mesh(i);
             ImGui::PopID();
         }
         ImGui::TreePop();
     }
-    if (ImGui::TreeNodeEx("Spheres", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (icon_tree_node(EditorIcon::Sphere, "Spheres", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (int i = 0; i < static_cast<int>(g_editor.scene.spheres.size()); ++i) {
             const bool selected = g_editor.selection_kind == SelectionKind::Sphere && g_editor.selected_sphere == i;
             const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(i)];
             ImGui::PushID(i);
-            if (ImGui::Selectable(sphere.name.c_str(), selected)) select_sphere(i);
+            if (icon_selectable(EditorIcon::Sphere, sphere.name.c_str(), selected)) select_sphere(i);
             ImGui::PopID();
         }
         ImGui::TreePop();
@@ -2365,8 +2794,21 @@ void draw_outliner() {
 
 void draw_properties() {
     ImGui::Begin("Properties", nullptr, ImGuiWindowFlags_NoCollapse);
-    if (ImGui::BeginTabBar("PropertiesTabs")) {
-        if (ImGui::BeginTabItem("Object")) {
+    static PropertiesPanel active_panel = PropertiesPanel::Object;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(kPropertiesIconBarPaddingX, 6.0f));
+    ImGui::BeginChild("PropertiesPanelTabs", ImVec2(kPropertiesIconBarWidth, 0.0f), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 5.0f));
+    properties_panel_button(PropertiesPanel::Object, active_panel);
+    properties_panel_button(PropertiesPanel::Material, active_panel);
+    properties_panel_button(PropertiesPanel::Camera, active_panel);
+    properties_panel_button(PropertiesPanel::Render, active_panel);
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::SameLine(0.0f, 8.0f);
+    ImGui::BeginChild("PropertiesPanelContent", ImVec2(0.0f, 0.0f), false);
+    ImGui::SeparatorText(properties_panel_name(active_panel));
+    if (active_panel == PropertiesPanel::Object) {
             if (has_mesh_selection()) {
                 lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
                 char name[128] = {};
@@ -2468,10 +2910,9 @@ void draw_properties() {
             } else {
                 ImGui::TextDisabled("No object selected");
             }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Material")) {
-            if (ImGui::Button("Add Material")) {
+    }
+    if (active_panel == PropertiesPanel::Material) {
+            if (icon_text_button("Add Material", EditorIcon::Add)) {
                 add_material();
             }
             ImGui::Separator();
@@ -2514,7 +2955,7 @@ void draw_properties() {
                         }
                         reset_accumulation(lt::RenderDirty::Material);
                     }
-                    if (ImGui::Button("Load Texture")) {
+                    if (icon_text_button("Load Texture", EditorIcon::Texture)) {
                         load_texture_dialog(*material);
                     }
                     if (ImGui::Checkbox("Double-sided Material", &material->double_sided)) {
@@ -2754,29 +3195,27 @@ void draw_properties() {
                 }
                 ImGui::PopID();
             }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Camera")) {
+    }
+    if (active_panel == PropertiesPanel::Camera) {
             edit_vec3("Position", g_editor.scene.camera.position, 0.02f, lt::RenderDirty::Camera);
             edit_vec3("Target", g_editor.scene.camera.target, 0.02f, lt::RenderDirty::Camera);
             if (ImGui::DragFloat("FOV", &g_editor.scene.camera.fov_degrees, 0.2f, 10.0f, 120.0f, "%.1f")) {
                 g_editor.scene.camera.fov_degrees = std::clamp(g_editor.scene.camera.fov_degrees, 10.0f, 120.0f);
                 reset_accumulation(lt::RenderDirty::Camera);
             }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Render")) {
+    }
+    if (active_panel == PropertiesPanel::Render) {
             const bool using_cuda = g_editor.renderer == &g_editor.cuda;
             const char* renderer_name = using_cuda ? "CUDA Path Tracer" : "CPU Path Tracer";
             if (ImGui::BeginCombo("Renderer", renderer_name)) {
-                if (ImGui::Selectable("CPU Path Tracer", !using_cuda)) {
+                if (icon_selectable(EditorIcon::Cpu, "CPU Path Tracer", !using_cuda)) {
                     set_renderer(false);
                 }
                 const bool cuda_available = g_editor.cuda.available();
                 const bool cuda_disabled = !cuda_available ||
                     lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
                 ImGui::BeginDisabled(cuda_disabled);
-                if (ImGui::Selectable("CUDA Path Tracer", using_cuda)) {
+                if (icon_selectable(EditorIcon::Gpu, "CUDA Path Tracer", using_cuda)) {
                     set_renderer(true);
                 }
                 ImGui::EndDisabled();
@@ -2811,7 +3250,7 @@ void draw_properties() {
                 g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
                 reset_accumulation(lt::RenderDirty::Geometry);
             }
-            if (ImGui::CollapsingHeader("Irradiance Volume")) {
+            if (icon_collapsing_header(EditorIcon::Volume, "Irradiance Volume")) {
                 if (ImGui::Checkbox("Enable Irradiance Volume", &g_editor.settings.use_irradiance_volume)) {
                     reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
@@ -2822,7 +3261,7 @@ void draw_properties() {
                 if (ImGui::Checkbox("Auto Update", &g_editor.settings.irradiance_volume_auto_update)) {
                     reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
-                if (ImGui::Button("Update Volume")) {
+                if (icon_text_button("Update Volume", EditorIcon::Bake)) {
                     g_editor.settings.irradiance_volume_force_rebake = true;
                     reset_accumulation(lt::RenderDirty::IrradianceVolume);
                 }
@@ -2896,7 +3335,7 @@ void draw_properties() {
                 ImGui::EndDisabled();
                 ImGui::EndDisabled();
             }
-            if (ImGui::CollapsingHeader("Lightmap")) {
+            if (icon_collapsing_header(EditorIcon::Lightmap, "Lightmap")) {
                 if (ImGui::Checkbox("Enable Lightmap", &g_editor.settings.use_lightmap)) {
                     reset_accumulation(lt::RenderDirty::Lightmap);
                 }
@@ -2907,7 +3346,7 @@ void draw_properties() {
                 if (ImGui::Checkbox("Lightmap Auto Update", &g_editor.settings.lightmap_auto_update)) {
                     reset_accumulation(lt::RenderDirty::Lightmap);
                 }
-                if (ImGui::Button("Update Lightmap")) {
+                if (icon_text_button("Update Lightmap", EditorIcon::Bake)) {
                     g_editor.settings.lightmap_force_rebake = true;
                     reset_accumulation(lt::RenderDirty::Lightmap);
                 }
@@ -2943,7 +3382,7 @@ void draw_properties() {
                 }
                 ImGui::EndDisabled();
             }
-            if (ImGui::CollapsingHeader("NPR Sampling")) {
+            if (icon_collapsing_header(EditorIcon::Render, "NPR Sampling")) {
                 if (ImGui::DragInt("Style Samples", &g_editor.settings.stylized_samples, 1.0f, 1, 128)) {
                     g_editor.settings.stylized_samples = std::clamp(g_editor.settings.stylized_samples, 1, 128);
                     if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
@@ -2959,7 +3398,7 @@ void draw_properties() {
                     reset_accumulation();
                 }
             }
-            if (ImGui::CollapsingHeader("Environment")) {
+            if (icon_collapsing_header(EditorIcon::Environment, "Environment")) {
                 color_edit("Environment Color", g_editor.scene.environment.color, lt::RenderDirty::Environment);
                 if (ImGui::DragFloat("Strength", &g_editor.scene.environment.strength, 0.05f, 0.0f, 100.0f, "%.2f")) {
                     g_editor.scene.environment.strength = std::max(0.0f, g_editor.scene.environment.strength);
@@ -2974,21 +3413,19 @@ void draw_properties() {
                     reset_accumulation(lt::RenderDirty::Environment);
                 }
                 ImGui::Text("HDRI: %s", g_editor.scene.environment.texture ? g_editor.scene.environment.texture->name.c_str() : "None");
-                if (ImGui::Button("Load HDRI")) {
+                if (icon_text_button("Load HDRI", EditorIcon::Environment)) {
                     load_environment_texture_dialog();
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Clear HDRI")) {
+                if (icon_text_button("Clear HDRI", EditorIcon::Clear)) {
                     g_editor.scene.environment.texture = nullptr;
                     g_editor.scene.environment.constant = false;
                     reset_accumulation(lt::RenderDirty::Environment);
                 }
             }
             ImGui::Checkbox("Pause", &g_editor.paused);
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
     }
+    ImGui::EndChild();
     ImGui::End();
 }
 
@@ -3139,7 +3576,7 @@ void draw_viewport() {
         handled_input_early = true;
 
         // D3D11 real-time preview. Camera-only motion updates constants, while
-        // geometry buffers rebuild only when content_generation changes.
+        // geometry buffers rebuild only when geometry_generation changes.
         const int w = std::max(64, static_cast<int>(available.x));
         const int h = std::max(64, static_cast<int>(available.y));
         init_solid_preview(g_solid_preview);
@@ -3180,6 +3617,26 @@ void draw_viewport() {
         }
     }
 
+    bool selection_outline_drawn = false;
+    if (has_selection() && !g_editor.hide_dirty_wireframes) {
+        ID3D11ShaderResourceView* outline_srv = render_selection_outline(
+            g_solid_preview,
+            g_editor.scene,
+            available,
+            g_editor.selection_kind,
+            g_editor.selection_kind == SelectionKind::Sphere ? g_editor.selected_sphere : g_editor.selected_mesh);
+        if (outline_srv) {
+            draw_list->AddImage(
+                reinterpret_cast<ImTextureID>(outline_srv),
+                g_editor.viewport_image_min,
+                g_editor.viewport_image_max);
+            selection_outline_drawn = true;
+        }
+    }
+    if (has_selection() && !selection_outline_drawn && !g_editor.hide_dirty_wireframes) {
+        draw_solid_selection_outline(draw_list);
+    }
+
     draw_gizmo_overlay();
     if (g_editor.viewport_hovered) {
         if (g_editor.tool_mode == ToolMode::Move) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
@@ -3195,63 +3652,51 @@ void draw_viewport() {
     const float button_size = 28.0f;
     const float padding = 10.0f;
 
-    // Preview mode segmented buttons.
-    {
-        const float gap = 4.0f;
-        const float render_w = 66.0f;
-        const float solid_w = 48.0f;
-        const float wire_w = 44.0f;
-        const float total_w = render_w + solid_w + wire_w + gap * 2.0f;
-        float x = g_editor.viewport_image_max.x - button_size - total_w - padding - 8.0f;
-        const float y = g_editor.viewport_image_min.y + padding;
-
-        auto set_preview_mode = [](ViewportPreviewMode mode) {
-            set_viewport_preview_mode(mode);
-        };
-
-        auto draw_mode_button = [&](const char* label, const char* tooltip, ViewportPreviewMode mode, float width) {
-            const ImVec2 min = {x, y};
-            const ImVec2 max = {x + width, y + button_size};
-            const bool active = g_editor.viewport_preview_mode == mode;
-            const bool hovered = point_in_rect(ImGui::GetIO().MousePos, min, max);
-            const ImU32 fill = active ? IM_COL32(70, 96, 150, 235) : IM_COL32(18, 18, 20, 210);
-            const ImU32 border = hovered || active ? IM_COL32(140, 160, 205, 240) : IM_COL32(95, 100, 110, 230);
-            draw_list->AddRectFilled(min, max, fill, 4.0f);
-            draw_list->AddRect(min, max, border, 4.0f);
-            const ImVec2 text_size = ImGui::CalcTextSize(label);
-            draw_list->AddText({min.x + (width - text_size.x) * 0.5f, min.y + (button_size - text_size.y) * 0.5f},
-                IM_COL32(225, 228, 235, 255), label);
-            if (hovered) {
-                ImGui::SetTooltip("%s", tooltip);
-                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                    set_preview_mode(mode);
-                }
+    const float gap = 4.0f;
+    const float y = g_editor.viewport_image_min.y + padding;
+    float x = g_editor.viewport_image_max.x - padding - button_size;
+    auto draw_overlay_icon_button = [&](EditorIcon icon, const char* tooltip, bool active, auto&& on_click) {
+        const ImVec2 min = {x, y};
+        const ImVec2 max = {x + button_size, y + button_size};
+        const bool hovered = point_in_rect(ImGui::GetIO().MousePos, min, max);
+        const ImU32 fill = active ? IM_COL32(75, 105, 170, 235) : IM_COL32(18, 18, 20, 210);
+        const ImU32 border = hovered || active ? IM_COL32(145, 165, 210, 240) : IM_COL32(95, 100, 110, 230);
+        const ImU32 icon_color = IM_COL32(226, 229, 235, 255);
+        draw_list->AddRectFilled(min, max, fill, 4.0f);
+        draw_list->AddRect(min, max, border, 4.0f);
+        const float icon_size = button_size - 10.0f;
+        const ImVec2 icon_min = {min.x + (button_size - icon_size) * 0.5f, min.y + (button_size - icon_size) * 0.5f};
+        draw_editor_icon(draw_list, icon, icon_min, {icon_min.x + icon_size, icon_min.y + icon_size}, icon_color);
+        if (hovered) {
+            ImGui::SetTooltip("%s", tooltip);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                on_click();
             }
-            x += width + gap;
-        };
-
-        draw_mode_button("Render", "Rendered path tracer preview", ViewportPreviewMode::Rendered, render_w);
-        draw_mode_button("Solid", "Solid viewport preview", ViewportPreviewMode::Solid, solid_w);
-        draw_mode_button("Wire", "Wireframe-only viewport preview", ViewportPreviewMode::Wireframe, wire_w);
-    }
-
-    // Fullscreen button
-    const ImVec2 button_min = {g_editor.viewport_image_max.x - button_size - padding, g_editor.viewport_image_min.y + padding};
-    const ImVec2 button_max = {button_min.x + button_size, button_min.y + button_size};
-    draw_list->AddRectFilled(button_min, button_max, IM_COL32(18, 18, 20, 210), 4.0f);
-    draw_list->AddRect(button_min, button_max, IM_COL32(95, 100, 110, 230), 4.0f);
-    const char* fullscreen_label = g_editor.viewport_fullscreen ? "X" : "F";
-    const ImVec2 label_size = ImGui::CalcTextSize(fullscreen_label);
-    draw_list->AddText({button_min.x + (button_size - label_size.x) * 0.5f, button_min.y + (button_size - label_size.y) * 0.5f}, IM_COL32(235, 238, 242, 255), fullscreen_label);
-    const bool fullscreen_hovered = point_in_rect(ImGui::GetIO().MousePos, button_min, button_max);
-    if (fullscreen_hovered) {
-        ImGui::SetTooltip(g_editor.viewport_fullscreen ? "Exit fullscreen viewport" : "Fullscreen viewport");
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen;
         }
-    }
+        x -= button_size + gap;
+    };
+
+    draw_overlay_icon_button(
+        g_editor.viewport_fullscreen ? EditorIcon::ExitFullscreen : EditorIcon::Fullscreen,
+        g_editor.viewport_fullscreen ? "Exit fullscreen viewport" : "Fullscreen viewport",
+        false,
+        [&]() { g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen; });
+    draw_overlay_icon_button(
+        EditorIcon::WireframePreview,
+        "Wireframe-only viewport preview",
+        g_editor.viewport_preview_mode == ViewportPreviewMode::Wireframe,
+        [&]() { set_viewport_preview_mode(ViewportPreviewMode::Wireframe); });
+    draw_overlay_icon_button(
+        EditorIcon::SolidPreview,
+        "Solid viewport preview",
+        g_editor.viewport_preview_mode == ViewportPreviewMode::Solid,
+        [&]() { set_viewport_preview_mode(ViewportPreviewMode::Solid); });
+    draw_overlay_icon_button(
+        EditorIcon::RenderedPreview,
+        "Rendered path tracer preview",
+        g_editor.viewport_preview_mode == ViewportPreviewMode::Rendered,
+        [&]() { set_viewport_preview_mode(ViewportPreviewMode::Rendered); });
 
     const ImVec2 text_size = ImGui::CalcTextSize(hint);
     const ImVec2 text_pos = {g_editor.viewport_image_min.x + 8.0f, g_editor.viewport_image_max.y - text_size.y - 8.0f};
@@ -3266,6 +3711,22 @@ void draw_status_bar() {
     ImGui::SetNextWindowPos({viewport->Pos.x, viewport->Pos.y + viewport->Size.y - 26.0f});
     ImGui::SetNextWindowSize({viewport->Size.x, 26.0f});
     ImGui::Begin("Status", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    const int width = g_editor.framebuffer.width > 0
+        ? g_editor.framebuffer.width
+        : std::max(0, static_cast<int>(g_editor.viewport_size.x));
+    const int height = g_editor.framebuffer.height > 0
+        ? g_editor.framebuffer.height
+        : std::max(0, static_cast<int>(g_editor.viewport_size.y));
+    char resolution_text[32] = {};
+    std::snprintf(resolution_text, sizeof(resolution_text), "%d x %d", width, height);
+    const float bar_height = ImGui::GetWindowHeight();
+    const ImVec2 text_size = ImGui::CalcTextSize(resolution_text);
+    const ImVec2 bar_min = ImGui::GetWindowPos();
+    const ImVec2 text_pos = {
+        bar_min.x + 8.0f,
+        bar_min.y + std::max(0.0f, std::floor((bar_height - text_size.y) * 0.5f))
+    };
+    ImGui::GetWindowDrawList()->AddText(text_pos, ImGui::GetColorU32(ImGuiCol_TextDisabled), resolution_text);
     ImGui::End();
 }
 
@@ -3946,7 +4407,6 @@ void handle_global_shortcuts() {
     else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R)) reset_accumulation();
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) delete_selected();
-    if (ImGui::IsKeyPressed(ImGuiKey_O)) open_scene_dialog();
     if (ImGui::IsKeyPressed(ImGuiKey_Space)) g_editor.paused = !g_editor.paused;
     if (ImGui::IsKeyPressed(ImGuiKey_F11)) g_editor.viewport_fullscreen = !g_editor.viewport_fullscreen;
 }

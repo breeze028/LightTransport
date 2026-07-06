@@ -71,6 +71,7 @@ external/
 logs/
 papers/
 tmp/
+outputs/
 scenes/AntiqueCamera.glb
 scenes/Avocado.glb
 scenes/Bistro_v5_2/
@@ -83,6 +84,13 @@ scenes/cornell.lt.ivol
 scenes/dining-room/
 scenes/qwantani_sunset_puresky_4k.hdr
 scenes/staircase2/
+scenes/bathroom
+scenes/spaceship
+scenes/staircase
+scenes/living-room-2
+scenes/classroom
+scenes/bedroom
+scenes/veach-mis
 
 # Editor / OS files
 .vscode/

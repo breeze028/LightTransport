@@ -23,11 +23,13 @@ cbuffer ConstantBuffer : register(b0) {
     float4 light_dir;
     float4 ambient_color;
     float4 clay_color;
+    float4 selection_params;
 };
 
 struct VSInput {
     float3 position : POSITION;
     float3 normal   : NORMAL;
+    uint object_id   : TEXCOORD1;
 };
 
 struct PSInput {
@@ -73,11 +75,13 @@ cbuffer ConstantBuffer : register(b0) {
     float4 light_dir;
     float4 ambient_color;
     float4 clay_color;
+    float4 selection_params;
 };
 
 struct VSInput {
     float3 position : POSITION;
     float3 normal   : NORMAL;
+    uint object_id   : TEXCOORD1;
 };
 
 struct PSInput {
@@ -91,7 +95,175 @@ PSInput VSMain(VSInput input) {
 }
 
 float4 PSMain(PSInput input) : SV_TARGET {
-    return float4(0.08f, 0.09f, 0.10f, 1.0f);
+    return float4(1.0f, 0.55f, 0.12f, 1.0f);
+}
+)";
+
+static const char* kObjectIdShaderSource = R"(
+cbuffer ConstantBuffer : register(b0) {
+    row_major float4x4 view_proj;
+    float4 camera_pos;
+    float4 light_dir;
+    float4 ambient_color;
+    float4 clay_color;
+    float4 selection_params;
+};
+
+struct VSInput {
+    float3 position : POSITION;
+    float3 normal   : NORMAL;
+    uint object_id   : TEXCOORD1;
+};
+
+struct PSInput {
+    float4 position : SV_POSITION;
+    nointerpolation uint object_id : TEXCOORD1;
+};
+
+PSInput VSMain(VSInput input) {
+    PSInput output;
+    output.position = mul(float4(input.position, 1.0f), view_proj);
+    output.object_id = input.object_id;
+    return output;
+}
+
+uint PSMain(PSInput input) : SV_Target {
+    return input.object_id;
+}
+
+uint SelectedPSMain(PSInput input) : SV_Target {
+    uint selected_id = (uint)(selection_params.x + 0.5f);
+    if (input.object_id != selected_id) {
+        discard;
+    }
+    return input.object_id;
+}
+)";
+
+static const char* kOutlineShaderSource = R"(
+cbuffer ConstantBuffer : register(b0) {
+    row_major float4x4 view_proj;
+    float4 camera_pos;
+    float4 light_dir;
+    float4 ambient_color;
+    float4 clay_color;
+    float4 selection_params;
+};
+
+Texture2D<uint> selected_id_tx : register(t0);
+Texture2D<float> scene_depth_tx : register(t1);
+Texture2D<float> selected_depth_tx : register(t2);
+
+struct VSOutput {
+    float4 position : SV_POSITION;
+};
+
+VSOutput VSMain(uint vertex_id : SV_VertexID) {
+    float2 positions[3] = {
+        float2(-1.0f, -1.0f),
+        float2(-1.0f,  3.0f),
+        float2( 3.0f, -1.0f)
+    };
+    VSOutput output;
+    output.position = float4(positions[vertex_id], 0.0f, 1.0f);
+    return output;
+}
+
+uint load_id(int2 p, int2 dims) {
+    p = min(max(p, int2(0, 0)), dims - int2(1, 1));
+    return selected_id_tx.Load(int3(p, 0));
+}
+
+float load_selected_depth(int2 p, int2 dims) {
+    p = min(max(p, int2(0, 0)), dims - int2(1, 1));
+    return selected_depth_tx.Load(int3(p, 0));
+}
+
+float load_scene_depth(int2 p, int2 dims) {
+    p = min(max(p, int2(0, 0)), dims - int2(1, 1));
+    return scene_depth_tx.Load(int3(p, 0));
+}
+
+float4 PSMain(VSOutput input) : SV_Target {
+    int2 dims = max(int2(selection_params.yz + 0.5f), int2(1, 1));
+    int2 p = min(max(int2(input.position.xy), int2(0, 0)), dims - int2(1, 1));
+    uint center_id = load_id(p, dims);
+    bool center_selected = center_id != 0;
+
+    int2 left_p = p + int2(-1, 0);
+    int2 right_p = p + int2(1, 0);
+    int2 up_p = p + int2(0, -1);
+    int2 down_p = p + int2(0, 1);
+    int2 up_left_p = p + int2(-1, -1);
+    int2 up_right_p = p + int2(1, -1);
+    int2 down_left_p = p + int2(-1, 1);
+    int2 down_right_p = p + int2(1, 1);
+    int2 left2_p = p + int2(-2, 0);
+    int2 right2_p = p + int2(2, 0);
+    int2 up2_p = p + int2(0, -2);
+    int2 down2_p = p + int2(0, 2);
+
+    bool left_selected = load_id(left_p, dims) != 0;
+    bool right_selected = load_id(right_p, dims) != 0;
+    bool up_selected = load_id(up_p, dims) != 0;
+    bool down_selected = load_id(down_p, dims) != 0;
+    bool up_left_selected = load_id(up_left_p, dims) != 0;
+    bool up_right_selected = load_id(up_right_p, dims) != 0;
+    bool down_left_selected = load_id(down_left_p, dims) != 0;
+    bool down_right_selected = load_id(down_right_p, dims) != 0;
+    bool left2_selected = load_id(left2_p, dims) != 0;
+    bool right2_selected = load_id(right2_p, dims) != 0;
+    bool up2_selected = load_id(up2_p, dims) != 0;
+    bool down2_selected = load_id(down2_p, dims) != 0;
+
+    float cardinal_selected =
+        (left_selected ? 1.0f : 0.0f) +
+        (right_selected ? 1.0f : 0.0f) +
+        (up_selected ? 1.0f : 0.0f) +
+        (down_selected ? 1.0f : 0.0f);
+    float diagonal_selected =
+        (up_left_selected ? 1.0f : 0.0f) +
+        (up_right_selected ? 1.0f : 0.0f) +
+        (down_left_selected ? 1.0f : 0.0f) +
+        (down_right_selected ? 1.0f : 0.0f);
+    float outer_selected =
+        (left2_selected ? 1.0f : 0.0f) +
+        (right2_selected ? 1.0f : 0.0f) +
+        (up2_selected ? 1.0f : 0.0f) +
+        (down2_selected ? 1.0f : 0.0f);
+
+    float cardinal_outside = 4.0f - cardinal_selected;
+    float diagonal_outside = 4.0f - diagonal_selected;
+    float coverage = 0.0f;
+    float selected_depth = center_selected ? load_selected_depth(p, dims) : 1.0f;
+
+    if (!center_selected) {
+        if (left_selected) selected_depth = min(selected_depth, load_selected_depth(left_p, dims));
+        if (right_selected) selected_depth = min(selected_depth, load_selected_depth(right_p, dims));
+        if (up_selected) selected_depth = min(selected_depth, load_selected_depth(up_p, dims));
+        if (down_selected) selected_depth = min(selected_depth, load_selected_depth(down_p, dims));
+        if (up_left_selected) selected_depth = min(selected_depth, load_selected_depth(up_left_p, dims));
+        if (up_right_selected) selected_depth = min(selected_depth, load_selected_depth(up_right_p, dims));
+        if (down_left_selected) selected_depth = min(selected_depth, load_selected_depth(down_left_p, dims));
+        if (down_right_selected) selected_depth = min(selected_depth, load_selected_depth(down_right_p, dims));
+        if (left2_selected) selected_depth = min(selected_depth, load_selected_depth(left2_p, dims));
+        if (right2_selected) selected_depth = min(selected_depth, load_selected_depth(right2_p, dims));
+        if (up2_selected) selected_depth = min(selected_depth, load_selected_depth(up2_p, dims));
+        if (down2_selected) selected_depth = min(selected_depth, load_selected_depth(down2_p, dims));
+        coverage = cardinal_selected > 0.0f ? saturate(0.86f + cardinal_selected * 0.05f)
+                                            : (diagonal_selected > 0.0f ? 0.64f : (outer_selected > 0.0f ? 0.40f : 0.0f));
+    } else {
+        coverage = cardinal_outside > 0.0f ? 0.32f
+                                           : (diagonal_outside > 0.0f ? 0.16f : 0.0f);
+    }
+
+    if (coverage <= 0.0f) {
+        discard;
+    }
+
+    float scene_depth = load_scene_depth(p, dims);
+    float alpha = (selected_depth > scene_depth + 0.0005f ? 0.34f : 0.96f) * coverage;
+    return float4(1.0f, 0.55f, 0.12f, alpha);
 }
 )";
 
@@ -128,10 +300,17 @@ int create_solid_shaders(SolidPreview& sp) {
     ID3DBlob* ps_blob = nullptr;
     ID3DBlob* wire_vs_blob = nullptr;
     ID3DBlob* wire_ps_blob = nullptr;
+    ID3DBlob* id_vs_blob = nullptr;
+    ID3DBlob* id_ps_blob = nullptr;
+    ID3DBlob* selected_id_ps_blob = nullptr;
+    ID3DBlob* outline_vs_blob = nullptr;
+    ID3DBlob* outline_ps_blob = nullptr;
     int ok = 0;
 
     size_t solid_len = std::strlen(kSolidShaderSource);
     size_t wire_len = std::strlen(kWireShaderSource);
+    size_t object_id_len = std::strlen(kObjectIdShaderSource);
+    size_t outline_len = std::strlen(kOutlineShaderSource);
 
     if (!compile_shader(kSolidShaderSource, solid_len, "VSMain", "vs_5_0", &vs_blob)) return ok;
     if (!compile_shader(kSolidShaderSource, solid_len, "PSMain", "ps_5_0", &ps_blob)) { vs_blob->Release(); return ok; }
@@ -139,18 +318,41 @@ int create_solid_shaders(SolidPreview& sp) {
     if (!compile_shader(kWireShaderSource, wire_len, "PSMain", "ps_5_0", &wire_ps_blob)) {
         vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); return ok;
     }
+    if (!compile_shader(kObjectIdShaderSource, object_id_len, "VSMain", "vs_5_0", &id_vs_blob)) {
+        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); return ok;
+    }
+    if (!compile_shader(kObjectIdShaderSource, object_id_len, "PSMain", "ps_5_0", &id_ps_blob)) {
+        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); return ok;
+    }
+    if (!compile_shader(kObjectIdShaderSource, object_id_len, "SelectedPSMain", "ps_5_0", &selected_id_ps_blob)) {
+        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); id_ps_blob->Release(); return ok;
+    }
+    if (!compile_shader(kOutlineShaderSource, outline_len, "VSMain", "vs_5_0", &outline_vs_blob)) {
+        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
+        id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); return ok;
+    }
+    if (!compile_shader(kOutlineShaderSource, outline_len, "PSMain", "ps_5_0", &outline_ps_blob)) {
+        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
+        id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); outline_vs_blob->Release(); return ok;
+    }
 
     do {
         if (g_device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &sp.vs) != S_OK) break;
         if (g_device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &sp.ps) != S_OK) break;
         if (g_device->CreateVertexShader(wire_vs_blob->GetBufferPointer(), wire_vs_blob->GetBufferSize(), nullptr, &sp.wire_vs) != S_OK) break;
         if (g_device->CreatePixelShader(wire_ps_blob->GetBufferPointer(), wire_ps_blob->GetBufferSize(), nullptr, &sp.wire_ps) != S_OK) break;
+        if (g_device->CreateVertexShader(id_vs_blob->GetBufferPointer(), id_vs_blob->GetBufferSize(), nullptr, &sp.id_vs) != S_OK) break;
+        if (g_device->CreatePixelShader(id_ps_blob->GetBufferPointer(), id_ps_blob->GetBufferSize(), nullptr, &sp.id_ps) != S_OK) break;
+        if (g_device->CreatePixelShader(selected_id_ps_blob->GetBufferPointer(), selected_id_ps_blob->GetBufferSize(), nullptr, &sp.selected_id_ps) != S_OK) break;
+        if (g_device->CreateVertexShader(outline_vs_blob->GetBufferPointer(), outline_vs_blob->GetBufferSize(), nullptr, &sp.fullscreen_vs) != S_OK) break;
+        if (g_device->CreatePixelShader(outline_ps_blob->GetBufferPointer(), outline_ps_blob->GetBufferSize(), nullptr, &sp.outline_ps) != S_OK) break;
 
         D3D11_INPUT_ELEMENT_DESC layout[] = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 1, DXGI_FORMAT_R32_UINT,       0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
         };
-        if (g_device->CreateInputLayout(layout, 2, vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &sp.input_layout) != S_OK) break;
+        if (g_device->CreateInputLayout(layout, 3, id_vs_blob->GetBufferPointer(), id_vs_blob->GetBufferSize(), &sp.input_layout) != S_OK) break;
 
         ok = 1;
     } while (false);
@@ -159,6 +361,11 @@ int create_solid_shaders(SolidPreview& sp) {
     ps_blob->Release();
     wire_vs_blob->Release();
     wire_ps_blob->Release();
+    id_vs_blob->Release();
+    id_ps_blob->Release();
+    selected_id_ps_blob->Release();
+    outline_vs_blob->Release();
+    outline_ps_blob->Release();
     return ok;
 }
 
@@ -202,8 +409,103 @@ void release_render_targets(SolidPreview& sp) {
     if (sp.msaa_texture) { sp.msaa_texture->Release(); sp.msaa_texture = nullptr; }
     if (sp.msaa_dsv) { sp.msaa_dsv->Release(); sp.msaa_dsv = nullptr; }
     if (sp.msaa_depth_texture) { sp.msaa_depth_texture->Release(); sp.msaa_depth_texture = nullptr; }
+    if (sp.object_id_rtv) { sp.object_id_rtv->Release(); sp.object_id_rtv = nullptr; }
+    if (sp.object_id_texture) { sp.object_id_texture->Release(); sp.object_id_texture = nullptr; }
+    if (sp.pick_readback_texture) { sp.pick_readback_texture->Release(); sp.pick_readback_texture = nullptr; }
+    if (sp.scene_depth_srv) { sp.scene_depth_srv->Release(); sp.scene_depth_srv = nullptr; }
+    if (sp.scene_depth_dsv) { sp.scene_depth_dsv->Release(); sp.scene_depth_dsv = nullptr; }
+    if (sp.scene_depth_texture) { sp.scene_depth_texture->Release(); sp.scene_depth_texture = nullptr; }
+    if (sp.selected_id_srv) { sp.selected_id_srv->Release(); sp.selected_id_srv = nullptr; }
+    if (sp.selected_id_rtv) { sp.selected_id_rtv->Release(); sp.selected_id_rtv = nullptr; }
+    if (sp.selected_id_texture) { sp.selected_id_texture->Release(); sp.selected_id_texture = nullptr; }
+    if (sp.selected_depth_srv) { sp.selected_depth_srv->Release(); sp.selected_depth_srv = nullptr; }
+    if (sp.selected_depth_dsv) { sp.selected_depth_dsv->Release(); sp.selected_depth_dsv = nullptr; }
+    if (sp.selected_depth_texture) { sp.selected_depth_texture->Release(); sp.selected_depth_texture = nullptr; }
+    if (sp.outline_srv) { sp.outline_srv->Release(); sp.outline_srv = nullptr; }
+    if (sp.outline_rtv) { sp.outline_rtv->Release(); sp.outline_rtv = nullptr; }
+    if (sp.outline_texture) { sp.outline_texture->Release(); sp.outline_texture = nullptr; }
     sp.sample_count = 1;
     sp.sample_quality = 0;
+    sp.outline_valid = false;
+}
+
+bool create_depth_target(UINT width,
+                         UINT height,
+                         ID3D11Texture2D** texture,
+                         ID3D11DepthStencilView** dsv,
+                         ID3D11ShaderResourceView** srv) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    if (g_device->CreateTexture2D(&desc, nullptr, texture) != S_OK) return false;
+
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
+    dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (g_device->CreateDepthStencilView(*texture, &dsv_desc, dsv) != S_OK) return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    if (g_device->CreateShaderResourceView(*texture, &srv_desc, srv) != S_OK) return false;
+    return true;
+}
+
+bool create_selection_targets(SolidPreview& sp, int width, int height) {
+    const UINT w = static_cast<UINT>(width);
+    const UINT h = static_cast<UINT>(height);
+
+    D3D11_TEXTURE2D_DESC id_desc{};
+    id_desc.Width = w;
+    id_desc.Height = h;
+    id_desc.MipLevels = 1;
+    id_desc.ArraySize = 1;
+    id_desc.Format = DXGI_FORMAT_R32_UINT;
+    id_desc.SampleDesc.Count = 1;
+    id_desc.Usage = D3D11_USAGE_DEFAULT;
+    id_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (g_device->CreateTexture2D(&id_desc, nullptr, &sp.object_id_texture) != S_OK) return false;
+    if (g_device->CreateRenderTargetView(sp.object_id_texture, nullptr, &sp.object_id_rtv) != S_OK) return false;
+
+    D3D11_TEXTURE2D_DESC readback_desc = id_desc;
+    readback_desc.Width = 15;
+    readback_desc.Height = 15;
+    readback_desc.Usage = D3D11_USAGE_STAGING;
+    readback_desc.BindFlags = 0;
+    readback_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (g_device->CreateTexture2D(&readback_desc, nullptr, &sp.pick_readback_texture) != S_OK) return false;
+
+    if (!create_depth_target(w, h, &sp.scene_depth_texture, &sp.scene_depth_dsv, &sp.scene_depth_srv)) return false;
+
+    D3D11_TEXTURE2D_DESC selected_id_desc = id_desc;
+    selected_id_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (g_device->CreateTexture2D(&selected_id_desc, nullptr, &sp.selected_id_texture) != S_OK) return false;
+    if (g_device->CreateRenderTargetView(sp.selected_id_texture, nullptr, &sp.selected_id_rtv) != S_OK) return false;
+    if (g_device->CreateShaderResourceView(sp.selected_id_texture, nullptr, &sp.selected_id_srv) != S_OK) return false;
+
+    if (!create_depth_target(w, h, &sp.selected_depth_texture, &sp.selected_depth_dsv, &sp.selected_depth_srv)) return false;
+
+    D3D11_TEXTURE2D_DESC outline_desc{};
+    outline_desc.Width = w;
+    outline_desc.Height = h;
+    outline_desc.MipLevels = 1;
+    outline_desc.ArraySize = 1;
+    outline_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    outline_desc.SampleDesc.Count = 1;
+    outline_desc.Usage = D3D11_USAGE_DEFAULT;
+    outline_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (g_device->CreateTexture2D(&outline_desc, nullptr, &sp.outline_texture) != S_OK) return false;
+    if (g_device->CreateRenderTargetView(sp.outline_texture, nullptr, &sp.outline_rtv) != S_OK) return false;
+    if (g_device->CreateShaderResourceView(sp.outline_texture, nullptr, &sp.outline_srv) != S_OK) return false;
+
+    return true;
 }
 
 void choose_msaa(SolidPreview& sp) {
@@ -227,6 +529,7 @@ struct GenCount { size_t verts; size_t indices; };
 GenCount generate_sphere_geometry(std::vector<SolidPreviewVertex>& verts,
                                   std::vector<uint32_t>& indices,
                                   const lt::Sphere& sphere,
+                                  uint32_t object_id,
                                   int segments = 16, int rings = 8) {
     const size_t vert_start = verts.size();
     const float r = sphere.radius;
@@ -246,7 +549,7 @@ GenCount generate_sphere_geometry(std::vector<SolidPreviewVertex>& verts,
                 c.z + r * sin_theta * std::sin(phi),
             };
             const lt::Vec3 n = lt::normalize(pos - c);
-            verts.push_back({pos.x, pos.y, pos.z, n.x, n.y, n.z});
+            verts.push_back({pos.x, pos.y, pos.z, n.x, n.y, n.z, object_id});
         }
     }
 
@@ -264,27 +567,62 @@ GenCount generate_sphere_geometry(std::vector<SolidPreviewVertex>& verts,
     return {verts.size() - vert_start, indices.size() - idx_start};
 }
 
+uint32_t ensure_selection_id(SolidPreview& sp,
+                             std::vector<uint32_t>& ids,
+                             int object_index,
+                             SelectionKind kind) {
+    if (object_index < 0) return 0;
+    if (object_index >= static_cast<int>(ids.size())) return 0;
+    uint32_t& id = ids[static_cast<size_t>(object_index)];
+    if (id == 0) {
+        id = static_cast<uint32_t>(sp.selection_refs.size() + 1);
+        sp.selection_refs.push_back({kind, object_index});
+    }
+    return id;
+}
+
+void append_draw_range(SolidPreview& sp, uint32_t object_id, UINT start_index, UINT index_count) {
+    if (object_id == 0 || index_count == 0) return;
+    if (!sp.draw_ranges.empty()) {
+        SolidDrawRange& previous = sp.draw_ranges.back();
+        if (previous.object_id == object_id &&
+            previous.start_index + previous.index_count == start_index) {
+            previous.index_count += index_count;
+            return;
+        }
+    }
+    sp.draw_ranges.push_back({object_id, start_index, index_count});
+}
+
 void build_buffer_from_scene(SolidPreview& sp, const lt::Scene& scene) {
     // Release old buffers
     if (sp.vb) { sp.vb->Release(); sp.vb = nullptr; }
     if (sp.ib) { sp.ib->Release(); sp.ib = nullptr; }
     sp.vertex_count = 0;
     sp.index_count = 0;
+    sp.selection_refs.clear();
+    sp.draw_ranges.clear();
+    sp.outline_valid = false;
 
     std::vector<SolidPreviewVertex> verts;
     std::vector<uint32_t> indices;
+    std::vector<uint32_t> mesh_ids(scene.meshes.size(), 0);
+    std::vector<uint32_t> sphere_ids(scene.spheres.size(), 0);
 
     const lt::RenderScene render_scene = lt::build_render_scene(scene);
 
     // Use the same world-space geometry as picking and the path tracer.
     for (const lt::Triangle& triangle : render_scene.triangles) {
         const uint32_t base = static_cast<uint32_t>(verts.size());
-        verts.push_back({triangle.v0.x, triangle.v0.y, triangle.v0.z, triangle.n0.x, triangle.n0.y, triangle.n0.z});
-        verts.push_back({triangle.v1.x, triangle.v1.y, triangle.v1.z, triangle.n1.x, triangle.n1.y, triangle.n1.z});
-        verts.push_back({triangle.v2.x, triangle.v2.y, triangle.v2.z, triangle.n2.x, triangle.n2.y, triangle.n2.z});
+        const uint32_t object_id = ensure_selection_id(sp, mesh_ids, triangle.mesh, SelectionKind::Mesh);
+        const UINT range_start = static_cast<UINT>(indices.size());
+        verts.push_back({triangle.v0.x, triangle.v0.y, triangle.v0.z, triangle.n0.x, triangle.n0.y, triangle.n0.z, object_id});
+        verts.push_back({triangle.v1.x, triangle.v1.y, triangle.v1.z, triangle.n1.x, triangle.n1.y, triangle.n1.z, object_id});
+        verts.push_back({triangle.v2.x, triangle.v2.y, triangle.v2.z, triangle.n2.x, triangle.n2.y, triangle.n2.z, object_id});
         indices.push_back(base);
         indices.push_back(base + 1);
         indices.push_back(base + 2);
+        append_draw_range(sp, object_id, range_start, 3);
     }
 
     for (const lt::RenderSphere& sphere : render_scene.spheres) {
@@ -292,7 +630,10 @@ void build_buffer_from_scene(SolidPreview& sp, const lt::Scene& scene) {
         preview_sphere.center = sphere.center;
         preview_sphere.radius = sphere.radius;
         preview_sphere.material = sphere.material;
-        generate_sphere_geometry(verts, indices, preview_sphere);
+        const uint32_t object_id = ensure_selection_id(sp, sphere_ids, sphere.sphere, SelectionKind::Sphere);
+        const UINT range_start = static_cast<UINT>(indices.size());
+        const GenCount count = generate_sphere_geometry(verts, indices, preview_sphere, object_id);
+        append_draw_range(sp, object_id, range_start, static_cast<UINT>(count.indices));
     }
 
     if (verts.empty() || indices.empty()) return;
@@ -333,6 +674,242 @@ void build_constant_buffer(SolidPreview& sp) {
     g_device->CreateBuffer(&desc, nullptr, &sp.cb);
 }
 
+bool upload_solid_constants(SolidPreview& sp,
+                            const Scene& scene,
+                            ImVec2 viewport_size,
+                            uint32_t selected_id = 0) {
+    if (!sp.cb) return false;
+
+    // Build view-projection matrix matching the editor projection helpers:
+    // camera forward maps to +Z in view space.
+    const float aspect = viewport_size.x / std::max(1.0f, viewport_size.y);
+    const float fov_rad = scene.camera.fov_degrees * lt::kPi / 180.0f;
+    const lt::Vec3 forward = lt::normalize(scene.camera.target - scene.camera.position);
+    const float right_sign = scene.camera.right_sign < 0.0f ? -1.0f : 1.0f;
+    const lt::Vec3 right = lt::normalize(lt::cross(forward, scene.camera.up)) * right_sign;
+    const lt::Vec3 up = lt::cross(right, forward) * right_sign;
+    const lt::Vec3& pos = scene.camera.position;
+
+    const float view[16] = {
+        right.x,         up.x,        forward.x,        0.0f,
+        right.y,         up.y,        forward.y,        0.0f,
+        right.z,         up.z,        forward.z,        0.0f,
+        -lt::dot(right, pos), -lt::dot(up, pos), -lt::dot(forward, pos), 1.0f,
+    };
+
+    const float n = 0.05f;
+    const float f = 1000.0f;
+    const float h = 1.0f / std::tan(fov_rad * 0.5f);
+    const float w = h / aspect;
+    float proj[16] = {0};
+    proj[0]  = w;
+    proj[5]  = h;
+    proj[10] = f / (f - n);
+    proj[11] = 1.0f;
+    proj[14] = -n * f / (f - n);
+
+    float view_proj[16] = {0};
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            for (int k = 0; k < 4; ++k) {
+                view_proj[row * 4 + col] += view[row * 4 + k] * proj[k * 4 + col];
+            }
+        }
+    }
+
+    // Blender-style solid preview is independent from scene lights. Attach a
+    // soft studio direction to the view so shape readability stays stable while
+    // orbiting.
+    lt::Vec3 light_dir = lt::normalize(right * -0.35f + up * 0.45f + forward * 0.82f);
+
+    SolidConstantBuffer cb_data{};
+    std::memcpy(cb_data.view_proj, view_proj, sizeof(view_proj));
+    cb_data.camera_pos[0] = pos.x;
+    cb_data.camera_pos[1] = pos.y;
+    cb_data.camera_pos[2] = pos.z;
+    cb_data.camera_pos[3] = 1.0f;
+    cb_data.light_dir[0] = light_dir.x;
+    cb_data.light_dir[1] = light_dir.y;
+    cb_data.light_dir[2] = light_dir.z;
+    cb_data.light_dir[3] = 0.0f;
+    cb_data.ambient_color[0] = 0.18f;
+    cb_data.ambient_color[1] = 0.19f;
+    cb_data.ambient_color[2] = 0.22f;
+    cb_data.ambient_color[3] = 1.0f;
+    cb_data.clay_color[0] = 0.62f;
+    cb_data.clay_color[1] = 0.62f;
+    cb_data.clay_color[2] = 0.60f;
+    cb_data.clay_color[3] = 1.0f;
+    cb_data.selection_params[0] = static_cast<float>(selected_id);
+    cb_data.selection_params[1] = static_cast<float>(sp.width);
+    cb_data.selection_params[2] = static_cast<float>(sp.height);
+    cb_data.selection_params[3] = 0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (g_context->Map(sp.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped) != S_OK) {
+        return false;
+    }
+    std::memcpy(mapped.pData, &cb_data, sizeof(cb_data));
+    g_context->Unmap(sp.cb, 0);
+    return true;
+}
+
+uint32_t find_selection_id(const SolidPreview& sp, SelectionKind kind, int object_index) {
+    for (size_t i = 0; i < sp.selection_refs.size(); ++i) {
+        const SolidSelectionRef& ref = sp.selection_refs[i];
+        if (ref.kind == kind && ref.object_index == object_index) {
+            return static_cast<uint32_t>(i + 1);
+        }
+    }
+    return 0;
+}
+
+bool has_selection_resources(const SolidPreview& sp) {
+    return sp.object_id_rtv &&
+        sp.pick_readback_texture &&
+        sp.scene_depth_dsv &&
+        sp.scene_depth_srv &&
+        sp.selected_id_rtv &&
+        sp.selected_id_srv &&
+        sp.selected_depth_dsv &&
+        sp.selected_depth_srv &&
+        sp.outline_rtv &&
+        sp.outline_srv;
+}
+
+void bind_preview_geometry(SolidPreview& sp) {
+    const UINT stride = sizeof(SolidPreviewVertex);
+    const UINT offset = 0;
+    g_context->IASetInputLayout(sp.input_layout);
+    g_context->IASetVertexBuffers(0, 1, &sp.vb, &stride, &offset);
+    g_context->IASetIndexBuffer(sp.ib, DXGI_FORMAT_R32_UINT, 0);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_context->VSSetConstantBuffers(0, 1, &sp.cb);
+    g_context->PSSetConstantBuffers(0, 1, &sp.cb);
+    g_context->RSSetState(sp.solid_rasterizer);
+    g_context->OMSetDepthStencilState(sp.solid_depth_state, 0);
+}
+
+void set_preview_viewport(const SolidPreview& sp) {
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<float>(sp.width);
+    vp.Height = static_cast<float>(sp.height);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    g_context->RSSetViewports(1, &vp);
+}
+
+void restore_render_target(ID3D11RenderTargetView* previous_rtv, ID3D11DepthStencilView* previous_dsv) {
+    g_context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);
+    if (previous_rtv) previous_rtv->Release();
+    if (previous_dsv) previous_dsv->Release();
+}
+
+bool render_scene_id_pass(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size) {
+    if (!sp.vb || !sp.ib || !sp.id_vs || !sp.id_ps || !has_selection_resources(sp)) return false;
+    if (!upload_solid_constants(sp, scene, viewport_size)) return false;
+
+    ID3D11ShaderResourceView* null_srvs[3] = {};
+    g_context->PSSetShaderResources(0, 3, null_srvs);
+
+    ID3D11RenderTargetView* previous_rtv = nullptr;
+    ID3D11DepthStencilView* previous_dsv = nullptr;
+    g_context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
+
+    const float clear_id[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    g_context->ClearRenderTargetView(sp.object_id_rtv, clear_id);
+    g_context->ClearDepthStencilView(sp.scene_depth_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    ID3D11RenderTargetView* id_rtv = sp.object_id_rtv;
+    g_context->OMSetRenderTargets(1, &id_rtv, sp.scene_depth_dsv);
+    set_preview_viewport(sp);
+    bind_preview_geometry(sp);
+    g_context->VSSetShader(sp.id_vs, nullptr, 0);
+    g_context->PSSetShader(sp.id_ps, nullptr, 0);
+    g_context->DrawIndexed(sp.index_count, 0, 0);
+
+    restore_render_target(previous_rtv, previous_dsv);
+    return true;
+}
+
+bool render_selected_id_pass(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size, uint32_t selected_id) {
+    if (!sp.vb || !sp.ib || !sp.id_vs || !sp.selected_id_ps || selected_id == 0 || !has_selection_resources(sp)) return false;
+    if (!upload_solid_constants(sp, scene, viewport_size, selected_id)) return false;
+
+    ID3D11ShaderResourceView* null_srvs[3] = {};
+    g_context->PSSetShaderResources(0, 3, null_srvs);
+
+    ID3D11RenderTargetView* previous_rtv = nullptr;
+    ID3D11DepthStencilView* previous_dsv = nullptr;
+    g_context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
+
+    const float clear_id[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    g_context->ClearRenderTargetView(sp.selected_id_rtv, clear_id);
+    g_context->ClearDepthStencilView(sp.selected_depth_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    ID3D11RenderTargetView* selected_rtv = sp.selected_id_rtv;
+    g_context->OMSetRenderTargets(1, &selected_rtv, sp.selected_depth_dsv);
+    set_preview_viewport(sp);
+    bind_preview_geometry(sp);
+    g_context->VSSetShader(sp.id_vs, nullptr, 0);
+    g_context->PSSetShader(sp.selected_id_ps, nullptr, 0);
+    for (const SolidDrawRange& range : sp.draw_ranges) {
+        if (range.object_id == selected_id) {
+            g_context->DrawIndexed(range.index_count, range.start_index, 0);
+        }
+    }
+
+    restore_render_target(previous_rtv, previous_dsv);
+    return true;
+}
+
+bool render_outline_texture(SolidPreview& sp) {
+    if (!sp.fullscreen_vs || !sp.outline_ps || !has_selection_resources(sp)) return false;
+
+    ID3D11RenderTargetView* previous_rtv = nullptr;
+    ID3D11DepthStencilView* previous_dsv = nullptr;
+    g_context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
+
+    const float clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    g_context->ClearRenderTargetView(sp.outline_rtv, clear_color);
+    ID3D11RenderTargetView* outline_rtv = sp.outline_rtv;
+    g_context->OMSetRenderTargets(1, &outline_rtv, nullptr);
+    g_context->OMSetDepthStencilState(nullptr, 0);
+    g_context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    set_preview_viewport(sp);
+
+    ID3D11Buffer* null_vb = nullptr;
+    UINT stride = 0;
+    UINT offset = 0;
+    g_context->IASetInputLayout(nullptr);
+    g_context->IASetVertexBuffers(0, 1, &null_vb, &stride, &offset);
+    g_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_context->VSSetShader(sp.fullscreen_vs, nullptr, 0);
+    g_context->PSSetShader(sp.outline_ps, nullptr, 0);
+    g_context->VSSetConstantBuffers(0, 1, &sp.cb);
+    g_context->PSSetConstantBuffers(0, 1, &sp.cb);
+    ID3D11ShaderResourceView* srvs[3] = {sp.selected_id_srv, sp.scene_depth_srv, sp.selected_depth_srv};
+    g_context->PSSetShaderResources(0, 3, srvs);
+    g_context->Draw(3, 0);
+
+    ID3D11ShaderResourceView* null_srvs[3] = {};
+    g_context->PSSetShaderResources(0, 3, null_srvs);
+    restore_render_target(previous_rtv, previous_dsv);
+    return true;
+}
+
+bool decode_selection_id(const SolidPreview& sp, uint32_t object_id, SelectionKind& kind, int& object_index) {
+    if (object_id == 0 || object_id > sp.selection_refs.size()) return false;
+    const SolidSelectionRef& ref = sp.selection_refs[static_cast<size_t>(object_id - 1)];
+    if (ref.kind == SelectionKind::None || ref.object_index < 0) return false;
+    kind = ref.kind;
+    object_index = ref.object_index;
+    return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -362,6 +939,11 @@ void release_solid_preview(SolidPreview& sp) {
     if (sp.input_layout) { sp.input_layout->Release(); sp.input_layout = nullptr; }
     if (sp.wire_vs) { sp.wire_vs->Release(); sp.wire_vs = nullptr; }
     if (sp.wire_ps) { sp.wire_ps->Release(); sp.wire_ps = nullptr; }
+    if (sp.id_vs) { sp.id_vs->Release(); sp.id_vs = nullptr; }
+    if (sp.id_ps) { sp.id_ps->Release(); sp.id_ps = nullptr; }
+    if (sp.selected_id_ps) { sp.selected_id_ps->Release(); sp.selected_id_ps = nullptr; }
+    if (sp.fullscreen_vs) { sp.fullscreen_vs->Release(); sp.fullscreen_vs = nullptr; }
+    if (sp.outline_ps) { sp.outline_ps->Release(); sp.outline_ps = nullptr; }
     if (sp.wire_rasterizer) { sp.wire_rasterizer->Release(); sp.wire_rasterizer = nullptr; }
     if (sp.solid_rasterizer) { sp.solid_rasterizer->Release(); sp.solid_rasterizer = nullptr; }
     if (sp.solid_depth_state) { sp.solid_depth_state->Release(); sp.solid_depth_state = nullptr; }
@@ -422,6 +1004,11 @@ void resize_solid_preview(SolidPreview& sp, int width, int height) {
         g_device->CreateDepthStencilView(sp.msaa_depth_texture, nullptr, &sp.msaa_dsv);
     }
 
+    if (!create_selection_targets(sp, width, height)) {
+        release_render_targets(sp);
+        return;
+    }
+
     sp.width = width;
     sp.height = height;
 }
@@ -429,10 +1016,10 @@ void resize_solid_preview(SolidPreview& sp, int width, int height) {
 void update_solid_preview_buffers(SolidPreview& sp, const Scene& scene) {
     // Rebuild geometry only when scene content changes. Camera-only changes update
     // constants in render_solid_preview and must not touch large vertex buffers.
-    if (!sp.vb || !sp.ib || sp.content_generation != g_editor.content_generation) {
+    if (!sp.vb || !sp.ib || sp.geometry_generation != g_editor.geometry_generation) {
         build_buffer_from_scene(sp, scene);
         sp.scene_generation = g_editor.render_generation;
-        sp.content_generation = g_editor.content_generation;
+        sp.geometry_generation = g_editor.geometry_generation;
     }
 }
 
@@ -441,77 +1028,7 @@ void render_solid_preview(SolidPreview& sp, const Scene& scene, ImVec2 viewport_
     ID3D11DepthStencilView* target_dsv = sp.sample_count > 1 ? sp.msaa_dsv : sp.dsv;
     if (!target_rtv || !target_dsv || !sp.srv || !sp.vb || !sp.ib || !sp.vs || !sp.ps) return;
 
-    // Build view-projection matrix matching the editor projection helpers:
-    // camera forward maps to +Z in view space.
-    const float aspect = viewport_size.x / std::max(1.0f, viewport_size.y);
-    const float fov_rad = scene.camera.fov_degrees * lt::kPi / 180.0f;
-    const lt::Vec3 forward = lt::normalize(scene.camera.target - scene.camera.position);
-    const float right_sign = scene.camera.right_sign < 0.0f ? -1.0f : 1.0f;
-    const lt::Vec3 right = lt::normalize(lt::cross(forward, scene.camera.up)) * right_sign;
-    const lt::Vec3 up = lt::cross(right, forward) * right_sign;
-    const lt::Vec3& pos = scene.camera.position;
-
-    // Camera looks along +Z in view space.
-    // Row-major matrix for HLSL mul(float4(position), view_proj).
-    const float view[16] = {
-        right.x,         up.x,        forward.x,        0.0f,
-        right.y,         up.y,        forward.y,        0.0f,
-        right.z,         up.z,        forward.z,        0.0f,
-        -lt::dot(right, pos), -lt::dot(up, pos), -lt::dot(forward, pos), 1.0f,
-    };
-
-    // D3D perspective projection, row-vector layout, depth 0..1.
-    const float n = 0.05f;
-    const float f = 1000.0f;
-    const float h = 1.0f / std::tan(fov_rad * 0.5f);
-    const float w = h / aspect;
-    float proj[16] = {0};
-    proj[0]  = w;
-    proj[5]  = h;
-    proj[10] = f / (f - n);
-    proj[11] = 1.0f;
-    proj[14] = -n * f / (f - n);
-
-    // view * proj
-    float view_proj[16] = {0};
-    for (int row = 0; row < 4; ++row) {
-        for (int col = 0; col < 4; ++col) {
-            for (int k = 0; k < 4; ++k) {
-                view_proj[row * 4 + col] += view[row * 4 + k] * proj[k * 4 + col];
-            }
-        }
-    }
-
-    // Blender-style solid preview is independent from scene lights. Attach a
-    // soft studio direction to the view so shape readability stays stable while
-    // orbiting.
-    lt::Vec3 light_dir = lt::normalize(right * -0.35f + up * 0.45f + forward * 0.82f);
-
-    // Upload constant buffer
-    SolidConstantBuffer cb_data{};
-    std::memcpy(cb_data.view_proj, view_proj, sizeof(view_proj));
-    cb_data.camera_pos[0] = pos.x;
-    cb_data.camera_pos[1] = pos.y;
-    cb_data.camera_pos[2] = pos.z;
-    cb_data.camera_pos[3] = 1.0f;
-    cb_data.light_dir[0] = light_dir.x;
-    cb_data.light_dir[1] = light_dir.y;
-    cb_data.light_dir[2] = light_dir.z;
-    cb_data.light_dir[3] = 0.0f;
-    cb_data.ambient_color[0] = 0.18f;
-    cb_data.ambient_color[1] = 0.19f;
-    cb_data.ambient_color[2] = 0.22f;
-    cb_data.ambient_color[3] = 1.0f;
-    cb_data.clay_color[0] = 0.62f;
-    cb_data.clay_color[1] = 0.62f;
-    cb_data.clay_color[2] = 0.60f;
-    cb_data.clay_color[3] = 1.0f;
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (sp.cb && g_context->Map(sp.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped) == S_OK) {
-        std::memcpy(mapped.pData, &cb_data, sizeof(cb_data));
-        g_context->Unmap(sp.cb, 0);
-    }
+    if (!upload_solid_constants(sp, scene, viewport_size)) return;
 
     // Save existing render target
     ID3D11RenderTargetView* prev_rtv = nullptr;
@@ -571,6 +1088,126 @@ void render_solid_preview(SolidPreview& sp, const Scene& scene, ImVec2 viewport_
     g_context->OMSetRenderTargets(1, &prev_rtv, prev_dsv);
     if (prev_rtv) prev_rtv->Release();
     if (prev_dsv) prev_dsv->Release();
+}
+
+GpuPickResult pick_solid_preview_object(SolidPreview& sp,
+                                        const Scene& scene,
+                                        ImVec2 viewport_size,
+                                        ImVec2 image_min,
+                                        ImVec2 image_max,
+                                        ImVec2 mouse,
+                                        SelectionKind& kind,
+                                        int& object_index) {
+    kind = SelectionKind::None;
+    object_index = -1;
+
+    const int width = std::max(64, static_cast<int>(viewport_size.x));
+    const int height = std::max(64, static_cast<int>(viewport_size.y));
+    init_solid_preview(sp);
+    resize_solid_preview(sp, width, height);
+    update_solid_preview_buffers(sp, scene);
+
+    if (sp.selection_refs.empty()) return GpuPickResult::Miss;
+    if (!sp.vb || !sp.ib || !has_selection_resources(sp)) return GpuPickResult::Unavailable;
+    if (!render_scene_id_pass(sp, scene, viewport_size)) return GpuPickResult::Unavailable;
+
+    const float rect_w = std::max(1.0f, image_max.x - image_min.x);
+    const float rect_h = std::max(1.0f, image_max.y - image_min.y);
+    const float u = std::clamp((mouse.x - image_min.x) / rect_w, 0.0f, 0.999999f);
+    const float v = std::clamp((mouse.y - image_min.y) / rect_h, 0.0f, 0.999999f);
+    const int px = std::clamp(static_cast<int>(std::floor(u * static_cast<float>(sp.width))), 0, sp.width - 1);
+    const int py = std::clamp(static_cast<int>(std::floor(v * static_cast<float>(sp.height))), 0, sp.height - 1);
+
+    constexpr int kPickRadius = 7;
+    const int left = std::max(0, px - kPickRadius);
+    const int top = std::max(0, py - kPickRadius);
+    const int right = std::min(sp.width, px + kPickRadius + 1);
+    const int bottom = std::min(sp.height, py + kPickRadius + 1);
+    const int copy_w = std::max(0, right - left);
+    const int copy_h = std::max(0, bottom - top);
+    if (copy_w <= 0 || copy_h <= 0) return GpuPickResult::Miss;
+
+    D3D11_BOX box{};
+    box.left = static_cast<UINT>(left);
+    box.top = static_cast<UINT>(top);
+    box.front = 0;
+    box.right = static_cast<UINT>(right);
+    box.bottom = static_cast<UINT>(bottom);
+    box.back = 1;
+    g_context->CopySubresourceRegion(sp.pick_readback_texture, 0, 0, 0, 0, sp.object_id_texture, 0, &box);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (g_context->Map(sp.pick_readback_texture, 0, D3D11_MAP_READ, 0, &mapped) != S_OK) {
+        return GpuPickResult::Unavailable;
+    }
+
+    uint32_t best_id = 0;
+    const int center_x = px - left;
+    const int center_y = py - top;
+    for (int radius = 0; radius <= kPickRadius && best_id == 0; ++radius) {
+        for (int y = 0; y < copy_h && best_id == 0; ++y) {
+            for (int x = 0; x < copy_w; ++x) {
+                if (std::max(std::abs(x - center_x), std::abs(y - center_y)) != radius) continue;
+                const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
+                const uint32_t id = reinterpret_cast<const uint32_t*>(row)[x];
+                if (id != 0) {
+                    best_id = id;
+                    break;
+                }
+            }
+        }
+    }
+
+    g_context->Unmap(sp.pick_readback_texture, 0);
+    if (best_id == 0) return GpuPickResult::Miss;
+    return decode_selection_id(sp, best_id, kind, object_index) ? GpuPickResult::Hit : GpuPickResult::Miss;
+}
+
+ID3D11ShaderResourceView* render_selection_outline(SolidPreview& sp,
+                                                   const Scene& scene,
+                                                   ImVec2 viewport_size,
+                                                   SelectionKind kind,
+                                                   int object_index) {
+    const int width = std::max(64, static_cast<int>(viewport_size.x));
+    const int height = std::max(64, static_cast<int>(viewport_size.y));
+    init_solid_preview(sp);
+    resize_solid_preview(sp, width, height);
+    update_solid_preview_buffers(sp, scene);
+
+    const uint32_t selected_id = find_selection_id(sp, kind, object_index);
+    if (selected_id == 0 || !sp.vb || !sp.ib || !has_selection_resources(sp)) {
+        sp.outline_valid = false;
+        return nullptr;
+    }
+
+    if (sp.outline_valid &&
+        sp.outline_generation == g_editor.render_generation &&
+        sp.outline_content_generation == g_editor.content_generation &&
+        sp.outline_object_id == selected_id &&
+        sp.width == width &&
+        sp.height == height &&
+        sp.outline_srv) {
+        return sp.outline_srv;
+    }
+
+    if (!render_scene_id_pass(sp, scene, viewport_size)) {
+        sp.outline_valid = false;
+        return nullptr;
+    }
+    if (!render_selected_id_pass(sp, scene, viewport_size, selected_id)) {
+        sp.outline_valid = false;
+        return nullptr;
+    }
+    if (!render_outline_texture(sp)) {
+        sp.outline_valid = false;
+        return nullptr;
+    }
+
+    sp.outline_valid = true;
+    sp.outline_generation = g_editor.render_generation;
+    sp.outline_content_generation = g_editor.content_generation;
+    sp.outline_object_id = selected_id;
+    return sp.outline_srv;
 }
 
 } // namespace lt::editor
