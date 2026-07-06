@@ -42,6 +42,7 @@ struct ImportState {
     Mat4 transform;
     int material = 0;
     LightComponent area_light;
+    bool reverse_orientation = false;
 };
 
 struct MeshLoadResult {
@@ -453,6 +454,15 @@ void apply_transform(Mesh& mesh, const Mat4& transform) {
     }
 }
 
+void reverse_mesh_orientation(Mesh& mesh) {
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        std::swap(mesh.indices[i + 1], mesh.indices[i + 2]);
+    }
+    for (Vec3& normal : mesh.normals) {
+        normal *= -1.0f;
+    }
+}
+
 Mesh make_baked_uv_sphere_mesh(const std::string& name, int material, float radius, int segments, int rings) {
     Mesh mesh = make_uv_sphere_mesh(name, material, {}, 1.0f, segments, rings);
     for (Vec3& vertex : mesh.vertices) {
@@ -734,6 +744,8 @@ private:
         } else if ((op == "Transform" || op == "ConcatTransform") && pos < tokens.size()) {
             Mat4 m = parse_matrix(tokens, pos);
             state_.transform = op == "Transform" ? m : multiply(state_.transform, m);
+        } else if (op == "ReverseOrientation") {
+            state_.reverse_orientation = !state_.reverse_orientation;
         } else if (op == "LookAt" && pos + 8 < tokens.size()) {
             parse_look_at(tokens, pos);
         } else if (op == "Camera") {
@@ -936,7 +948,7 @@ private:
         const float scale_value = std::max(0.0f, float_param(params, "scale", 1.0f));
         const float intensity = std::max({l.x, l.y, l.z}) * scale_value;
         state_.area_light.enabled = intensity > 0.0f;
-        state_.area_light.double_sided = true;
+        state_.area_light.double_sided = bool_param(params, "twosided", false);
         state_.area_light.intensity = intensity;
         state_.area_light.color = intensity > 0.0f ? l / std::max(1.0e-6f, std::max({l.x, l.y, l.z})) : Vec3{1.0f};
     }
@@ -989,7 +1001,7 @@ private:
             Mesh mesh = make_baked_uv_sphere_mesh("point_light_" + std::to_string(scene_.meshes.size()), mat, 0.035f, 12, 6);
             apply_transform(mesh, state_.transform);
             mesh.light.enabled = true;
-            mesh.light.double_sided = true;
+            mesh.light.double_sided = false;
             mesh.light.intensity = intensity;
             mesh.light.color = color / std::max(1.0e-6f, std::max({color.x, color.y, color.z}));
             scene_.meshes.push_back(std::move(mesh));
@@ -1021,6 +1033,9 @@ private:
     }
 
     void finish_mesh(Mesh& mesh) {
+        if (state_.reverse_orientation) {
+            reverse_mesh_orientation(mesh);
+        }
         mesh.material = state_.material;
         mesh.light = state_.area_light;
         append_mesh(current_object_, std::move(mesh));
@@ -1071,6 +1086,9 @@ private:
             Mesh mesh = source;
             mesh.name = name + "_" + std::to_string(scene_.meshes.size());
             apply_transform(mesh, state_.transform);
+            if (state_.reverse_orientation) {
+                reverse_mesh_orientation(mesh);
+            }
             scene_.meshes.push_back(std::move(mesh));
         }
     }
@@ -1107,10 +1125,11 @@ private:
         const Mat4 transform = state_.transform;
         const int material = state_.material;
         const LightComponent light = state_.area_light;
+        const bool reverse_orientation = state_.reverse_orientation;
         limit_pending_meshes();
         PendingMesh pending;
         pending.object = current_object_;
-        pending.future = std::async(std::launch::async, [path, filename, transform, material, light]() {
+        pending.future = std::async(std::launch::async, [path, filename, transform, material, light, reverse_orientation]() {
             MeshLoadResult result;
             result.mesh.name = std::filesystem::path(filename).stem().string();
             if (!load_ply_mesh(path, result.mesh, result.error)) {
@@ -1120,6 +1139,9 @@ private:
             result.mesh.material = material;
             result.mesh.light = light;
             apply_transform(result.mesh, transform);
+            if (reverse_orientation) {
+                reverse_mesh_orientation(result.mesh);
+            }
             return result;
         });
         pending_meshes_.push_back(std::move(pending));

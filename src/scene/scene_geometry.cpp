@@ -135,8 +135,8 @@ Mesh make_uv_sphere_mesh(const std::string& name, int material, Vec3 translation
             const uint32_t b = a + 1;
             const uint32_t c = static_cast<uint32_t>((y + 1) * (segments + 1) + x + 1);
             const uint32_t d = static_cast<uint32_t>((y + 1) * (segments + 1) + x);
-            scene_detail::add_triangle(mesh, a, d, b);
-            scene_detail::add_triangle(mesh, b, d, c);
+            scene_detail::add_triangle(mesh, a, b, d);
+            scene_detail::add_triangle(mesh, b, c, d);
         }
     }
     return mesh;

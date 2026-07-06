@@ -717,9 +717,13 @@ SceneLoadResult load_scene(const std::string& path) {
                 parse_float_token(remaining_tokens[1], roughness);
                 parse_float_token(remaining_tokens[2], metallic);
             }
-            roughness = brdf == BrdfModel::Dielectric
-                ? std::clamp(roughness, 1.0f, 3.0f)
-                : std::clamp(roughness, 0.02f, 1.0f);
+            if (brdf == BrdfModel::Dielectric) {
+                roughness = std::clamp(roughness, 1.0f, 3.0f);
+            } else if (brdf == BrdfModel::Conductor) {
+                roughness = std::clamp(roughness, 0.0f, 1.0f);
+            } else {
+                roughness = std::clamp(roughness, 0.02f, 1.0f);
+            }
             metallic = std::clamp(metallic, 0.0f, 1.0f);
 
             material_ids[material_name] = static_cast<int>(scene.materials.size());
@@ -859,6 +863,30 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!input) {
                 return fail("Invalid dielectric_properties at line " + std::to_string(line_number));
             }
+        } else if (tag == "conductor_properties") {
+            std::string material_name;
+            input >> material_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid conductor_properties material at line " + std::to_string(line_number));
+            }
+            auto* conductor = dynamic_cast<ConductorMaterial*>(scene.materials[static_cast<size_t>(index)].get());
+            if (!conductor) {
+                return fail("conductor_properties used on non-conductor material at line " + std::to_string(line_number));
+            }
+            input >> conductor->roughness
+                >> conductor->eta.x
+                >> conductor->eta.y
+                >> conductor->eta.z
+                >> conductor->k.x
+                >> conductor->k.y
+                >> conductor->k.z;
+            if (!input) {
+                return fail("Invalid conductor_properties at line " + std::to_string(line_number));
+            }
+            conductor->roughness = std::clamp(conductor->roughness, 0.0f, 1.0f);
+            conductor->eta = max(conductor->eta, Vec3{0.0f, 0.0f, 0.0f});
+            conductor->k = max(conductor->k, Vec3{0.0f, 0.0f, 0.0f});
         } else if (tag == "standard_surface") {
             std::string material_name;
             input >> material_name;
@@ -1203,6 +1231,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
             metallic = principled->metallic;
         } else if (const auto* dielectric = dynamic_cast<const DielectricMaterial*>(material.get())) {
             roughness = dielectric->ior;
+        } else if (const auto* conductor = dynamic_cast<const ConductorMaterial*>(material.get())) {
+            roughness = conductor->roughness;
         } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
             roughness = standard->roughness;
             metallic = standard->metalness;
@@ -1260,6 +1290,15 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
                     << dielectric->transmission_tint.y << ' '
                     << dielectric->transmission_tint.z << '\n';
             }
+        } else if (const auto* conductor = dynamic_cast<const ConductorMaterial*>(material.get())) {
+            output << "conductor_properties " << material->name << ' '
+                << conductor->roughness << ' '
+                << conductor->eta.x << ' '
+                << conductor->eta.y << ' '
+                << conductor->eta.z << ' '
+                << conductor->k.x << ' '
+                << conductor->k.y << ' '
+                << conductor->k.z << '\n';
         } else if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
             if (standard->specular_weight != 1.0f ||
                 standard->specular_ior != 1.5f ||
