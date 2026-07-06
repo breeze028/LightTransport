@@ -100,6 +100,7 @@ enum class EditorIcon {
     Cpu,
     Gpu,
     RenderedPreview,
+    MaterialPreview,
     SolidPreview,
     WireframePreview,
     Fullscreen,
@@ -140,6 +141,7 @@ const EditorIconInfo& editor_icon_info(EditorIcon icon) {
         {"C", nullptr},
         {"G", nullptr},
         {"R", nullptr},
+        {"M", nullptr},
         {"S", nullptr},
         {"W", nullptr},
         {"F", nullptr},
@@ -2529,6 +2531,17 @@ void draw_editor_icon(ImDrawList* draw_list, EditorIcon icon, ImVec2 min, ImVec2
         circle(0.50f, 0.50f, 0.32f, color);
         filled_circle(0.39f, 0.37f, 0.08f, ImGui::GetColorU32(ImVec4(0.88f, 0.94f, 1.0f, 0.92f)));
         break;
+    case EditorIcon::MaterialPreview:
+        filled_circle(0.50f, 0.50f, 0.32f, ImGui::GetColorU32(ImVec4(0.92f, 0.62f, 0.25f, 1.0f)));
+        draw_list->PathArcTo(p(0.50f, 0.50f), s * 0.32f, -2.70f, 0.35f, 18);
+        draw_list->PathLineTo(p(0.50f, 0.50f));
+        draw_list->PathFillConvex(ImGui::GetColorU32(ImVec4(0.25f, 0.42f, 0.78f, 1.0f)));
+        draw_list->PathArcTo(p(0.50f, 0.50f), s * 0.32f, 0.35f, 2.55f, 18);
+        draw_list->PathLineTo(p(0.50f, 0.50f));
+        draw_list->PathFillConvex(ImGui::GetColorU32(ImVec4(0.82f, 0.86f, 0.90f, 1.0f)));
+        circle(0.50f, 0.50f, 0.32f, color);
+        filled_circle(0.38f, 0.35f, 0.07f, ImGui::GetColorU32(ImVec4(1.0f, 0.96f, 0.78f, 0.95f)));
+        break;
     case EditorIcon::SolidPreview:
         filled_circle(0.50f, 0.50f, 0.32f, ImGui::GetColorU32(ImVec4(0.58f, 0.60f, 0.64f, 1.0f)));
         draw_list->PathArcTo(p(0.50f, 0.50f), s * 0.32f, -1.57f, 1.57f, 18);
@@ -3561,6 +3574,7 @@ void draw_viewport() {
 
     const bool realtime_preview =
         g_editor.viewport_preview_mode == ViewportPreviewMode::Solid ||
+        g_editor.viewport_preview_mode == ViewportPreviewMode::MaterialPreview ||
         g_editor.viewport_preview_mode == ViewportPreviewMode::Wireframe;
     bool handled_input_early = false;
 
@@ -3692,6 +3706,11 @@ void draw_viewport() {
         "Solid viewport preview",
         g_editor.viewport_preview_mode == ViewportPreviewMode::Solid,
         [&]() { set_viewport_preview_mode(ViewportPreviewMode::Solid); });
+    draw_overlay_icon_button(
+        EditorIcon::MaterialPreview,
+        "Material preview",
+        g_editor.viewport_preview_mode == ViewportPreviewMode::MaterialPreview,
+        [&]() { set_viewport_preview_mode(ViewportPreviewMode::MaterialPreview); });
     draw_overlay_icon_button(
         EditorIcon::RenderedPreview,
         "Rendered path tracer preview",
@@ -4277,6 +4296,7 @@ void draw_statistics_panel() {
         const char* mode_name = "Unknown";
         switch (g_editor.viewport_preview_mode) {
             case ViewportPreviewMode::Rendered:  mode_name = "Rendered"; break;
+            case ViewportPreviewMode::MaterialPreview: mode_name = "Material Preview"; break;
             case ViewportPreviewMode::Solid:     mode_name = "Solid"; break;
             case ViewportPreviewMode::Wireframe: mode_name = "Wireframe"; break;
         }

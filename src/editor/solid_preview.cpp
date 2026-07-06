@@ -29,6 +29,7 @@ cbuffer ConstantBuffer : register(b0) {
 struct VSInput {
     float3 position : POSITION;
     float3 normal   : NORMAL;
+    float2 uv       : TEXCOORD0;
     uint object_id   : TEXCOORD1;
 };
 
@@ -81,6 +82,7 @@ cbuffer ConstantBuffer : register(b0) {
 struct VSInput {
     float3 position : POSITION;
     float3 normal   : NORMAL;
+    float2 uv       : TEXCOORD0;
     uint object_id   : TEXCOORD1;
 };
 
@@ -112,6 +114,7 @@ cbuffer ConstantBuffer : register(b0) {
 struct VSInput {
     float3 position : POSITION;
     float3 normal   : NORMAL;
+    float2 uv       : TEXCOORD0;
     uint object_id   : TEXCOORD1;
 };
 
@@ -137,6 +140,115 @@ uint SelectedPSMain(PSInput input) : SV_Target {
         discard;
     }
     return input.object_id;
+}
+)";
+
+static const char* kMaterialPreviewShaderSource = R"(
+cbuffer ConstantBuffer : register(b0) {
+    row_major float4x4 view_proj;
+    float4 camera_pos;
+    float4 light_dir;
+    float4 ambient_color;
+    float4 clay_color;
+    float4 selection_params;
+};
+
+cbuffer MaterialBuffer : register(b1) {
+    float4 base_color;
+    float4 emission;
+    float4 material_params; // roughness, metallic, alpha, flags
+};
+
+Texture2D base_color_tx : register(t0);
+SamplerState base_color_sampler : register(s0);
+
+struct VSInput {
+    float3 position : POSITION;
+    float3 normal   : NORMAL;
+    float2 uv       : TEXCOORD0;
+    uint object_id   : TEXCOORD1;
+};
+
+struct PSInput {
+    float4 position : SV_POSITION;
+    float3 normal   : NORMAL;
+    float3 world_pos : TEXCOORD0;
+    float2 uv        : TEXCOORD2;
+};
+
+PSInput VSMain(VSInput input) {
+    PSInput output;
+    output.position = mul(float4(input.position, 1.0f), view_proj);
+    output.normal = normalize(input.normal);
+    output.world_pos = input.position;
+    output.uv = input.uv;
+    return output;
+}
+
+float distribution_ggx(float ndoth, float roughness) {
+    float a = max(roughness * roughness, 0.02f);
+    float a2 = a * a;
+    float d = ndoth * ndoth * (a2 - 1.0f) + 1.0f;
+    return a2 / max(3.14159265f * d * d, 0.0001f);
+}
+
+float geometry_schlick_ggx(float ndotv, float roughness) {
+    float r = roughness + 1.0f;
+    float k = (r * r) * 0.125f;
+    return ndotv / max(ndotv * (1.0f - k) + k, 0.0001f);
+}
+
+float3 fresnel_schlick(float cos_theta, float3 f0) {
+    return f0 + (1.0f - f0) * pow(saturate(1.0f - cos_theta), 5.0f);
+}
+
+float3 shade_light(float3 base, float3 N, float3 V, float3 L, float3 light_color, float roughness, float metallic) {
+    float3 H = normalize(V + L);
+    float ndotl = saturate(dot(N, L));
+    float ndotv = saturate(dot(N, V));
+    float ndoth = saturate(dot(N, H));
+    float hdotv = saturate(dot(H, V));
+    float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), base, metallic);
+    float3 F = fresnel_schlick(hdotv, f0);
+    float D = distribution_ggx(ndoth, roughness);
+    float G = geometry_schlick_ggx(ndotv, roughness) * geometry_schlick_ggx(ndotl, roughness);
+    float3 spec = (D * G * F) / max(4.0f * ndotv * ndotl, 0.0001f);
+    float3 diffuse = (1.0f - F) * base * (1.0f - metallic) * 0.31830989f;
+    return (diffuse + spec) * light_color * ndotl;
+}
+
+float4 PSMain(PSInput input) : SV_TARGET {
+    float texture_enabled = material_params.w;
+    float4 texel = lerp(float4(1.0f, 1.0f, 1.0f, 1.0f), base_color_tx.Sample(base_color_sampler, input.uv), texture_enabled);
+    float3 base = saturate(base_color.rgb * texel.rgb);
+    float roughness = saturate(material_params.x);
+    float metallic = saturate(material_params.y);
+    float alpha = saturate(material_params.z * texel.a);
+
+    float3 N = normalize(input.normal);
+    float3 V = normalize(camera_pos.xyz - input.world_pos);
+    if (dot(N, V) < 0.0f) {
+        N = -N;
+    }
+
+    float3 forward = normalize(light_dir.xyz);
+    float3 key = normalize(forward);
+    float3 fill = normalize(float3(-forward.x, abs(forward.y) + 0.35f, -forward.z * 0.35f));
+    float3 rim = normalize(-V + float3(0.0f, 0.65f, 0.0f));
+
+    float3 color = base * ambient_color.rgb * 0.75f;
+    color += shade_light(base, N, V, key, float3(1.28f, 1.20f, 1.05f), roughness, metallic);
+    color += shade_light(base, N, V, fill, float3(0.34f, 0.42f, 0.58f), roughness, metallic) * 0.55f;
+
+    float rim_amount = pow(saturate(dot(N, rim)), 2.0f) * 0.16f;
+    color += rim_amount * float3(0.90f, 0.96f, 1.0f);
+
+    float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), base, metallic);
+    color += f0 * lerp(0.05f, 0.20f, 1.0f - roughness);
+    color += emission.rgb;
+    color = color / (color + 1.0f);
+    color = pow(max(color, 0.0f), 1.0f / 2.2f);
+    return float4(color, max(alpha, 0.20f));
 }
 )";
 
@@ -298,6 +410,7 @@ bool compile_shader(const char* source, size_t source_len, const char* entry,
 int create_solid_shaders(SolidPreview& sp) {
     ID3DBlob* vs_blob = nullptr;
     ID3DBlob* ps_blob = nullptr;
+    ID3DBlob* material_ps_blob = nullptr;
     ID3DBlob* wire_vs_blob = nullptr;
     ID3DBlob* wire_ps_blob = nullptr;
     ID3DBlob* id_vs_blob = nullptr;
@@ -308,37 +421,44 @@ int create_solid_shaders(SolidPreview& sp) {
     int ok = 0;
 
     size_t solid_len = std::strlen(kSolidShaderSource);
+    size_t material_len = std::strlen(kMaterialPreviewShaderSource);
     size_t wire_len = std::strlen(kWireShaderSource);
     size_t object_id_len = std::strlen(kObjectIdShaderSource);
     size_t outline_len = std::strlen(kOutlineShaderSource);
 
     if (!compile_shader(kSolidShaderSource, solid_len, "VSMain", "vs_5_0", &vs_blob)) return ok;
     if (!compile_shader(kSolidShaderSource, solid_len, "PSMain", "ps_5_0", &ps_blob)) { vs_blob->Release(); return ok; }
-    if (!compile_shader(kWireShaderSource, wire_len, "VSMain", "vs_5_0", &wire_vs_blob)) { vs_blob->Release(); ps_blob->Release(); return ok; }
+    if (!compile_shader(kMaterialPreviewShaderSource, material_len, "PSMain", "ps_5_0", &material_ps_blob)) {
+        vs_blob->Release(); ps_blob->Release(); return ok;
+    }
+    if (!compile_shader(kWireShaderSource, wire_len, "VSMain", "vs_5_0", &wire_vs_blob)) {
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); return ok;
+    }
     if (!compile_shader(kWireShaderSource, wire_len, "PSMain", "ps_5_0", &wire_ps_blob)) {
-        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); return ok;
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); return ok;
     }
     if (!compile_shader(kObjectIdShaderSource, object_id_len, "VSMain", "vs_5_0", &id_vs_blob)) {
-        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); return ok;
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); return ok;
     }
     if (!compile_shader(kObjectIdShaderSource, object_id_len, "PSMain", "ps_5_0", &id_ps_blob)) {
-        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); return ok;
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); return ok;
     }
     if (!compile_shader(kObjectIdShaderSource, object_id_len, "SelectedPSMain", "ps_5_0", &selected_id_ps_blob)) {
-        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); id_ps_blob->Release(); return ok;
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); id_ps_blob->Release(); return ok;
     }
     if (!compile_shader(kOutlineShaderSource, outline_len, "VSMain", "vs_5_0", &outline_vs_blob)) {
-        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
         id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); return ok;
     }
     if (!compile_shader(kOutlineShaderSource, outline_len, "PSMain", "ps_5_0", &outline_ps_blob)) {
-        vs_blob->Release(); ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
         id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); outline_vs_blob->Release(); return ok;
     }
 
     do {
         if (g_device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &sp.vs) != S_OK) break;
         if (g_device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &sp.ps) != S_OK) break;
+        if (g_device->CreatePixelShader(material_ps_blob->GetBufferPointer(), material_ps_blob->GetBufferSize(), nullptr, &sp.material_ps) != S_OK) break;
         if (g_device->CreateVertexShader(wire_vs_blob->GetBufferPointer(), wire_vs_blob->GetBufferSize(), nullptr, &sp.wire_vs) != S_OK) break;
         if (g_device->CreatePixelShader(wire_ps_blob->GetBufferPointer(), wire_ps_blob->GetBufferSize(), nullptr, &sp.wire_ps) != S_OK) break;
         if (g_device->CreateVertexShader(id_vs_blob->GetBufferPointer(), id_vs_blob->GetBufferSize(), nullptr, &sp.id_vs) != S_OK) break;
@@ -350,15 +470,17 @@ int create_solid_shaders(SolidPreview& sp) {
         D3D11_INPUT_ELEMENT_DESC layout[] = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 1, DXGI_FORMAT_R32_UINT,       0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,   0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 1, DXGI_FORMAT_R32_UINT,       0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
         };
-        if (g_device->CreateInputLayout(layout, 3, id_vs_blob->GetBufferPointer(), id_vs_blob->GetBufferSize(), &sp.input_layout) != S_OK) break;
+        if (g_device->CreateInputLayout(layout, 4, id_vs_blob->GetBufferPointer(), id_vs_blob->GetBufferSize(), &sp.input_layout) != S_OK) break;
 
         ok = 1;
     } while (false);
 
     vs_blob->Release();
     ps_blob->Release();
+    material_ps_blob->Release();
     wire_vs_blob->Release();
     wire_ps_blob->Release();
     id_vs_blob->Release();
@@ -397,6 +519,26 @@ void create_solid_states(SolidPreview& sp) {
     // Wire depth/stencil: test on, write off
     ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     g_device->CreateDepthStencilState(&ds_desc, &sp.wire_depth_state);
+
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampler_desc.MaxAnisotropy = 1;
+    sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sampler_desc.MinLOD = 0.0f;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    g_device->CreateSamplerState(&sampler_desc, &sp.material_sampler);
+}
+
+void release_material_preview_textures(SolidPreview& sp) {
+    for (MaterialPreviewTexture& texture : sp.material_textures) {
+        if (texture.srv) { texture.srv->Release(); texture.srv = nullptr; }
+        if (texture.texture) { texture.texture->Release(); texture.texture = nullptr; }
+        texture.source = nullptr;
+    }
+    sp.material_textures.clear();
 }
 
 void release_render_targets(SolidPreview& sp) {
@@ -549,7 +691,7 @@ GenCount generate_sphere_geometry(std::vector<SolidPreviewVertex>& verts,
                 c.z + r * sin_theta * std::sin(phi),
             };
             const lt::Vec3 n = lt::normalize(pos - c);
-            verts.push_back({pos.x, pos.y, pos.z, n.x, n.y, n.z, object_id});
+            verts.push_back({pos.x, pos.y, pos.z, n.x, n.y, n.z, u, v, object_id});
         }
     }
 
@@ -581,17 +723,145 @@ uint32_t ensure_selection_id(SolidPreview& sp,
     return id;
 }
 
-void append_draw_range(SolidPreview& sp, uint32_t object_id, UINT start_index, UINT index_count) {
+void append_draw_range(SolidPreview& sp, uint32_t object_id, int material_index, UINT start_index, UINT index_count) {
     if (object_id == 0 || index_count == 0) return;
     if (!sp.draw_ranges.empty()) {
         SolidDrawRange& previous = sp.draw_ranges.back();
         if (previous.object_id == object_id &&
+            previous.material_index == material_index &&
             previous.start_index + previous.index_count == start_index) {
             previous.index_count += index_count;
             return;
         }
     }
-    sp.draw_ranges.push_back({object_id, start_index, index_count});
+    sp.draw_ranges.push_back({object_id, material_index, start_index, index_count});
+}
+
+float clamp01(float v) {
+    return std::max(0.0f, std::min(1.0f, v));
+}
+
+lt::Vec3 conductor_f0(const lt::Vec3& eta, const lt::Vec3& k) {
+    auto channel = [](float e, float kk) {
+        const float e2 = e * e;
+        const float k2 = kk * kk;
+        return ((e - 1.0f) * (e - 1.0f) + k2) / std::max((e + 1.0f) * (e + 1.0f) + k2, 0.0001f);
+    };
+    return {channel(eta.x, k.x), channel(eta.y, k.y), channel(eta.z, k.z)};
+}
+
+MaterialPreviewData pack_material_preview_data(const std::shared_ptr<lt::Material>& material) {
+    MaterialPreviewData data{};
+    if (!material) return data;
+
+    lt::Vec3 base = material->albedo;
+    lt::Vec3 emission = material->emission;
+    float roughness = 0.9f;
+    float metallic = 0.0f;
+
+    switch (material->model()) {
+    case lt::BrdfModel::Principled:
+        if (const auto* principled = dynamic_cast<const lt::PrincipledMaterial*>(material.get())) {
+            roughness = principled->roughness;
+            metallic = principled->metallic;
+        }
+        break;
+    case lt::BrdfModel::Mirror:
+        roughness = 0.02f;
+        metallic = 1.0f;
+        break;
+    case lt::BrdfModel::Dielectric:
+        roughness = 0.04f;
+        metallic = 0.0f;
+        base = base * 0.82f + lt::Vec3{0.18f, 0.22f, 0.28f};
+        break;
+    case lt::BrdfModel::Conductor:
+        if (const auto* conductor = dynamic_cast<const lt::ConductorMaterial*>(material.get())) {
+            roughness = conductor->roughness;
+            base = conductor_f0(conductor->eta, conductor->k) * material->albedo;
+        }
+        metallic = 1.0f;
+        break;
+    case lt::BrdfModel::StandardSurface:
+        if (const auto* standard = dynamic_cast<const lt::StandardSurfaceMaterial*>(material.get())) {
+            roughness = standard->roughness;
+            metallic = standard->metalness;
+            base = material->albedo;
+        }
+        break;
+    case lt::BrdfModel::Lambertian:
+    default:
+        break;
+    }
+
+    data.base_color[0] = clamp01(base.x);
+    data.base_color[1] = clamp01(base.y);
+    data.base_color[2] = clamp01(base.z);
+    data.base_color[3] = clamp01(material->alpha);
+    data.emission[0] = std::max(0.0f, emission.x);
+    data.emission[1] = std::max(0.0f, emission.y);
+    data.emission[2] = std::max(0.0f, emission.z);
+    data.emission[3] = 0.0f;
+    data.params[0] = std::max(0.02f, std::min(1.0f, roughness));
+    data.params[1] = clamp01(metallic);
+    data.params[2] = clamp01(material->alpha);
+    data.params[3] = material->albedo_texture ? 1.0f : 0.0f;
+    return data;
+}
+
+bool upload_material_texture(const lt::Texture& source, MaterialPreviewTexture& target) {
+    if (source.width <= 0 || source.height <= 0 || source.pixels.empty()) return false;
+
+    std::vector<float> pixels(static_cast<size_t>(source.width) * static_cast<size_t>(source.height) * 4u, 1.0f);
+    const size_t count = std::min(source.pixels.size(), static_cast<size_t>(source.width) * static_cast<size_t>(source.height));
+    for (size_t i = 0; i < count; ++i) {
+        pixels[i * 4u + 0u] = std::max(0.0f, source.pixels[i].x);
+        pixels[i * 4u + 1u] = std::max(0.0f, source.pixels[i].y);
+        pixels[i * 4u + 2u] = std::max(0.0f, source.pixels[i].z);
+        pixels[i * 4u + 3u] = i < source.alpha.size() ? clamp01(source.alpha[i]) : 1.0f;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = static_cast<UINT>(source.width);
+    desc.Height = static_cast<UINT>(source.height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA data{};
+    data.pSysMem = pixels.data();
+    data.SysMemPitch = static_cast<UINT>(source.width * sizeof(float) * 4u);
+    if (g_device->CreateTexture2D(&desc, &data, &target.texture) != S_OK) return false;
+    if (g_device->CreateShaderResourceView(target.texture, nullptr, &target.srv) != S_OK) {
+        target.texture->Release();
+        target.texture = nullptr;
+        return false;
+    }
+    target.source = &source;
+    return true;
+}
+
+void build_material_preview_resources(SolidPreview& sp, const lt::Scene& scene) {
+    release_material_preview_textures(sp);
+    sp.material_data.clear();
+    sp.material_data.reserve(scene.materials.size());
+    sp.material_textures.resize(scene.materials.size());
+
+    for (size_t i = 0; i < scene.materials.size(); ++i) {
+        const std::shared_ptr<lt::Material>& material = scene.materials[i];
+        sp.material_data.push_back(pack_material_preview_data(material));
+        if (material && material->albedo_texture) {
+            MaterialPreviewTexture& texture = sp.material_textures[i];
+            if (!upload_material_texture(*material->albedo_texture, texture)) {
+                sp.material_data.back().params[3] = 0.0f;
+            }
+        } else {
+            sp.material_data.back().params[3] = 0.0f;
+        }
+    }
 }
 
 void build_buffer_from_scene(SolidPreview& sp, const lt::Scene& scene) {
@@ -616,13 +886,13 @@ void build_buffer_from_scene(SolidPreview& sp, const lt::Scene& scene) {
         const uint32_t base = static_cast<uint32_t>(verts.size());
         const uint32_t object_id = ensure_selection_id(sp, mesh_ids, triangle.mesh, SelectionKind::Mesh);
         const UINT range_start = static_cast<UINT>(indices.size());
-        verts.push_back({triangle.v0.x, triangle.v0.y, triangle.v0.z, triangle.n0.x, triangle.n0.y, triangle.n0.z, object_id});
-        verts.push_back({triangle.v1.x, triangle.v1.y, triangle.v1.z, triangle.n1.x, triangle.n1.y, triangle.n1.z, object_id});
-        verts.push_back({triangle.v2.x, triangle.v2.y, triangle.v2.z, triangle.n2.x, triangle.n2.y, triangle.n2.z, object_id});
+        verts.push_back({triangle.v0.x, triangle.v0.y, triangle.v0.z, triangle.n0.x, triangle.n0.y, triangle.n0.z, triangle.uv0.x, triangle.uv0.y, object_id});
+        verts.push_back({triangle.v1.x, triangle.v1.y, triangle.v1.z, triangle.n1.x, triangle.n1.y, triangle.n1.z, triangle.uv1.x, triangle.uv1.y, object_id});
+        verts.push_back({triangle.v2.x, triangle.v2.y, triangle.v2.z, triangle.n2.x, triangle.n2.y, triangle.n2.z, triangle.uv2.x, triangle.uv2.y, object_id});
         indices.push_back(base);
         indices.push_back(base + 1);
         indices.push_back(base + 2);
-        append_draw_range(sp, object_id, range_start, 3);
+        append_draw_range(sp, object_id, triangle.material, range_start, 3);
     }
 
     for (const lt::RenderSphere& sphere : render_scene.spheres) {
@@ -633,7 +903,7 @@ void build_buffer_from_scene(SolidPreview& sp, const lt::Scene& scene) {
         const uint32_t object_id = ensure_selection_id(sp, sphere_ids, sphere.sphere, SelectionKind::Sphere);
         const UINT range_start = static_cast<UINT>(indices.size());
         const GenCount count = generate_sphere_geometry(verts, indices, preview_sphere, object_id);
-        append_draw_range(sp, object_id, range_start, static_cast<UINT>(count.indices));
+        append_draw_range(sp, object_id, sphere.material, range_start, static_cast<UINT>(count.indices));
     }
 
     if (verts.empty() || indices.empty()) return;
@@ -665,13 +935,22 @@ void build_buffer_from_scene(SolidPreview& sp, const lt::Scene& scene) {
 }
 
 void build_constant_buffer(SolidPreview& sp) {
-    if (sp.cb) return;
-    D3D11_BUFFER_DESC desc{};
-    desc.ByteWidth = sizeof(SolidConstantBuffer);
-    desc.Usage = D3D11_USAGE_DYNAMIC;
-    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    g_device->CreateBuffer(&desc, nullptr, &sp.cb);
+    if (!sp.cb) {
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = sizeof(SolidConstantBuffer);
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        g_device->CreateBuffer(&desc, nullptr, &sp.cb);
+    }
+    if (!sp.material_cb) {
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = sizeof(MaterialPreviewData);
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        g_device->CreateBuffer(&desc, nullptr, &sp.material_cb);
+    }
 }
 
 bool upload_solid_constants(SolidPreview& sp,
@@ -752,6 +1031,27 @@ bool upload_solid_constants(SolidPreview& sp,
     std::memcpy(mapped.pData, &cb_data, sizeof(cb_data));
     g_context->Unmap(sp.cb, 0);
     return true;
+}
+
+bool upload_material_preview_constants(SolidPreview& sp, int material_index) {
+    if (!sp.material_cb) return false;
+    MaterialPreviewData data{};
+    if (material_index >= 0 && material_index < static_cast<int>(sp.material_data.size())) {
+        data = sp.material_data[static_cast<size_t>(material_index)];
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (g_context->Map(sp.material_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped) != S_OK) {
+        return false;
+    }
+    std::memcpy(mapped.pData, &data, sizeof(data));
+    g_context->Unmap(sp.material_cb, 0);
+    return true;
+}
+
+ID3D11ShaderResourceView* material_preview_srv(SolidPreview& sp, int material_index) {
+    if (material_index < 0 || material_index >= static_cast<int>(sp.material_textures.size())) return nullptr;
+    return sp.material_textures[static_cast<size_t>(material_index)].srv;
 }
 
 uint32_t find_selection_id(const SolidPreview& sp, SelectionKind kind, int object_index) {
@@ -931,11 +1231,14 @@ void init_solid_preview(SolidPreview& sp) {
 
 void release_solid_preview(SolidPreview& sp) {
     release_render_targets(sp);
+    release_material_preview_textures(sp);
     if (sp.vb) { sp.vb->Release(); sp.vb = nullptr; }
     if (sp.ib) { sp.ib->Release(); sp.ib = nullptr; }
     if (sp.cb) { sp.cb->Release(); sp.cb = nullptr; }
+    if (sp.material_cb) { sp.material_cb->Release(); sp.material_cb = nullptr; }
     if (sp.vs) { sp.vs->Release(); sp.vs = nullptr; }
     if (sp.ps) { sp.ps->Release(); sp.ps = nullptr; }
+    if (sp.material_ps) { sp.material_ps->Release(); sp.material_ps = nullptr; }
     if (sp.input_layout) { sp.input_layout->Release(); sp.input_layout = nullptr; }
     if (sp.wire_vs) { sp.wire_vs->Release(); sp.wire_vs = nullptr; }
     if (sp.wire_ps) { sp.wire_ps->Release(); sp.wire_ps = nullptr; }
@@ -948,6 +1251,7 @@ void release_solid_preview(SolidPreview& sp) {
     if (sp.solid_rasterizer) { sp.solid_rasterizer->Release(); sp.solid_rasterizer = nullptr; }
     if (sp.solid_depth_state) { sp.solid_depth_state->Release(); sp.solid_depth_state = nullptr; }
     if (sp.wire_depth_state) { sp.wire_depth_state->Release(); sp.wire_depth_state = nullptr; }
+    if (sp.material_sampler) { sp.material_sampler->Release(); sp.material_sampler = nullptr; }
     sp = {};
 }
 
@@ -1021,6 +1325,10 @@ void update_solid_preview_buffers(SolidPreview& sp, const Scene& scene) {
         sp.scene_generation = g_editor.render_generation;
         sp.geometry_generation = g_editor.geometry_generation;
     }
+    if (sp.material_generation != g_editor.content_generation || sp.material_data.size() != scene.materials.size()) {
+        build_material_preview_resources(sp, scene);
+        sp.material_generation = g_editor.content_generation;
+    }
 }
 
 void render_solid_preview(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size, ViewportPreviewMode mode) {
@@ -1072,6 +1380,20 @@ void render_solid_preview(SolidPreview& sp, const Scene& scene, ImVec2 viewport_
         g_context->VSSetShader(sp.wire_vs, nullptr, 0);
         g_context->PSSetShader(sp.wire_ps, nullptr, 0);
         g_context->DrawIndexed(sp.index_count, 0, 0);
+    } else if (mode == ViewportPreviewMode::MaterialPreview && sp.material_ps && sp.material_cb) {
+        g_context->RSSetState(sp.solid_rasterizer);
+        g_context->VSSetShader(sp.vs, nullptr, 0);
+        g_context->PSSetShader(sp.material_ps, nullptr, 0);
+        g_context->PSSetConstantBuffers(1, 1, &sp.material_cb);
+        g_context->PSSetSamplers(0, 1, &sp.material_sampler);
+        for (const SolidDrawRange& range : sp.draw_ranges) {
+            if (!upload_material_preview_constants(sp, range.material_index)) continue;
+            ID3D11ShaderResourceView* srv = material_preview_srv(sp, range.material_index);
+            g_context->PSSetShaderResources(0, 1, &srv);
+            g_context->DrawIndexed(range.index_count, range.start_index, 0);
+        }
+        ID3D11ShaderResourceView* null_srv = nullptr;
+        g_context->PSSetShaderResources(0, 1, &null_srv);
     } else {
         g_context->RSSetState(sp.solid_rasterizer);
         g_context->VSSetShader(sp.vs, nullptr, 0);

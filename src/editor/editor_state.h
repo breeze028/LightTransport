@@ -20,7 +20,7 @@ enum class ToolMode { Select, Move, Rotate, Scale };
 enum class TransformSpace { Local, World };
 enum class GizmoHandle { None, AxisX, AxisY, AxisZ, PlaneXY, PlaneYZ, PlaneZX, Uniform };
 enum class SelectionKind { None, Mesh, Sphere };
-enum class ViewportPreviewMode { Rendered, Solid, Wireframe };
+enum class ViewportPreviewMode { Rendered, MaterialPreview, Solid, Wireframe };
 
 struct GpuPreview {
     ID3D11Texture2D* texture = nullptr;
