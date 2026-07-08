@@ -113,6 +113,10 @@ float principled_specular_probability(float metallic) {
     return std::clamp(0.25f + 0.75f * metallic, 0.25f, 1.0f);
 }
 
+float max_channel(Vec3 v) {
+    return std::max({v.x, v.y, v.z});
+}
+
 Vec2 transform_material_uv(const MaterialInput& input, Vec2 uv) {
     uv.x *= input.transform.scale.x;
     uv.y *= input.transform.scale.y;
@@ -263,6 +267,55 @@ MaterialSample LambertianMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& r
     result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), n));
     result.pdf = pdf(n, wo, result.direction, uv);
     const float ndotl = std::max(0.0f, dot(n, result.direction));
+    result.weight = result.pdf > 0.0f ? evaluate(n, wo, result.direction, uv) * (ndotl / result.pdf) : Vec3{};
+    return result;
+}
+
+Vec3 DiffuseTransmissionMaterial::transmittance_color(Vec2 uv) const {
+    return transmittance * (transmittance_texture ? transmittance_texture->sample(uv) : Vec3{1.0f});
+}
+
+float DiffuseTransmissionMaterial::transmission(Vec2 uv) const {
+    return std::clamp(max_channel(transmittance_color(uv)), 0.0f, 1.0f);
+}
+
+Vec3 DiffuseTransmissionMaterial::evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotv = dot(n, wo);
+    const float ndotl = dot(n, wi);
+    if (ndotv == 0.0f || ndotl == 0.0f) {
+        return {};
+    }
+    return ndotv * ndotl > 0.0f ? base_color(uv) / kPi : transmittance_color(uv) / kPi;
+}
+
+float DiffuseTransmissionMaterial::pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const {
+    const float ndotv = dot(n, wo);
+    const float ndotl = dot(n, wi);
+    if (ndotv == 0.0f || ndotl == 0.0f) {
+        return 0.0f;
+    }
+    const float reflect_weight = max_channel(base_color(uv));
+    const float transmit_weight = max_channel(transmittance_color(uv));
+    const float sum = reflect_weight + transmit_weight;
+    const float transmit_prob = sum > 0.0f ? transmit_weight / sum : 0.5f;
+    const bool transmission_lobe = ndotv * ndotl < 0.0f;
+    const float lobe_prob = transmission_lobe ? transmit_prob : 1.0f - transmit_prob;
+    return lobe_prob * std::fabs(ndotl) / kPi;
+}
+
+MaterialSample DiffuseTransmissionMaterial::sample(Vec3 n, Vec3 wo, Vec2 uv, bool, Rng& rng) const {
+    MaterialSample result;
+    const Vec3 reflectance = base_color(uv);
+    const float reflect_weight = max_channel(reflectance);
+    const float transmit_weight = max_channel(transmittance_color(uv));
+    const float sum = reflect_weight + transmit_weight;
+    const float transmit_prob = sum > 0.0f ? transmit_weight / sum : 0.5f;
+    const Vec3 facing_n = dot(n, wo) >= 0.0f ? n : -n;
+    const bool sample_transmission = rng.next_float() < transmit_prob;
+    const Vec3 sample_n = sample_transmission ? -facing_n : facing_n;
+    result.direction = normalize(to_world(cosine_sample_hemisphere(rng.next_float(), rng.next_float()), sample_n));
+    result.pdf = pdf(n, wo, result.direction, uv);
+    const float ndotl = std::fabs(dot(n, result.direction));
     result.weight = result.pdf > 0.0f ? evaluate(n, wo, result.direction, uv) * (ndotl / result.pdf) : Vec3{};
     return result;
 }
@@ -563,6 +616,9 @@ std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, Br
     if (model == BrdfModel::StandardSurface) {
         return std::make_shared<StandardSurfaceMaterial>(name, albedo, std::clamp(roughness, 0.02f, 1.0f), std::clamp(metallic, 0.0f, 1.0f));
     }
+    if (model == BrdfModel::DiffuseTransmission) {
+        return std::make_shared<DiffuseTransmissionMaterial>(name, albedo, Vec3{std::clamp(metallic, 0.0f, 1.0f)});
+    }
     if (model == BrdfModel::Principled) {
         return std::make_shared<PrincipledMaterial>(name, albedo, std::clamp(roughness, 0.02f, 1.0f), std::clamp(metallic, 0.0f, 1.0f));
     }
@@ -580,6 +636,7 @@ std::shared_ptr<Material> make_material(const std::string& name, Vec3 albedo, Br
 
 BrdfModel parse_brdf_model(const std::string& name) {
     if (name == "standard_surface" || name == "standard-surface" || name == "openpbr" || name == "open_pbr") return BrdfModel::StandardSurface;
+    if (name == "diffuse_transmission" || name == "diffuse-transmission" || name == "diffusetransmission") return BrdfModel::DiffuseTransmission;
     if (name == "principled" || name == "cook_torrance" || name == "cook-torrance" || name == "ggx") return BrdfModel::Principled;
     if (name == "mirror" || name == "specular") return BrdfModel::Mirror;
     if (name == "dielectric" || name == "glass") return BrdfModel::Dielectric;

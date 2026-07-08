@@ -208,7 +208,8 @@ Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scen
                 const float dist = std::sqrt(dist2);
                 const Vec3 light_dir = to_light / dist;
                 const float ndotl_raw = dot(hit.normal, light_dir);
-                const float ndotl = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
+                const bool diffuse_transmission = material.model() == BrdfModel::DiffuseTransmission;
+                const float ndotl = (material.double_sided || diffuse_transmission) ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
                 const bool has_mesh_emission = has_light_emission(light_emission(scene, light.mesh));
                 const bool material_emissive_double_sided = !has_mesh_emission &&
                     light.material >= 0 && light.material < static_cast<int>(scene.materials.size()) &&
@@ -266,7 +267,8 @@ Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scen
         }
         const Vec3 light_dir = normalize(light.direction);
         const float ndotl_raw = dot(hit.normal, light_dir);
-        const float ndotl = material.double_sided ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
+        const bool diffuse_transmission = material.model() == BrdfModel::DiffuseTransmission;
+        const float ndotl = (material.double_sided || diffuse_transmission) ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
         if (ndotl <= 0.0f) {
             continue;
         }

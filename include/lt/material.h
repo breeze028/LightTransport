@@ -16,6 +16,7 @@ enum class BrdfModel {
     Dielectric = 3,
     Conductor = 4,
     StandardSurface = 5,
+    DiffuseTransmission = 6,
 };
 
 enum class AlphaMode {
@@ -138,6 +139,25 @@ public:
     float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
     MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
     std::shared_ptr<Material> clone() const override { return std::make_shared<LambertianMaterial>(*this); }
+};
+
+class DiffuseTransmissionMaterial final : public Material {
+public:
+    Vec3 transmittance = {0.5f, 0.5f, 0.5f};
+    std::shared_ptr<Texture> transmittance_texture;
+
+    DiffuseTransmissionMaterial() = default;
+    DiffuseTransmissionMaterial(std::string name_, Vec3 reflectance_, Vec3 transmittance_)
+        : Material(std::move(name_), reflectance_), transmittance(transmittance_) {}
+
+    BrdfModel model() const override { return BrdfModel::DiffuseTransmission; }
+    const char* model_name() const override { return "diffuse_transmission"; }
+    Vec3 transmittance_color(Vec2 uv) const;
+    float transmission(Vec2 uv) const override;
+    Vec3 evaluate(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
+    float pdf(Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) const override;
+    MaterialSample sample(Vec3 n, Vec3 wo, Vec2 uv, bool front_face, Rng& rng) const override;
+    std::shared_ptr<Material> clone() const override { return std::make_shared<DiffuseTransmissionMaterial>(*this); }
 };
 
 class PrincipledMaterial final : public Material {

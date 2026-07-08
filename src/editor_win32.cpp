@@ -2979,7 +2979,7 @@ void draw_properties() {
                         material_system.materialx_available ? "on" : "fallback",
                         material_system.openimageio_available ? "on" : "fallback",
                         material_system.opencolorio_available ? "on" : "fallback");
-                    const char* models[] = {"Lambertian", "Principled", "Mirror", "Dielectric", "Conductor", "Standard Surface"};
+                    const char* models[] = {"Lambertian", "Principled", "Mirror", "Dielectric", "Conductor", "Standard Surface", "Diffuse Transmission"};
                     int model = static_cast<int>(material->model());
                     if (ImGui::Combo("BRDF", &model, models, IM_ARRAYSIZE(models))) {
                         const std::string name = material->name;

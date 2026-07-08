@@ -87,6 +87,9 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
             transmission = 1.0f;
             specular_ior = dielectric->ior;
             transmission_tint = dielectric->transmission_tint;
+        } else if (const auto* diffuse_transmission = dynamic_cast<const DiffuseTransmissionMaterial*>(material.get())) {
+            transmission_tint = diffuse_transmission->transmittance;
+            transmission = std::clamp(std::max(transmission_tint.x, std::max(transmission_tint.y, transmission_tint.z)), 0.0f, 1.0f);
         } else if (const auto* conductor = dynamic_cast<const ConductorMaterial*>(material.get())) {
             roughness = conductor->roughness;
             conductor_eta = conductor->eta;
@@ -156,6 +159,8 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
             clearcoat_texture_index = find_texture_index(standard->coat_input.texture);
             clearcoat_roughness_texture_index = find_texture_index(standard->coat_roughness_input.texture);
             transmission_texture_index = find_texture_index(standard->transmission_input.texture);
+        } else if (const auto* diffuse_transmission = dynamic_cast<const DiffuseTransmissionMaterial*>(material.get())) {
+            transmission_texture_index = find_texture_index(diffuse_transmission->transmittance_texture);
         }
         if (material->normal_texture) {
             for (int t = 0; t < gpu.texture_count; ++t) {

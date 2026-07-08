@@ -232,7 +232,18 @@ __device__ float material_clearcoat_roughness_gpu(const GpuScene& scene, const G
     return dclamp(material.clearcoat_roughness * sample_texture_gpu(scene, material.clearcoat_roughness_texture_index, uv).y, 0.02f, 1.0f);
 }
 
+__device__ float max_channel_gpu(Vec3 v) {
+    return fmaxf(v.x, fmaxf(v.y, v.z));
+}
+
+__device__ Vec3 material_transmission_color_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    return mul(material.transmission_tint, sample_texture_gpu(scene, material.transmission_texture_index, uv));
+}
+
 __device__ float material_transmission_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission)) {
+        return dclamp(max_channel_gpu(material_transmission_color_gpu(scene, material, uv)), 0.0f, 1.0f);
+    }
     return dclamp(material.transmission * sample_texture_gpu(scene, material.transmission_texture_index, uv).x, 0.0f, 1.0f);
 }
 
@@ -331,6 +342,15 @@ __device__ float sheen_visibility_gpu(float ndotv, float ndotl) {
 }
 
 __device__ Vec3 evaluate_brdf_gpu(const GpuScene& scene, const GpuMaterial& material, Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission)) {
+        const float ndotv_signed = ddot(n, wo);
+        const float ndotl_signed = ddot(n, wi);
+        if (ndotv_signed == 0.0f || ndotl_signed == 0.0f) {
+            return {};
+        }
+        const Vec3 reflectance = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
+        return divv(ndotv_signed * ndotl_signed > 0.0f ? reflectance : material_transmission_color_gpu(scene, material, uv), kPi);
+    }
     const float ndotv = material.double_sided ? fabsf(ddot(n, wo)) : fmaxf(0.0f, ddot(n, wo));
     const float ndotl = material.double_sided ? fabsf(ddot(n, wi)) : fmaxf(0.0f, ddot(n, wi));
     if (ndotv <= 0.0f || ndotl <= 0.0f) {
@@ -424,6 +444,21 @@ __device__ Vec3 sample_ggx_half_alpha_gpu(Vec3 n, float alpha, float u1, float u
 }
 
 __device__ float material_pdf_gpu(const GpuScene& scene, const GpuMaterial& material, Vec3 n, Vec3 wo, Vec3 wi, Vec2 uv) {
+    if (material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission)) {
+        const float ndotv_signed = ddot(n, wo);
+        const float ndotl_signed = ddot(n, wi);
+        if (ndotv_signed == 0.0f || ndotl_signed == 0.0f) {
+            return 0.0f;
+        }
+        const Vec3 reflectance = mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
+        const float reflect_weight = max_channel_gpu(reflectance);
+        const float transmit_weight = max_channel_gpu(material_transmission_color_gpu(scene, material, uv));
+        const float sum = reflect_weight + transmit_weight;
+        const float transmit_prob = sum > 0.0f ? transmit_weight / sum : 0.5f;
+        const bool transmission_lobe = ndotv_signed * ndotl_signed < 0.0f;
+        const float lobe_prob = transmission_lobe ? transmit_prob : 1.0f - transmit_prob;
+        return lobe_prob * fabsf(ndotl_signed) / kPi;
+    }
     const float ndotl = material.double_sided ? fabsf(ddot(n, wi)) : fmaxf(0.0f, ddot(n, wi));
     const float ndotv = material.double_sided ? fabsf(ddot(n, wo)) : fmaxf(0.0f, ddot(n, wo));
     if (ndotl <= 0.0f || ndotv <= 0.0f) {
@@ -506,6 +541,20 @@ __device__ GpuMaterialSample sample_material_gpu(const GpuScene& scene, const Gp
         result.weight = material.transmission_tint;
         result.pdf = 1.0f;
         result.delta = true;
+        return result;
+    }
+    if (material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission)) {
+        const float reflect_weight = max_channel_gpu(color);
+        const float transmit_weight = max_channel_gpu(material_transmission_color_gpu(scene, material, uv));
+        const float sum = reflect_weight + transmit_weight;
+        const float transmit_prob = sum > 0.0f ? transmit_weight / sum : 0.5f;
+        const Vec3 facing_n = ddot(n, wo) >= 0.0f ? n : mul(n, -1.0f);
+        const bool sample_transmission = rng_float(rng) < transmit_prob;
+        const Vec3 sample_n = sample_transmission ? mul(facing_n, -1.0f) : facing_n;
+        result.direction = dnormalize(to_world_gpu(cosine_sample(rng_float(rng), rng_float(rng)), sample_n));
+        result.pdf = material_pdf_gpu(scene, material, n, wo, result.direction, uv);
+        const float ndotl = fabsf(ddot(n, result.direction));
+        result.weight = result.pdf > 0.0f ? mul(evaluate_brdf_gpu(scene, material, n, wo, result.direction, uv), ndotl / result.pdf) : Vec3{};
         return result;
     }
     if (material.brdf_model == static_cast<int>(BrdfModel::StandardSurface)) {
@@ -608,7 +657,8 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                 const float dist = sqrtf(dist2);
                 const Vec3 light_dir = divv(to_light, dist);
                 const float ndotl_raw = ddot(hit.normal, light_dir);
-                const float ndotl = material.double_sided ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
+                const bool diffuse_transmission = material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission);
+                const float ndotl = (material.double_sided || diffuse_transmission) ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
                 const GpuMaterial light_material = scene.materials[light.material];
                 const float ldot_raw = ddot(mul(light.normal, -1.0f), light_dir);
                 const bool mesh_light_double_sided = light.light_double_sided != 0;
@@ -658,7 +708,8 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         }
         const Vec3 light_dir = dnormalize(light.direction);
         const float ndotl_raw = ddot(hit.normal, light_dir);
-        const float ndotl = material.double_sided ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
+        const bool diffuse_transmission = material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission);
+        const float ndotl = (material.double_sided || diffuse_transmission) ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
         if (ndotl <= 0.0f) {
             continue;
         }

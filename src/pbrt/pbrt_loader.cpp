@@ -892,6 +892,18 @@ private:
             auto dielectric = std::make_shared<DielectricMaterial>(name, transmission, std::clamp(float_param(params, "eta", 1.5f), 1.0f, 3.0f));
             dielectric->transmission_tint = transmission;
             material = dielectric;
+        } else if (type == "diffusetransmission") {
+            const float scale = std::max(0.0f, float_param(params, "scale", 1.0f));
+            const Vec3 reflectance = vec3_param(params, "reflectance", vec3_param(params, "R", color)) * scale;
+            const Vec3 transmittance = vec3_param(params, "transmittance", vec3_param(params, "T", {0.5f, 0.5f, 0.5f})) * scale;
+            auto diffuse_transmission = std::make_shared<DiffuseTransmissionMaterial>(name, reflectance, transmittance);
+            const std::string transmittance_texture = string_param(params, "transmittance", string_param(params, "T"));
+            if ((find_param(params, "transmittance") && find_param(params, "transmittance")->type == "texture") ||
+                (find_param(params, "T") && find_param(params, "T")->type == "texture")) {
+                const int texture = find_texture_index(scene_, transmittance_texture);
+                diffuse_transmission->transmittance_texture = texture >= 0 ? scene_.textures[static_cast<size_t>(texture)] : nullptr;
+            }
+            material = diffuse_transmission;
         } else if (type == "coateddiffuse") {
             auto principled = std::make_shared<PrincipledMaterial>(name, color, 1.0f, 0.0f);
             principled->clearcoat = 1.0f;

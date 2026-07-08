@@ -240,6 +240,15 @@ bool assign_material_texture(Material& material, const std::string& slot, const 
         }
         return true;
     }
+    if (auto* diffuse_transmission = dynamic_cast<DiffuseTransmissionMaterial*>(&material)) {
+        if (slot == "transmittance" || slot == "transmission") {
+            if (texture) {
+                apply_texture_role(*texture, TextureRole::Color, TextureColorSpace::SRGB);
+            }
+            diffuse_transmission->transmittance_texture = texture;
+            return true;
+        }
+    }
     auto* principled = dynamic_cast<PrincipledMaterial*>(&material);
     if (!principled) {
         return false;
@@ -863,6 +872,24 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!input) {
                 return fail("Invalid dielectric_properties at line " + std::to_string(line_number));
             }
+        } else if (tag == "diffuse_transmission_properties") {
+            std::string material_name;
+            input >> material_name;
+            const int index = material_id(material_ids, material_name);
+            if (!input || index < 0 || index >= static_cast<int>(scene.materials.size()) || !scene.materials[static_cast<size_t>(index)]) {
+                return fail("Invalid diffuse_transmission_properties material at line " + std::to_string(line_number));
+            }
+            auto* diffuse_transmission = dynamic_cast<DiffuseTransmissionMaterial*>(scene.materials[static_cast<size_t>(index)].get());
+            if (!diffuse_transmission) {
+                return fail("diffuse_transmission_properties used on non-diffuse-transmission material at line " + std::to_string(line_number));
+            }
+            input >> diffuse_transmission->transmittance.x
+                >> diffuse_transmission->transmittance.y
+                >> diffuse_transmission->transmittance.z;
+            if (!input) {
+                return fail("Invalid diffuse_transmission_properties at line " + std::to_string(line_number));
+            }
+            diffuse_transmission->transmittance = clamp(diffuse_transmission->transmittance, 0.0f, 1.0f);
         } else if (tag == "conductor_properties") {
             std::string material_name;
             input >> material_name;
@@ -1290,6 +1317,12 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
                     << dielectric->transmission_tint.y << ' '
                     << dielectric->transmission_tint.z << '\n';
             }
+        } else if (const auto* diffuse_transmission = dynamic_cast<const DiffuseTransmissionMaterial*>(material.get())) {
+            output << "diffuse_transmission_properties " << material->name << ' '
+                << diffuse_transmission->transmittance.x << ' '
+                << diffuse_transmission->transmittance.y << ' '
+                << diffuse_transmission->transmittance.z << '\n';
+            write_material_texture(output, *material, "transmittance", diffuse_transmission->transmittance_texture);
         } else if (const auto* conductor = dynamic_cast<const ConductorMaterial*>(material.get())) {
             output << "conductor_properties " << material->name << ' '
                 << conductor->roughness << ' '

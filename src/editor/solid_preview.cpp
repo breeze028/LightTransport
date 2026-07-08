@@ -789,6 +789,13 @@ MaterialPreviewData pack_material_preview_data(const std::shared_ptr<lt::Materia
             base = material->albedo;
         }
         break;
+    case lt::BrdfModel::DiffuseTransmission:
+        roughness = 0.8f;
+        metallic = 0.0f;
+        if (const auto* diffuse_transmission = dynamic_cast<const lt::DiffuseTransmissionMaterial*>(material.get())) {
+            base = material->albedo * 0.6f + diffuse_transmission->transmittance * 0.4f;
+        }
+        break;
     case lt::BrdfModel::Lambertian:
     default:
         break;
