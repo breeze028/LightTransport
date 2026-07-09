@@ -7,7 +7,7 @@
 | 目标 | 类型 | 作用 |
 | --- | --- | --- |
 | `lt_core` | 静态/默认库目标 | 场景、材质、纹理、导入器、CPU 路径追踪和可选 CUDA 后端 |
-| `lt_render` | 控制台程序 | 加载场景、渲染若干累积帧、写出 PPM |
+| `lt_render` | 控制台程序 | 加载场景、渲染若干累积帧、按扩展名写出 PPM/PNG |
 | `lt_editor` | Windows GUI 程序 | ImGui + DirectX 11 编辑器和交互预览 |
 
 主要 CMake 选项：
@@ -33,7 +33,7 @@ flowchart LR
     Pack --> GPU["CudaPathTracer / GpuScene"]
     CPU --> FB["Framebuffer"]
     GPU --> FB
-    FB --> CLI["PPM 输出"]
+    FB --> CLI["PPM/PNG 输出"]
     FB --> Editor["D3D11 预览纹理"]
     Scene --> IV["IrradianceVolume\n(bake & lookup)"]
     IV --> CPU

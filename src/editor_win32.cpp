@@ -1,3 +1,4 @@
+#include "lt/image_io.h"
 #include "lt/renderer.h"
 #include "lt/log.h"
 #include "lt/materialx_adapter.h"
@@ -1028,6 +1029,53 @@ void save_scene() {
         return;
     }
     save_scene_to_path(g_editor.scene_path, false);
+}
+
+std::string default_screenshot_path() {
+    const std::filesystem::path base = g_editor.scene_path.empty() || is_url_path(g_editor.scene_path)
+        ? std::filesystem::path("screenshot")
+        : std::filesystem::path(g_editor.scene_path).stem();
+    return (base.string() + "_render.png");
+}
+
+bool save_render_screenshot_dialog() {
+    if (g_editor.framebuffer.width <= 0 || g_editor.framebuffer.height <= 0 || g_editor.framebuffer.rgba.empty()) {
+        show_modal_message_box(g_hwnd, L"No rendered image is available yet.", L"Save screenshot", MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+
+    wchar_t filename[MAX_PATH] = {};
+    const std::wstring initial = widen(default_screenshot_path());
+    const size_t count = std::min<size_t>(initial.size(), MAX_PATH - 1u);
+    for (size_t i = 0; i < count; ++i) {
+        filename[i] = initial[i];
+    }
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"PNG image (*.png)\0*.png\0All files (*.*)\0*.*\0";
+    ofn.lpstrDefExt = L"png";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    if (!show_save_file_dialog(ofn)) {
+        return false;
+    }
+
+    std::filesystem::path target_path(narrow(filename));
+    if (target_path.extension().empty()) {
+        target_path.replace_extension(".png");
+    }
+
+    std::string error;
+    if (!lt::write_png(target_path.string(), g_editor.framebuffer, &error)) {
+        LT_LOG_ERROR("Screenshot save failed '{}': {}", target_path.string(), error);
+        show_modal_message_box(g_hwnd, widen(error).c_str(), L"Screenshot save failed", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    LT_LOG_INFO("Saved render screenshot '{}'", target_path.string());
+    return true;
 }
 
 int default_material(const char* preferred) {
@@ -3409,6 +3457,8 @@ float draw_top_bar() {
         if (ImGui::MenuItem("Open")) open_scene_dialog();
         if (ImGui::MenuItem("Save", "Ctrl+S")) save_scene();
         if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) save_scene_as_dialog();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Save Render Screenshot...")) save_render_screenshot_dialog();
         if (ImGui::MenuItem("Exit", "Esc")) PostQuitMessage(0);
         ImGui::EndMenu();
     }

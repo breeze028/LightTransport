@@ -1,24 +1,10 @@
+#include "lt/image_io.h"
 #include "cli/render_options.h"
 
 #include <cstdio>
-#include <fstream>
 #include <iostream>
 
 namespace {
-
-bool write_ppm(const std::string& path, const lt::Framebuffer& framebuffer) {
-    std::ofstream output(path);
-    if (!output) {
-        return false;
-    }
-    output << "P3\n" << framebuffer.width << ' ' << framebuffer.height << "\n255\n";
-    for (uint32_t color : framebuffer.rgba) {
-        output << ((color >> 16u) & 0xffu) << ' '
-            << ((color >> 8u) & 0xffu) << ' '
-            << (color & 0xffu) << '\n';
-    }
-    return true;
-}
 
 struct LoggingScope {
     ~LoggingScope() {
@@ -106,8 +92,9 @@ int main(int argc, char** argv) {
         std::cout << "\n" << std::flush;
     }
 
-    if (!write_ppm(options.output_path, framebuffer)) {
-        LT_LOG_ERROR("Could not write {}", options.output_path);
+    std::string output_error;
+    if (!lt::write_image(options.output_path, framebuffer, &output_error)) {
+        LT_LOG_ERROR("Could not write {}: {}", options.output_path, output_error);
         return 1;
     }
     LT_LOG_INFO("Wrote {}", options.output_path);

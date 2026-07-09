@@ -17,7 +17,7 @@
 lt_render [scene_path] [output_path] [options...]
 ```
 
-默认场景是 `scenes/cornell.lt`，默认输出是 `out.ppm`。参数从 `argv[3]` 开始解析，因此只想传 option 时仍需写前两个位置参数。
+默认场景是 `scenes/cornell.lt`，默认输出是 `out.ppm`。输出路径支持 `.ppm` 和 `.png`；参数从 `argv[3]` 开始解析，因此只想传 option 时仍需写前两个位置参数。
 
 ### 当前选项
 
@@ -84,7 +84,7 @@ lt_render [scene_path] [output_path] [options...]
 5. 设置辐照度体积缓存默认值（cache key 为场景路径，cache path 为 `<scene>.ivol`）。
 6. 选择 CPU/CUDA；NPR 和辐照度体积烘焙强制 CPU。
 7. 从 frame 0 渲染到 `--frames - 1`。
-8. `write_ppm()` 写 ASCII P3。
+8. `lt::write_image()` 按输出扩展名写 `.ppm` 或 `.png`。
 
 场景加载错误当前只打印警告并继续使用返回的 fallback Scene。
 
@@ -103,19 +103,21 @@ lt_render [scene_path] [output_path] [options...]
 
 ## 离线输出
 
-`write_ppm()` 是 `src/main.cpp` 的匿名命名空间函数：
+`lt::write_image()` 位于 `src/image_io.cpp`：
 
-- 写 P3 文本 PPM。
+- `.ppm` 写 P3 文本 PPM。
+- `.png` 通过 `stb_image_write` 写 8-bit RGBA PNG。
 - 数据来自 `Framebuffer::rgba`，因此已经过固定 gamma 2.2 和 clamp。
 - 不保留 HDR。
+- 编辑器 File 菜单的 `Save Render Screenshot...` 复用同一套 PNG writer，保存当前 rendered framebuffer，不包含 ImGui overlay。
 
-新增 PNG/EXR 输出时建议建立独立 `image_io` 模块：
+新增 EXR 或其他输出格式时继续扩展 `image_io` 模块：
 
 - LDR 格式读取 `rgba` 或统一 tone-mapped buffer。
 - EXR 读取 `accumulation / frame_count`。
 - CUDA 当前不回传宿主侧 accumulation；EXR 支持还需增加设备 HDR 拷回，或明确只允许 CPU。
 - 将输出格式按扩展名分派。
-- 明确 RGBA 字节序；当前整数格式是 `0xAARRGGBB`，Windows 小端内存供 D3D BGRA 纹理直接使用。
+- 明确 RGBA 字节序；当前整数格式是 `0xAARRGGBB`，PNG writer 必须显式拆成 RGBA 字节，不能直接把整数内存传给 stb。
 
 ## 编辑器状态
 

@@ -92,6 +92,7 @@ add_library(lt_core
     src/denoise/svgf.cpp
     src/fbx_loader.cpp
     src/gltf_loader.cpp
+    src/image_io.cpp
     src/material.cpp
     src/materialx_adapter.cpp
     src/pbrt/pbrt_loader.cpp

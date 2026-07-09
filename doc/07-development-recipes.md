@@ -232,9 +232,9 @@ GPU：
 
 ## 新增输出格式
 
-- [ ] 把 `write_ppm()` 抽到独立模块。
-- [ ] API 接收平均 HDR 或 RGBA，明确色彩空间。
-- [ ] 按扩展名选择 writer。
+- [ ] 在 `include/lt/image_io.h` / `src/image_io.cpp` 增加 writer。
+- [ ] API 接收平均 HDR 或 `Framebuffer::rgba`，明确色彩空间。
+- [ ] 在 `lt::write_image()` 中按扩展名选择 writer。
 - [ ] CLI 输出错误返回非零。
 - [ ] PNG 测 alpha/通道顺序。
 - [ ] EXR 测 float 范围，不应用 gamma/clamp。
