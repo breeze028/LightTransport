@@ -60,7 +60,7 @@ MinSizeRel/
 *.ppm
 *.pfm
 *.exr
-*.png
+#*.png
 *.jpg
 *.jpeg
 *.hdr
