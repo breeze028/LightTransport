@@ -155,13 +155,13 @@ Scene make_default_scene() {
     };
     scene.meshes.push_back(make_quad_mesh("Floor", 0, {-1.4f, 0.0f, -1.5f}, {1.4f, 0.0f, -1.5f}, {1.4f, 0.0f, 1.5f}, {-1.4f, 0.0f, 1.5f}));
     scene.meshes.push_back(make_quad_mesh("Ceiling", 0, {-1.4f, 2.2f, 1.5f}, {1.4f, 2.2f, 1.5f}, {1.4f, 2.2f, -1.5f}, {-1.4f, 2.2f, -1.5f}));
-    scene.meshes.push_back(make_quad_mesh("Left Wall", 1, {-1.4f, 0.0f, 1.5f}, {-1.4f, 2.2f, 1.5f}, {-1.4f, 2.2f, -1.5f}, {-1.4f, 0.0f, -1.5f}));
-    scene.meshes.push_back(make_quad_mesh("Right Wall", 2, {1.4f, 0.0f, -1.5f}, {1.4f, 2.2f, -1.5f}, {1.4f, 2.2f, 1.5f}, {1.4f, 0.0f, 1.5f}));
-    scene.meshes.push_back(make_quad_mesh("Back Wall", 0, {-1.4f, 0.0f, 1.5f}, {1.4f, 0.0f, 1.5f}, {1.4f, 2.2f, 1.5f}, {-1.4f, 2.2f, 1.5f}));
+    scene.meshes.push_back(make_quad_mesh("Left_Wall", 1, {-1.4f, 0.0f, 1.5f}, {-1.4f, 2.2f, 1.5f}, {-1.4f, 2.2f, -1.5f}, {-1.4f, 0.0f, -1.5f}));
+    scene.meshes.push_back(make_quad_mesh("Right_Wall", 2, {1.4f, 0.0f, -1.5f}, {1.4f, 2.2f, -1.5f}, {1.4f, 2.2f, 1.5f}, {1.4f, 0.0f, 1.5f}));
+    scene.meshes.push_back(make_quad_mesh("Back_Wall", 0, {-1.4f, 0.0f, 1.5f}, {1.4f, 0.0f, 1.5f}, {1.4f, 2.2f, 1.5f}, {-1.4f, 2.2f, 1.5f}));
     scene.meshes.push_back(make_quad_mesh("Area_Light", 4, {-0.28f, 2.18f, 0.28f}, {-0.28f, 2.18f, -0.28f}, {0.28f, 2.18f, -0.28f}, {0.28f, 2.18f, 0.28f}));
     scene.meshes.back().light = {true, false, {1.0f, 0.888889f, 0.666667f}, 9.0f};
     scene.spheres.push_back({"Blue_Sphere", 3, {-0.55f, 0.42f, 0.0f}, 0.42f});
-    scene.meshes.push_back(make_cube_mesh("White Block", 0, {0.48f, 0.32f, -0.55f}, 0.62f));
+    scene.meshes.push_back(make_cube_mesh("White_Block", 0, {0.48f, 0.32f, -0.55f}, 0.62f));
     return scene;
 }
 

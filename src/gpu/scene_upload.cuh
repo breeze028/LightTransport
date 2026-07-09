@@ -35,6 +35,15 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
         const DirectionalLight& light = scene.directional_lights[static_cast<size_t>(i)];
         packed.directional_lights[static_cast<size_t>(i)] = {light.direction, light.color, light.intensity};
     }
+    if (!size_fits_int(scene.point_lights.size())) {
+        return false;
+    }
+    gpu.point_light_count = static_cast<int>(scene.point_lights.size());
+    packed.point_lights.resize(scene.point_lights.size());
+    for (int i = 0; i < gpu.point_light_count; ++i) {
+        const PointLight& light = scene.point_lights[static_cast<size_t>(i)];
+        packed.point_lights[static_cast<size_t>(i)] = {light.position, light.color, light.intensity};
+    }
     gpu.texture_count = static_cast<int>(scene.textures.size());
     packed.textures.resize(scene.textures.size());
     for (int i = 0; i < gpu.texture_count; ++i) {

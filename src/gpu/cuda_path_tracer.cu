@@ -205,6 +205,7 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
     void* dev_triangle_indices = nullptr;
     void* dev_light_indices = nullptr;
     void* dev_directional_lights = nullptr;
+    void* dev_point_lights = nullptr;
     void* dev_bvh_nodes = nullptr;
     void* dev_mesh_instances = nullptr;
     void* dev_mesh_instance_indices = nullptr;
@@ -212,7 +213,7 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
     void* dev_textures_buf = nullptr;
     int hint_materials = 0, hint_triangles = 0, hint_spheres = 0;
     int hint_triangle_indices = 0, hint_light_indices = 0;
-    int hint_directional_lights = 0, hint_bvh_nodes = 0;
+    int hint_directional_lights = 0, hint_point_lights = 0, hint_bvh_nodes = 0;
     int hint_mesh_instances = 0, hint_mesh_instance_indices = 0;
     int hint_tlas_nodes = 0, hint_textures = 0;
     std::vector<void*> texture_arrays;
@@ -227,6 +228,7 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
         cudaFree(dev_triangle_indices);
         cudaFree(dev_light_indices);
         cudaFree(dev_directional_lights);
+        cudaFree(dev_point_lights);
         cudaFree(dev_bvh_nodes);
         cudaFree(dev_mesh_instances);
         cudaFree(dev_mesh_instance_indices);
@@ -247,6 +249,7 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
         !upload_buffer(dev_triangle_indices, hint_triangle_indices, packed.triangle_indices) ||
         !upload_buffer(dev_light_indices, hint_light_indices, packed.light_indices) ||
         !upload_buffer(dev_directional_lights, hint_directional_lights, packed.directional_lights) ||
+        !upload_buffer(dev_point_lights, hint_point_lights, packed.point_lights) ||
         !upload_buffer(dev_bvh_nodes, hint_bvh_nodes, packed.bvh_nodes) ||
         !upload_buffer(dev_mesh_instances, hint_mesh_instances, packed.mesh_instances) ||
         !upload_buffer(dev_mesh_instance_indices, hint_mesh_instance_indices, packed.mesh_instance_indices) ||
@@ -265,6 +268,7 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
     packed.scene.triangle_indices = static_cast<int*>(dev_triangle_indices);
     packed.scene.light_indices = static_cast<int*>(dev_light_indices);
     packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(dev_directional_lights);
+    packed.scene.point_lights = static_cast<GpuPointLight*>(dev_point_lights);
     packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(dev_bvh_nodes);
     packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(dev_mesh_instances);
     packed.scene.mesh_instance_indices = static_cast<int*>(dev_mesh_instance_indices);
@@ -469,6 +473,7 @@ std::shared_ptr<void> build_lightmap_gpu(
     void* dev_triangle_indices = nullptr;
     void* dev_light_indices = nullptr;
     void* dev_directional_lights = nullptr;
+    void* dev_point_lights = nullptr;
     void* dev_bvh_nodes = nullptr;
     void* dev_mesh_instances = nullptr;
     void* dev_mesh_instance_indices = nullptr;
@@ -476,7 +481,7 @@ std::shared_ptr<void> build_lightmap_gpu(
     void* dev_textures_buf = nullptr;
     int hint_materials = 0, hint_triangles = 0, hint_spheres = 0;
     int hint_triangle_indices = 0, hint_light_indices = 0;
-    int hint_directional_lights = 0, hint_bvh_nodes = 0;
+    int hint_directional_lights = 0, hint_point_lights = 0, hint_bvh_nodes = 0;
     int hint_mesh_instances = 0, hint_mesh_instance_indices = 0;
     int hint_tlas_nodes = 0, hint_textures = 0;
     std::vector<void*> texture_arrays;
@@ -491,6 +496,7 @@ std::shared_ptr<void> build_lightmap_gpu(
         cudaFree(dev_triangle_indices);
         cudaFree(dev_light_indices);
         cudaFree(dev_directional_lights);
+        cudaFree(dev_point_lights);
         cudaFree(dev_bvh_nodes);
         cudaFree(dev_mesh_instances);
         cudaFree(dev_mesh_instance_indices);
@@ -511,6 +517,7 @@ std::shared_ptr<void> build_lightmap_gpu(
         !upload_buffer(dev_triangle_indices, hint_triangle_indices, packed.triangle_indices) ||
         !upload_buffer(dev_light_indices, hint_light_indices, packed.light_indices) ||
         !upload_buffer(dev_directional_lights, hint_directional_lights, packed.directional_lights) ||
+        !upload_buffer(dev_point_lights, hint_point_lights, packed.point_lights) ||
         !upload_buffer(dev_bvh_nodes, hint_bvh_nodes, packed.bvh_nodes) ||
         !upload_buffer(dev_mesh_instances, hint_mesh_instances, packed.mesh_instances) ||
         !upload_buffer(dev_mesh_instance_indices, hint_mesh_instance_indices, packed.mesh_instance_indices) ||
@@ -529,6 +536,7 @@ std::shared_ptr<void> build_lightmap_gpu(
     packed.scene.triangle_indices = static_cast<int*>(dev_triangle_indices);
     packed.scene.light_indices = static_cast<int*>(dev_light_indices);
     packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(dev_directional_lights);
+    packed.scene.point_lights = static_cast<GpuPointLight*>(dev_point_lights);
     packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(dev_bvh_nodes);
     packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(dev_mesh_instances);
     packed.scene.mesh_instance_indices = static_cast<int*>(dev_mesh_instance_indices);
@@ -739,6 +747,7 @@ void CudaPathTracer::reset() {
     cudaFree(device_triangle_indices_);
     cudaFree(device_light_indices_);
     cudaFree(device_directional_lights_);
+    cudaFree(device_point_lights_);
     cudaFree(device_bvh_nodes_);
     cudaFree(device_mesh_instances_);
     cudaFree(device_mesh_instance_indices_);
@@ -759,6 +768,7 @@ void CudaPathTracer::reset() {
     device_triangle_indices_ = nullptr;
     device_light_indices_ = nullptr;
     device_directional_lights_ = nullptr;
+    device_point_lights_ = nullptr;
     device_bvh_nodes_ = nullptr;
     device_mesh_instances_ = nullptr;
     device_mesh_instance_indices_ = nullptr;
@@ -780,6 +790,7 @@ void CudaPathTracer::reset() {
     cached_triangle_indices_ = 0;
     cached_lights_ = 0;
     cached_directional_lights_ = 0;
+    cached_point_lights_ = 0;
     cached_bvh_nodes_ = 0;
     cached_mesh_instances_ = 0;
     cached_mesh_instance_indices_ = 0;
@@ -969,6 +980,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !upload_buffer(device_triangle_indices_, cached_triangle_indices_, packed.triangle_indices) ||
             !upload_buffer(device_light_indices_, cached_lights_, packed.light_indices) ||
             !upload_buffer(device_directional_lights_, cached_directional_lights_, packed.directional_lights) ||
+            !upload_buffer(device_point_lights_, cached_point_lights_, packed.point_lights) ||
             !upload_buffer(device_bvh_nodes_, cached_bvh_nodes_, packed.bvh_nodes) ||
             !upload_buffer(device_mesh_instances_, cached_mesh_instances_, packed.mesh_instances) ||
             !upload_buffer(device_mesh_instance_indices_, cached_mesh_instance_indices_, packed.mesh_instance_indices) ||
@@ -984,6 +996,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.triangle_indices = static_cast<int*>(device_triangle_indices_);
         packed.scene.light_indices = static_cast<int*>(device_light_indices_);
         packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(device_directional_lights_);
+        packed.scene.point_lights = static_cast<GpuPointLight*>(device_point_lights_);
         packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(device_bvh_nodes_);
         packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(device_mesh_instances_);
         packed.scene.mesh_instance_indices = static_cast<int*>(device_mesh_instance_indices_);

@@ -19,7 +19,7 @@ namespace lt::editor {
 enum class ToolMode { Select, Move, Rotate, Scale };
 enum class TransformSpace { Local, World };
 enum class GizmoHandle { None, AxisX, AxisY, AxisZ, PlaneXY, PlaneYZ, PlaneZX, Uniform };
-enum class SelectionKind { None, Mesh, Sphere };
+enum class SelectionKind { None, Mesh, Sphere, DirectionalLight, PointLight };
 enum class ViewportPreviewMode { Rendered, MaterialPreview, Solid, Wireframe };
 
 struct GpuPreview {
@@ -47,6 +47,8 @@ struct EditorState {
     SelectionKind selection_kind = SelectionKind::Mesh;
     int selected_mesh = 0;
     int selected_sphere = -1;
+    int selected_directional_light = -1;
+    int selected_point_light = -1;
     bool viewport_focused = false;
     bool viewport_hovered = false;
     bool paused = false;
@@ -61,6 +63,10 @@ struct EditorState {
     int drag_start_mesh_index = -1;
     Sphere drag_start_sphere = {};
     int drag_start_sphere_index = -1;
+    PointLight drag_start_point_light = {};
+    int drag_start_point_light_index = -1;
+    DirectionalLight drag_start_directional_light = {};
+    int drag_start_directional_light_index = -1;
     GizmoHandle hovered_gizmo = GizmoHandle::None;
     GizmoHandle active_gizmo = GizmoHandle::None;
     ImVec2 drag_start_center_screen = {};

@@ -567,6 +567,11 @@ SceneLoadResult load_scene(const std::string& path) {
                 scene.environment.constant = true;
                 environment_texture_name.clear();
             }
+        } else if (tag == "environment_strength" || tag == "environment_intensity") {
+            input >> scene.environment.strength;
+            if (!input || scene.environment.strength < 0.0f) {
+                return fail("Invalid " + tag + " at line " + std::to_string(line_number));
+            }
         } else if (tag == "environment_mapping") {
             std::string mapping_name;
             input >> mapping_name;
@@ -589,9 +594,31 @@ SceneLoadResult load_scene(const std::string& path) {
             if (!input || light.intensity < 0.0f) {
                 return fail("Invalid directional_light at line " + std::to_string(line_number));
             }
+            // Optionally read position (added later; default {0,0,0} for old files)
+            input >> light.position.x >> light.position.y >> light.position.z;
+            if (!input) {
+                input.clear(); // old format, position stays at default
+            } else {
+                std::string light_name;
+                if (input >> light_name) {
+                    light.name = light_name;
+                }
+            }
             light.direction = normalize(light.direction);
             if (dot(light.direction, light.direction) > 0.0f && light.intensity > 0.0f) {
                 scene.directional_lights.push_back(light);
+            }
+        } else if (tag == "point_light") {
+            PointLight light;
+            input >> light.name
+                >> light.position.x >> light.position.y >> light.position.z
+                >> light.color.x >> light.color.y >> light.color.z
+                >> light.intensity;
+            if (!input || light.intensity < 0.0f) {
+                return fail("Invalid point_light at line " + std::to_string(line_number));
+            }
+            if (light.intensity > 0.0f) {
+                scene.point_lights.push_back(light);
             }
         } else if (tag == "npr_sampling") {
             input >> scene.render_settings.stylized_samples >> scene.render_settings.stylized_max_depth;
@@ -1187,6 +1214,9 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         }
         output << '\n';
     }
+    if (scene.environment.texture || (!scene.environment.constant && scene.environment.strength != 1.0f)) {
+        output << "environment_strength " << scene.environment.strength << "\n\n";
+    }
 
     for (const DirectionalLight& light : scene.directional_lights) {
         if (dot(light.direction, light.direction) <= 0.0f || light.intensity <= 0.0f) {
@@ -1195,9 +1225,25 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         output << "directional_light "
             << light.direction.x << ' ' << light.direction.y << ' ' << light.direction.z << ' '
             << light.color.x << ' ' << light.color.y << ' ' << light.color.z << ' '
-            << light.intensity << '\n';
+            << light.intensity << ' '
+            << light.position.x << ' ' << light.position.y << ' ' << light.position.z << ' '
+            << light.name << '\n';
     }
     if (!scene.directional_lights.empty()) {
+        output << '\n';
+    }
+
+    for (const PointLight& light : scene.point_lights) {
+        if (light.intensity <= 0.0f) {
+            continue;
+        }
+        output << "point_light "
+            << light.name << ' '
+            << light.position.x << ' ' << light.position.y << ' ' << light.position.z << ' '
+            << light.color.x << ' ' << light.color.y << ' ' << light.color.z << ' '
+            << light.intensity << '\n';
+    }
+    if (!scene.point_lights.empty()) {
         output << '\n';
     }
 
@@ -1417,7 +1463,6 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
     if (scene.uses_builtin_default_meshes) {
         LT_LOG_INFO("Saved scene '{}' (built-in default meshes, materials={}, textures={}, directional_lights={})",
             path, scene.materials.size(), scene.textures.size(), scene.directional_lights.size());
-        return true;
     }
 
     for (const Mesh& mesh : scene.meshes) {

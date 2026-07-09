@@ -297,6 +297,48 @@ Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scen
             direct += clamp_sample_radiance(material.evaluate(hit.normal, wo, light_dir, hit.uv) * (light.color * light.intensity) * ndotl);
         }
     }
+
+    for (const PointLight& light : scene.point_lights) {
+        if (light.intensity <= 0.0f) continue;
+        const Vec3 to_light = light.position - hit.position;
+        const float dist2 = dot(to_light, to_light);
+        const float dist = std::sqrt(dist2);
+        const float eps = 0.001f;
+        const float falloff = light.intensity / std::max(eps, dist2);
+        if (falloff <= 0.0f) continue;
+        const Vec3 light_dir = to_light / dist;
+        const float ndotl_raw = dot(hit.normal, light_dir);
+        const bool diffuse_transmission = material.model() == BrdfModel::DiffuseTransmission;
+        const float ndotl = (material.double_sided || diffuse_transmission) ? std::fabs(ndotl_raw) : std::max(0.0f, ndotl_raw);
+        if (ndotl <= 0.0f) continue;
+
+        bool blocked = false;
+        const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
+        Ray shadow_ray{hit.position + hit.normal * (0.002f * shadow_offset_side), light_dir};
+        for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+            Hit shadow_hit;
+            if (!intersect_scene(render_scene, shadow_ray, shadow_hit, settings.acceleration_structure)) {
+                break;
+            }
+            const float shadow_dist = length(shadow_hit.position - hit.position);
+            if (shadow_dist >= dist - 0.01f) break;
+            if (shadow_hit.material >= 0 && shadow_hit.material < static_cast<int>(scene.materials.size()) &&
+                scene.materials[static_cast<size_t>(shadow_hit.material)]) {
+                const Material& shadow_material = *scene.materials[static_cast<size_t>(shadow_hit.material)];
+                if (!material_visible(shadow_material, shadow_hit.uv, rng) ||
+                    shadow_material.model() == BrdfModel::Dielectric ||
+                    shadow_material.transmission(shadow_hit.uv) > 0.5f) {
+                    shadow_ray = {shadow_hit.position + light_dir * 0.002f, light_dir};
+                    continue;
+                }
+            }
+            blocked = true;
+            break;
+        }
+        if (!blocked) {
+            direct += clamp_sample_radiance(material.evaluate(hit.normal, wo, light_dir, hit.uv) * (light.color * falloff) * ndotl);
+        }
+    }
     return direct;
 }
 

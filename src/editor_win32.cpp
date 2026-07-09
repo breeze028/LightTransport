@@ -35,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -48,6 +49,34 @@ void upload_preview_texture();
 void apply_scene_render_settings(const lt::Scene& scene);
 void discard_pending_render_task();
 void reset_renderer_caches();
+
+void clear_modal_input_state() {
+    if (!ImGui::GetCurrentContext()) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    io.ClearEventsQueue();
+    io.ClearInputKeys();
+    io.ClearInputMouse();
+}
+
+int show_modal_message_box(HWND hwnd, LPCWSTR text, LPCWSTR caption, UINT type) {
+    const int result = MessageBoxW(hwnd, text, caption, type);
+    clear_modal_input_state();
+    return result;
+}
+
+bool show_open_file_dialog(OPENFILENAMEW& ofn) {
+    const BOOL result = GetOpenFileNameW(&ofn);
+    clear_modal_input_state();
+    return result != FALSE;
+}
+
+bool show_save_file_dialog(OPENFILENAMEW& ofn) {
+    const BOOL result = GetSaveFileNameW(&ofn);
+    clear_modal_input_state();
+    return result != FALSE;
+}
 
 lt::LogObserverHandle g_editor_log_observer = 0;
 constexpr size_t kMaxEditorLogs = 2000;
@@ -120,10 +149,10 @@ const EditorIconInfo& editor_icon_info(EditorIcon icon) {
         {"K", "ops.transform.resize.dat"},
         {"L", nullptr},
         {"W", nullptr},
-        {"M", "ops.mesh.primitive_cube_add_gizmo.dat"},
-        {"O", "ops.mesh.primitive_sphere_add_gizmo.dat"},
-        {"C", "ops.mesh.primitive_cube_add_gizmo.dat"},
-        {"P", "ops.mesh.primitive_grid_add_gizmo.dat"},
+        {"M", nullptr},    // Mesh — procedural
+        {"O", nullptr},    // Sphere — procedural
+        {"C", nullptr},    // Cube — procedural
+        {"P", nullptr},    // Plane — procedural
         {"L", nullptr},
         {"M", nullptr},
         {"T", "brush.paint_texture.fill.dat"},
@@ -266,10 +295,14 @@ void select_mesh(int index) {
         g_editor.selection_kind = SelectionKind::Mesh;
         g_editor.selected_mesh = index;
         g_editor.selected_sphere = -1;
+        g_editor.selected_directional_light = -1;
+        g_editor.selected_point_light = -1;
     } else {
         g_editor.selection_kind = SelectionKind::None;
         g_editor.selected_mesh = -1;
         g_editor.selected_sphere = -1;
+        g_editor.selected_directional_light = -1;
+        g_editor.selected_point_light = -1;
     }
 }
 
@@ -278,10 +311,46 @@ void select_sphere(int index) {
         g_editor.selection_kind = SelectionKind::Sphere;
         g_editor.selected_sphere = index;
         g_editor.selected_mesh = -1;
+        g_editor.selected_directional_light = -1;
+        g_editor.selected_point_light = -1;
     } else {
         g_editor.selection_kind = SelectionKind::None;
         g_editor.selected_mesh = -1;
         g_editor.selected_sphere = -1;
+        g_editor.selected_directional_light = -1;
+        g_editor.selected_point_light = -1;
+    }
+}
+
+void select_directional_light(int index) {
+    if (index >= 0 && index < static_cast<int>(g_editor.scene.directional_lights.size())) {
+        g_editor.selection_kind = SelectionKind::DirectionalLight;
+        g_editor.selected_directional_light = index;
+        g_editor.selected_mesh = -1;
+        g_editor.selected_sphere = -1;
+        g_editor.selected_point_light = -1;
+    } else {
+        g_editor.selection_kind = SelectionKind::None;
+        g_editor.selected_mesh = -1;
+        g_editor.selected_sphere = -1;
+        g_editor.selected_directional_light = -1;
+        g_editor.selected_point_light = -1;
+    }
+}
+
+void select_point_light(int index) {
+    if (index >= 0 && index < static_cast<int>(g_editor.scene.point_lights.size())) {
+        g_editor.selection_kind = SelectionKind::PointLight;
+        g_editor.selected_point_light = index;
+        g_editor.selected_mesh = -1;
+        g_editor.selected_sphere = -1;
+        g_editor.selected_directional_light = -1;
+    } else {
+        g_editor.selection_kind = SelectionKind::None;
+        g_editor.selected_mesh = -1;
+        g_editor.selected_sphere = -1;
+        g_editor.selected_directional_light = -1;
+        g_editor.selected_point_light = -1;
     }
 }
 
@@ -291,6 +360,12 @@ bool has_selection() {
     }
     if (g_editor.selection_kind == SelectionKind::Sphere) {
         return g_editor.selected_sphere >= 0 && g_editor.selected_sphere < static_cast<int>(g_editor.scene.spheres.size());
+    }
+    if (g_editor.selection_kind == SelectionKind::DirectionalLight) {
+        return g_editor.selected_directional_light >= 0 && g_editor.selected_directional_light < static_cast<int>(g_editor.scene.directional_lights.size());
+    }
+    if (g_editor.selection_kind == SelectionKind::PointLight) {
+        return g_editor.selected_point_light >= 0 && g_editor.selected_point_light < static_cast<int>(g_editor.scene.point_lights.size());
     }
     return false;
 }
@@ -305,6 +380,18 @@ bool has_sphere_selection() {
     return g_editor.selection_kind == SelectionKind::Sphere &&
         g_editor.selected_sphere >= 0 &&
         g_editor.selected_sphere < static_cast<int>(g_editor.scene.spheres.size());
+}
+
+bool has_directional_light_selection() {
+    return g_editor.selection_kind == SelectionKind::DirectionalLight &&
+        g_editor.selected_directional_light >= 0 &&
+        g_editor.selected_directional_light < static_cast<int>(g_editor.scene.directional_lights.size());
+}
+
+bool has_point_light_selection() {
+    return g_editor.selection_kind == SelectionKind::PointLight &&
+        g_editor.selected_point_light >= 0 &&
+        g_editor.selected_point_light < static_cast<int>(g_editor.scene.point_lights.size());
 }
 
 void invalidate_mesh_bounds_cache() {
@@ -336,10 +423,12 @@ void set_scene(lt::Scene scene, const std::string& path) {
     apply_scene_render_settings(g_editor.scene);
     invalidate_mesh_bounds_cache();
     select_mesh(-1);
-    LT_LOG_INFO("Editor scene set to '{}' (meshes={}, spheres={}, materials={}, textures={})",
+    LT_LOG_INFO("Editor scene set to '{}' (meshes={}, spheres={}, dir_lights={}, point_lights={}, materials={}, textures={})",
         g_editor.scene_path,
         g_editor.scene.meshes.size(),
         g_editor.scene.spheres.size(),
+        g_editor.scene.directional_lights.size(),
+        g_editor.scene.point_lights.size(),
         g_editor.scene.materials.size(),
         g_editor.scene.textures.size());
     reset_accumulation(lt::RenderDirty::All);
@@ -352,7 +441,7 @@ bool scene_load_in_progress() {
 void load_scene_file(const std::string& path) {
     if (scene_load_in_progress()) {
         LT_LOG_WARN("Scene load skipped while another scene is loading: '{}'", path);
-        MessageBoxW(g_hwnd, L"A scene is already loading. Please wait for it to finish.", L"Scene load in progress", MB_OK | MB_ICONINFORMATION);
+        show_modal_message_box(g_hwnd, L"A scene is already loading. Please wait for it to finish.", L"Scene load in progress", MB_OK | MB_ICONINFORMATION);
         return;
     }
     LT_LOG_INFO("Starting async scene load '{}'", path);
@@ -418,7 +507,7 @@ void poll_scene_load_result() {
     if (!loaded.error.empty()) {
         LT_LOG_WARN("Scene load warning for '{}': {}", path, loaded.error);
         if (loaded.scene.meshes.empty() && loaded.scene.spheres.empty()) {
-            MessageBoxW(g_hwnd, widen(loaded.error).c_str(), L"Scene load warning", MB_OK | MB_ICONWARNING);
+            show_modal_message_box(g_hwnd, widen(loaded.error).c_str(), L"Scene load warning", MB_OK | MB_ICONWARNING);
         }
         if (loaded.scene.meshes.empty() && loaded.scene.spheres.empty()) {
             LT_LOG_ERROR("Scene load produced no renderable geometry: '{}'", path);
@@ -426,6 +515,12 @@ void poll_scene_load_result() {
         }
     }
     set_scene(std::move(loaded.scene), path);
+}
+
+void new_scene() {
+    lt::Scene scene = lt::make_default_scene();
+    scene.uses_builtin_default_meshes = false;
+    set_scene(std::move(scene), "");
 }
 
 void open_scene_dialog() {
@@ -437,7 +532,7 @@ void open_scene_dialog() {
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter = L"Scene files (*.lt;*.fbx;*.pyscene;*.glb;*.gltf;*.pbrt)\0*.lt;*.fbx;*.pyscene;*.glb;*.gltf;*.pbrt\0LightTransport scenes (*.lt)\0*.lt\0FBX scenes (*.fbx;*.pyscene)\0*.fbx;*.pyscene\0glTF scenes (*.glb;*.gltf)\0*.glb;*.gltf\0PBRT scenes (*.pbrt)\0*.pbrt\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&ofn)) load_scene_file(narrow(filename));
+    if (show_open_file_dialog(ofn)) load_scene_file(narrow(filename));
 }
 
 std::string texture_name_from_path(const std::string& path) {
@@ -795,7 +890,7 @@ void load_texture_dialog(lt::Material& material) {
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter = L"Image textures (*.ppm;*.png;*.jpg;*.jpeg;*.hdr;*.exr)\0*.ppm;*.png;*.jpg;*.jpeg;*.hdr;*.exr\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (!GetOpenFileNameW(&ofn)) return;
+    if (!show_open_file_dialog(ofn)) return;
 
     const std::string path = narrow(filename);
     const std::string name = texture_name_from_path(path);
@@ -803,7 +898,7 @@ void load_texture_dialog(lt::Material& material) {
     std::string error;
     if (!lt::load_texture_file(name, path, texture, error)) {
         LT_LOG_ERROR("Texture load failed '{}': {}", path, error);
-        MessageBoxW(g_hwnd, widen(error).c_str(), L"Texture load failed", MB_OK | MB_ICONERROR);
+        show_modal_message_box(g_hwnd, widen(error).c_str(), L"Texture load failed", MB_OK | MB_ICONERROR);
         return;
     }
     auto shared = std::make_shared<lt::Texture>(std::move(texture));
@@ -822,7 +917,7 @@ void load_environment_texture_dialog() {
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter = L"HDRI environment (*.hdr;*.exr)\0*.hdr;*.exr\0Image textures (*.hdr;*.exr;*.ppm;*.png;*.jpg;*.jpeg)\0*.hdr;*.exr;*.ppm;*.png;*.jpg;*.jpeg\0All files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (!GetOpenFileNameW(&ofn)) return;
+    if (!show_open_file_dialog(ofn)) return;
 
     const std::string path = narrow(filename);
     const std::string name = texture_name_from_path(path);
@@ -830,7 +925,7 @@ void load_environment_texture_dialog() {
     std::string error;
     if (!lt::load_texture_file(name, path, texture, error)) {
         LT_LOG_ERROR("Environment load failed '{}': {}", path, error);
-        MessageBoxW(g_hwnd, widen(error).c_str(), L"Environment load failed", MB_OK | MB_ICONERROR);
+        show_modal_message_box(g_hwnd, widen(error).c_str(), L"Environment load failed", MB_OK | MB_ICONERROR);
         return;
     }
     auto shared = std::make_shared<lt::Texture>(std::move(texture));
@@ -871,7 +966,7 @@ bool save_scene_to_path(const std::string& requested_path, bool rewrite_assets) 
     if (rewrite_assets && !rewrite_texture_paths_for_save_as(g_editor.scene, g_editor.scene_path, target_path, error)) {
         restore_texture_paths(original_paths);
         LT_LOG_ERROR("Save As asset export failed '{}': {}", target_path, error);
-        MessageBoxW(g_hwnd, widen(error).c_str(), L"Save As failed", MB_OK | MB_ICONERROR);
+        show_modal_message_box(g_hwnd, widen(error).c_str(), L"Save As failed", MB_OK | MB_ICONERROR);
         return false;
     }
 
@@ -880,7 +975,7 @@ bool save_scene_to_path(const std::string& requested_path, bool rewrite_assets) 
             restore_texture_paths(original_paths);
         }
         LT_LOG_ERROR("Save failed '{}': {}", target_path, error);
-        MessageBoxW(g_hwnd, widen(error).c_str(), L"Save failed", MB_OK | MB_ICONERROR);
+        show_modal_message_box(g_hwnd, widen(error).c_str(), L"Save failed", MB_OK | MB_ICONERROR);
         return false;
     }
 
@@ -913,7 +1008,7 @@ bool save_scene_as_dialog() {
     ofn.lpstrFilter = L"LightTransport scenes (*.lt)\0*.lt\0All files (*.*)\0*.*\0";
     ofn.lpstrDefExt = L"lt";
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
-    if (!GetSaveFileNameW(&ofn)) {
+    if (!show_save_file_dialog(ofn)) {
         return false;
     }
     const std::string target_path = ensure_lt_extension(narrow(filename));
@@ -929,7 +1024,7 @@ void save_scene() {
         return;
     }
     const std::wstring message = L"Save changes to this scene?\n\n" + widen(g_editor.scene_path);
-    if (MessageBoxW(g_hwnd, message.c_str(), L"Confirm Save", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+    if (show_modal_message_box(g_hwnd, message.c_str(), L"Confirm Save", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
     save_scene_to_path(g_editor.scene_path, false);
@@ -993,6 +1088,14 @@ bool object_name_exists(const std::string& name, SelectionKind ignore_kind = Sel
         if (ignore_kind == SelectionKind::Sphere && i == ignore_index) continue;
         if (g_editor.scene.spheres[static_cast<size_t>(i)].name == name) return true;
     }
+    for (int i = 0; i < static_cast<int>(g_editor.scene.directional_lights.size()); ++i) {
+        if (ignore_kind == SelectionKind::DirectionalLight && i == ignore_index) continue;
+        if (g_editor.scene.directional_lights[static_cast<size_t>(i)].name == name) return true;
+    }
+    for (int i = 0; i < static_cast<int>(g_editor.scene.point_lights.size()); ++i) {
+        if (ignore_kind == SelectionKind::PointLight && i == ignore_index) continue;
+        if (g_editor.scene.point_lights[static_cast<size_t>(i)].name == name) return true;
+    }
     return false;
 }
 
@@ -1009,7 +1112,7 @@ std::string unique_object_name(std::string base, SelectionKind ignore_kind = Sel
             return candidate;
         }
     }
-    return base + "_" + std::to_string(static_cast<int>(g_editor.scene.meshes.size() + g_editor.scene.spheres.size()));
+    return base + "_" + std::to_string(static_cast<int>(g_editor.scene.meshes.size() + g_editor.scene.spheres.size() + g_editor.scene.directional_lights.size() + g_editor.scene.point_lights.size()));
 }
 
 lt::Vec3 spawn_position(float distance = 1.5f) {
@@ -1081,6 +1184,31 @@ void add_area_light_mesh() {
     reset_accumulation(lt::RenderDirty::Geometry | lt::RenderDirty::Material);
 }
 
+void add_directional_light() {
+    lt::DirectionalLight light;
+    light.name = unique_object_name("Directional_Light");
+    light.position = spawn_position(1.2f);
+    light.direction = lt::normalize(lt::Vec3{0.2f, -1.0f, -0.3f});
+    light.color = {1.0f, 0.95f, 0.85f};
+    light.intensity = 1.5f;
+    g_editor.scene.directional_lights.push_back(std::move(light));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    select_directional_light(static_cast<int>(g_editor.scene.directional_lights.size()) - 1);
+    reset_accumulation(lt::RenderDirty::Geometry);
+}
+
+void add_point_light() {
+    lt::PointLight light;
+    light.name = unique_object_name("Point_Light");
+    light.position = spawn_position(1.2f);
+    light.color = {1.0f, 0.888889f, 0.666667f};
+    light.intensity = 10.0f;
+    g_editor.scene.point_lights.push_back(std::move(light));
+    g_editor.scene.uses_builtin_default_meshes = false;
+    select_point_light(static_cast<int>(g_editor.scene.point_lights.size()) - 1);
+    reset_accumulation(lt::RenderDirty::Geometry);
+}
+
 void add_mesh() {
     add_cube_mesh();
 }
@@ -1099,6 +1227,18 @@ void duplicate_selected() {
         copy.center.x += copy.radius * 2.2f;
         g_editor.scene.spheres.push_back(copy);
         select_sphere(static_cast<int>(g_editor.scene.spheres.size()) - 1);
+    } else if (has_directional_light_selection()) {
+        lt::DirectionalLight copy = g_editor.scene.directional_lights[static_cast<size_t>(g_editor.selected_directional_light)];
+        copy.name = unique_object_name(copy.name + "_copy");
+        copy.position.x += 0.5f;
+        g_editor.scene.directional_lights.push_back(copy);
+        select_directional_light(static_cast<int>(g_editor.scene.directional_lights.size()) - 1);
+    } else if (has_point_light_selection()) {
+        lt::PointLight copy = g_editor.scene.point_lights[static_cast<size_t>(g_editor.selected_point_light)];
+        copy.name = unique_object_name(copy.name + "_copy");
+        copy.position.x += 0.5f;
+        g_editor.scene.point_lights.push_back(copy);
+        select_point_light(static_cast<int>(g_editor.scene.point_lights.size()) - 1);
     }
     g_editor.scene.uses_builtin_default_meshes = false;
     invalidate_mesh_bounds_cache();
@@ -1120,6 +1260,26 @@ void delete_selected() {
         g_editor.scene.spheres.erase(g_editor.scene.spheres.begin() + old_index);
         if (!g_editor.scene.spheres.empty()) {
             select_sphere(std::min(old_index, static_cast<int>(g_editor.scene.spheres.size()) - 1));
+        } else {
+            select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
+        }
+    } else if (has_directional_light_selection()) {
+        const int old_index = g_editor.selected_directional_light;
+        g_editor.scene.directional_lights.erase(g_editor.scene.directional_lights.begin() + old_index);
+        if (!g_editor.scene.directional_lights.empty()) {
+            select_directional_light(std::min(old_index, static_cast<int>(g_editor.scene.directional_lights.size()) - 1));
+        } else if (!g_editor.scene.point_lights.empty()) {
+            select_point_light(0);
+        } else {
+            select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
+        }
+    } else if (has_point_light_selection()) {
+        const int old_index = g_editor.selected_point_light;
+        g_editor.scene.point_lights.erase(g_editor.scene.point_lights.begin() + old_index);
+        if (!g_editor.scene.point_lights.empty()) {
+            select_point_light(std::min(old_index, static_cast<int>(g_editor.scene.point_lights.size()) - 1));
+        } else if (!g_editor.scene.directional_lights.empty()) {
+            select_directional_light(0);
         } else {
             select_mesh(g_editor.scene.meshes.empty() ? -1 : 0);
         }
@@ -1433,6 +1593,18 @@ bool move_selected_object(lt::Vec3 delta) {
         g_editor.scene.uses_builtin_default_meshes = false;
         return true;
     }
+    if (has_point_light_selection()) {
+        lt::PointLight& light = g_editor.scene.point_lights[static_cast<size_t>(g_editor.selected_point_light)];
+        light.position += delta;
+        g_editor.scene.uses_builtin_default_meshes = false;
+        return true;
+    }
+    if (has_directional_light_selection()) {
+        lt::DirectionalLight& light = g_editor.scene.directional_lights[static_cast<size_t>(g_editor.selected_directional_light)];
+        light.position += delta;
+        g_editor.scene.uses_builtin_default_meshes = false;
+        return true;
+    }
     return false;
 }
 
@@ -1515,18 +1687,31 @@ bool point_in_triangle(ImVec2 p, ImVec2 a, ImVec2 b, ImVec2 c) {
     return !(has_neg && has_pos);
 }
 
+float world_per_pixel_at(lt::Vec3 world_point) {
+    const lt::Vec3 to_point = world_point - g_editor.scene.camera.position;
+    const lt::Vec3 forward = lt::normalize(g_editor.scene.camera.target - g_editor.scene.camera.position);
+    const float depth = std::max(0.1f, lt::dot(to_point, forward));
+    const float half_height = std::tan(g_editor.scene.camera.fov_degrees * lt::kPi / 360.0f);
+    return depth * half_height * 2.0f / std::max(1.0f, g_editor.viewport_size.y);
+}
+
 GizmoHandle pick_move_gizmo_axes(lt::Vec3 center3, lt::Vec3 ax, lt::Vec3 ay, lt::Vec3 az, ImVec2 mouse, bool allow_uniform) {
     ImVec2 c{}, x{}, y{}, z{}, xy{}, yz{}, zx{};
     if (!project_point(center3, c)) return GizmoHandle::None;
     if (allow_uniform && distance(mouse, c) <= 10.0f) {
         return GizmoHandle::Uniform;
     }
-    project_point(center3 + ax * 0.55f, x);
-    project_point(center3 + ay * 0.55f, y);
-    project_point(center3 + az * 0.55f, z);
-    project_point(center3 + (ax + ay) * 0.28f, xy);
-    project_point(center3 + (ay + az) * 0.28f, yz);
-    project_point(center3 + (az + ax) * 0.28f, zx);
+
+    const float ps = world_per_pixel_at(center3);
+    const float arrow_len = 80.0f * ps;
+    const float plane_ofs = 40.0f * ps;
+
+    project_point(center3 + ax * arrow_len, x);
+    project_point(center3 + ay * arrow_len, y);
+    project_point(center3 + az * arrow_len, z);
+    project_point(center3 + (ax + ay) * plane_ofs, xy);
+    project_point(center3 + (ay + az) * plane_ofs, yz);
+    project_point(center3 + (az + ax) * plane_ofs, zx);
     float best = 12.0f;
     GizmoHandle result = GizmoHandle::None;
     const float dx = distance_to_segment(mouse, c, x);
@@ -1565,9 +1750,11 @@ GizmoHandle pick_sphere_move_gizmo(lt::Vec3 center3, ImVec2 mouse) {
 GizmoHandle pick_rotate_gizmo(const lt::Mesh& mesh, lt::Vec3 center3, ImVec2 mouse) {
     ImVec2 c{}, px{}, py{}, pz{};
     if (!project_point(center3, c)) return GizmoHandle::None;
-    project_point(center3 + local_axis(mesh, {1.0f, 0.0f, 0.0f}) * 0.7f, px);
-    project_point(center3 + local_axis(mesh, {0.0f, 1.0f, 0.0f}) * 0.7f, py);
-    project_point(center3 + local_axis(mesh, {0.0f, 0.0f, 1.0f}) * 0.7f, pz);
+    const float ps = world_per_pixel_at(center3);
+    const float rot_r = 60.0f * ps;
+    project_point(center3 + local_axis(mesh, {1.0f, 0.0f, 0.0f}) * rot_r, px);
+    project_point(center3 + local_axis(mesh, {0.0f, 1.0f, 0.0f}) * rot_r, py);
+    project_point(center3 + local_axis(mesh, {0.0f, 0.0f, 1.0f}) * rot_r, pz);
     const ImVec2 ax{px.x - c.x, px.y - c.y};
     const ImVec2 ay{py.x - c.x, py.y - c.y};
     const ImVec2 az{pz.x - c.x, pz.y - c.y};
@@ -1739,9 +1926,280 @@ void handle_sphere_gizmo_drag() {
     reset_accumulation(lt::RenderDirty::Transform);
 }
 
+void handle_point_light_gizmo_drag() {
+    if (g_editor.tool_mode != ToolMode::Move) {
+        g_editor.hovered_gizmo = GizmoHandle::None;
+        if (g_editor.drag_start_point_light_index >= 0) {
+            g_editor.gizmo_dragging = false;
+            g_editor.active_gizmo = GizmoHandle::None;
+            g_editor.drag_start_point_light_index = -1;
+        }
+        return;
+    }
+
+    lt::PointLight& light = g_editor.scene.point_lights[static_cast<size_t>(g_editor.selected_point_light)];
+    ImVec2 center{};
+    float depth = 1.0f;
+    if (!project_point(light.position, center, &depth)) {
+        g_editor.hovered_gizmo = GizmoHandle::None;
+        return;
+    }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const GizmoHandle picked = pick_sphere_move_gizmo(light.position, mouse);
+    g_editor.hovered_gizmo = picked;
+    if (g_editor.viewport_hovered && picked != GizmoHandle::None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        g_editor.gizmo_dragging = true;
+        g_editor.drag_start_mouse = mouse;
+        g_editor.drag_start_mesh_index = -1;
+        g_editor.drag_start_sphere_index = -1;
+        g_editor.drag_start_point_light = light;
+        g_editor.drag_start_point_light_index = g_editor.selected_point_light;
+        g_editor.active_gizmo = picked;
+        setup_sphere_drag_projection(light.position, picked);
+    }
+    if (!g_editor.gizmo_dragging) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+        g_editor.selection_kind != SelectionKind::PointLight ||
+        g_editor.drag_start_point_light_index != g_editor.selected_point_light) {
+        g_editor.gizmo_dragging = false;
+        g_editor.active_gizmo = GizmoHandle::None;
+        g_editor.drag_start_point_light_index = -1;
+        return;
+    }
+
+    const ImVec2 delta{mouse.x - g_editor.drag_start_mouse.x, mouse.y - g_editor.drag_start_mouse.y};
+    const ViewTransform view = make_view_transform(true);
+    const float world_per_pixel = g_editor.drag_start_depth * view.half_height * 2.0f / std::max(1.0f, g_editor.viewport_size.y);
+    if (g_editor.active_gizmo == GizmoHandle::AxisX || g_editor.active_gizmo == GizmoHandle::AxisY || g_editor.active_gizmo == GizmoHandle::AxisZ) {
+        const lt::Vec3 axis = handle_axis(g_editor.active_gizmo);
+        const ImVec2 screen_axis{
+            g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const float len = std::sqrt(screen_axis.x * screen_axis.x + screen_axis.y * screen_axis.y);
+        const float amount = len > 0.0f ? (delta.x * screen_axis.x + delta.y * screen_axis.y) / len * world_per_pixel : 0.0f;
+        light.position = g_editor.drag_start_point_light.position + axis * amount;
+    } else {
+        lt::Vec3 a{}, b{};
+        handle_plane_axes(g_editor.active_gizmo, a, b);
+        const ImVec2 sa{
+            g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const ImVec2 sb{
+            g_editor.drag_start_axis_b_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_b_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const float det = sa.x * sb.y - sa.y * sb.x;
+        if (std::fabs(det) > 80.0f) {
+            const float amount_a = (delta.x * sb.y - delta.y * sb.x) / det;
+            const float amount_b = (sa.x * delta.y - sa.y * delta.x) / det;
+            light.position = g_editor.drag_start_point_light.position + a * amount_a + b * amount_b;
+        } else {
+            const ImVec2 combined{sa.x + sb.x, sa.y + sb.y};
+            const float len = std::sqrt(combined.x * combined.x + combined.y * combined.y);
+            const float amount = len > 1.0f ? (delta.x * combined.x + delta.y * combined.y) / len * world_per_pixel : 0.0f;
+            light.position = g_editor.drag_start_point_light.position + lt::normalize(a + b) * amount;
+        }
+    }
+    g_editor.scene.uses_builtin_default_meshes = false;
+    reset_accumulation(lt::RenderDirty::Transform);
+}
+
+void handle_directional_light_gizmo_drag() {
+    lt::DirectionalLight& light = g_editor.scene.directional_lights[static_cast<size_t>(g_editor.selected_directional_light)];
+
+    if (g_editor.tool_mode == ToolMode::Move) {
+        // Use the same move gizmo logic as sphere
+        ImVec2 center{};
+        float depth = 1.0f;
+        if (!project_point(light.position, center, &depth)) {
+            g_editor.hovered_gizmo = GizmoHandle::None;
+            return;
+        }
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const GizmoHandle picked = pick_move_gizmo_axes(
+            light.position,
+            {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
+            mouse, false);
+        g_editor.hovered_gizmo = picked;
+        if (g_editor.viewport_hovered && picked != GizmoHandle::None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            g_editor.gizmo_dragging = true;
+            g_editor.drag_start_mouse = mouse;
+            g_editor.drag_start_mesh_index = -1;
+            g_editor.drag_start_sphere_index = -1;
+            g_editor.drag_start_point_light_index = -1;
+            g_editor.drag_start_directional_light = light;
+            g_editor.drag_start_directional_light_index = g_editor.selected_directional_light;
+            g_editor.active_gizmo = picked;
+            setup_sphere_drag_projection(light.position, picked);
+        }
+        if (!g_editor.gizmo_dragging) return;
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+            g_editor.selection_kind != SelectionKind::DirectionalLight ||
+            g_editor.drag_start_directional_light_index != g_editor.selected_directional_light) {
+            g_editor.gizmo_dragging = false;
+            g_editor.active_gizmo = GizmoHandle::None;
+            g_editor.drag_start_directional_light_index = -1;
+            return;
+        }
+        const ImVec2 delta{mouse.x - g_editor.drag_start_mouse.x, mouse.y - g_editor.drag_start_mouse.y};
+        const ViewTransform view = make_view_transform(true);
+        const float world_per_pixel = g_editor.drag_start_depth * view.half_height * 2.0f / std::max(1.0f, g_editor.viewport_size.y);
+        if (g_editor.active_gizmo == GizmoHandle::AxisX || g_editor.active_gizmo == GizmoHandle::AxisY || g_editor.active_gizmo == GizmoHandle::AxisZ) {
+            const lt::Vec3 axis = handle_axis(g_editor.active_gizmo);
+            const ImVec2 screen_axis{
+                g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+                g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+            };
+            const float len = std::sqrt(screen_axis.x * screen_axis.x + screen_axis.y * screen_axis.y);
+            const float amount = len > 0.0f ? (delta.x * screen_axis.x + delta.y * screen_axis.y) / len * world_per_pixel : 0.0f;
+            light.position = g_editor.drag_start_directional_light.position + axis * amount;
+        } else {
+            lt::Vec3 a{}, b{};
+            handle_plane_axes(g_editor.active_gizmo, a, b);
+            const ImVec2 sa{
+                g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+                g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+            };
+            const ImVec2 sb{
+                g_editor.drag_start_axis_b_screen.x - g_editor.drag_start_center_screen.x,
+                g_editor.drag_start_axis_b_screen.y - g_editor.drag_start_center_screen.y,
+            };
+            const float det = sa.x * sb.y - sa.y * sb.x;
+            if (std::fabs(det) > 80.0f) {
+                const float amount_a = (delta.x * sb.y - delta.y * sb.x) / det;
+                const float amount_b = (sa.x * delta.y - sa.y * delta.x) / det;
+                light.position = g_editor.drag_start_directional_light.position + a * amount_a + b * amount_b;
+            } else {
+                const ImVec2 combined{sa.x + sb.x, sa.y + sb.y};
+                const float len = std::sqrt(combined.x * combined.x + combined.y * combined.y);
+                const float amount = len > 1.0f ? (delta.x * combined.x + delta.y * combined.y) / len * world_per_pixel : 0.0f;
+                light.position = g_editor.drag_start_directional_light.position + lt::normalize(a + b) * amount;
+            }
+        }
+        g_editor.scene.uses_builtin_default_meshes = false;
+        reset_accumulation(lt::RenderDirty::Transform);
+
+    } else if (g_editor.tool_mode == ToolMode::Rotate) {
+        // Use the same rotate gizmo pick logic as mesh (world axes, no local transform)
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        ImVec2 c{}, px{}, py{}, pz{};
+        if (!project_point(light.position, c)) { g_editor.hovered_gizmo = GizmoHandle::None; return; }
+        const float ps = world_per_pixel_at(light.position);
+        const float rot_r = 60.0f * ps;
+        project_point(light.position + lt::Vec3{1.0f, 0.0f, 0.0f} * rot_r, px);
+        project_point(light.position + lt::Vec3{0.0f, 1.0f, 0.0f} * rot_r, py);
+        project_point(light.position + lt::Vec3{0.0f, 0.0f, 1.0f} * rot_r, pz);
+        const ImVec2 ax{px.x - c.x, px.y - c.y};
+        const ImVec2 ay{py.x - c.x, py.y - c.y};
+        const ImVec2 az{pz.x - c.x, pz.y - c.y};
+
+        // Pick nearest ring (same logic as pick_rotate_gizmo for mesh)
+        const auto ellipse_err = [&](ImVec2 a, ImVec2 b) {
+            const float det = a.x * b.y - a.y * b.x;
+            if (std::fabs(det) < 1.0e-5f) return 1.0e9f;
+            const ImVec2 p{mouse.x - c.x, mouse.y - c.y};
+            const float u = (p.x * b.y - p.y * b.x) / det;
+            const float v = (a.x * p.y - a.y * p.x) / det;
+            return std::fabs(std::sqrt(u * u + v * v) - 1.0f);
+        };
+        float best = 0.28f;
+        GizmoHandle picked = GizmoHandle::None;
+        int pick_axis = -1; // 0=X, 1=Y, 2=Z
+        const float ex = ellipse_err(ay, az);
+        if (ex < best) { best = ex; picked = GizmoHandle::AxisX; pick_axis = 0; }
+        const float ey = ellipse_err(az, ax);
+        if (ey < best) { best = ey; picked = GizmoHandle::AxisY; pick_axis = 1; }
+        const float ez = ellipse_err(ax, ay);
+        if (ez < best) { best = ez; picked = GizmoHandle::AxisZ; pick_axis = 2; }
+        g_editor.hovered_gizmo = picked;
+
+        if (g_editor.viewport_hovered && picked != GizmoHandle::None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            g_editor.gizmo_dragging = true;
+            g_editor.drag_start_mouse = mouse;
+            g_editor.drag_start_mesh_index = -1;
+            g_editor.drag_start_sphere_index = -1;
+            g_editor.drag_start_point_light_index = -1;
+            g_editor.drag_start_directional_light_index = -1;
+            g_editor.active_gizmo = picked;
+            g_editor.drag_start_directional_light = light;
+            g_editor.drag_start_directional_light_index = g_editor.selected_directional_light;
+            // Store initial ellipse angle for incremental rotation
+            const lt::Vec3 wx = {1.0f, 0.0f, 0.0f}, wy = {0.0f, 1.0f, 0.0f}, wz = {0.0f, 0.0f, 1.0f};
+            if (picked == GizmoHandle::AxisX) {
+                g_editor.drag_start_axis_a_screen = py; g_editor.drag_start_axis_b_screen = pz;
+            } else if (picked == GizmoHandle::AxisY) {
+                g_editor.drag_start_axis_a_screen = pz; g_editor.drag_start_axis_b_screen = px;
+            } else {
+                g_editor.drag_start_axis_a_screen = px; g_editor.drag_start_axis_b_screen = py;
+            }
+            g_editor.drag_start_center_screen = c;
+            g_editor.drag_start_angle = ellipse_angle(mouse, c,
+                {g_editor.drag_start_axis_a_screen.x - c.x, g_editor.drag_start_axis_a_screen.y - c.y},
+                {g_editor.drag_start_axis_b_screen.x - c.x, g_editor.drag_start_axis_b_screen.y - c.y});
+        }
+
+        if (!g_editor.gizmo_dragging) return;
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+            g_editor.selection_kind != SelectionKind::DirectionalLight ||
+            g_editor.drag_start_directional_light_index != g_editor.selected_directional_light) {
+            g_editor.gizmo_dragging = false;
+            g_editor.active_gizmo = GizmoHandle::None;
+            g_editor.drag_start_directional_light_index = -1;
+            return;
+        }
+
+        // Incremental ellipse rotation — same pattern as mesh rotation
+        const ImVec2 ea{
+            g_editor.drag_start_axis_a_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_a_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        const ImVec2 eb{
+            g_editor.drag_start_axis_b_screen.x - g_editor.drag_start_center_screen.x,
+            g_editor.drag_start_axis_b_screen.y - g_editor.drag_start_center_screen.y,
+        };
+        float signed_amount = ellipse_angle(mouse, g_editor.drag_start_center_screen, ea, eb) - g_editor.drag_start_angle;
+        if (signed_amount > lt::kPi) signed_amount -= 2.0f * lt::kPi;
+        if (signed_amount < -lt::kPi) signed_amount += 2.0f * lt::kPi;
+        if (std::fabs(signed_amount) < 1.0e-6f) return;
+
+        // Rotation axis in world space
+        lt::Vec3 rot_axis;
+        if (g_editor.active_gizmo == GizmoHandle::AxisX) rot_axis = {1.0f, 0.0f, 0.0f};
+        else if (g_editor.active_gizmo == GizmoHandle::AxisY) rot_axis = {0.0f, 1.0f, 0.0f};
+        else rot_axis = {0.0f, 0.0f, 1.0f};
+
+        // Apply rotation to the initial direction
+        lt::Vec3 init_dir = g_editor.drag_start_directional_light.direction;
+        float c_ = std::cos(signed_amount), s_ = std::sin(signed_amount);
+        lt::Vec3 rotated = init_dir * c_ + lt::cross(rot_axis, init_dir) * s_ + rot_axis * lt::dot(rot_axis, init_dir) * (1.0f - c_);
+        if (lt::dot(rotated, rotated) > 1.0e-8f) {
+            light.direction = lt::normalize(rotated);
+        }
+
+        g_editor.scene.uses_builtin_default_meshes = false;
+        reset_accumulation(lt::RenderDirty::Geometry);
+
+    } else {
+        g_editor.hovered_gizmo = GizmoHandle::None;
+        g_editor.gizmo_dragging = false;
+        g_editor.active_gizmo = GizmoHandle::None;
+    }
+}
+
 void handle_gizmo_drag() {
     if (has_sphere_selection()) {
         handle_sphere_gizmo_drag();
+        return;
+    }
+    if (has_point_light_selection()) {
+        handle_point_light_gizmo_drag();
+        return;
+    }
+    if (has_directional_light_selection()) {
+        handle_directional_light_gizmo_drag();
         return;
     }
     if (!has_mesh_selection()) {
@@ -1750,6 +2208,7 @@ void handle_gizmo_drag() {
         g_editor.active_gizmo = GizmoHandle::None;
         g_editor.drag_start_mesh_index = -1;
         g_editor.drag_start_sphere_index = -1;
+        g_editor.drag_start_point_light_index = -1;
         return;
     }
     lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
@@ -1777,6 +2236,7 @@ void handle_gizmo_drag() {
         g_editor.drag_start_mesh = mesh;
         g_editor.drag_start_mesh_index = g_editor.selected_mesh;
         g_editor.drag_start_sphere_index = -1;
+        g_editor.drag_start_point_light_index = -1;
         g_editor.active_gizmo = picked;
         setup_drag_projection(mesh, center3, picked);
     }
@@ -2042,12 +2502,17 @@ void draw_move_gizmo_handles(ImDrawList* draw_list, lt::Vec3 center3, lt::Vec3 a
     ImVec2 center{};
     if (!project_point(center3, center)) return;
     ImVec2 px{}, py{}, pz{}, pxy{}, pyz{}, pzx{};
-    const bool okx = project_point(center3 + ax * 0.55f, px);
-    const bool oky = project_point(center3 + ay * 0.55f, py);
-    const bool okz = project_point(center3 + az * 0.55f, pz);
-    const bool okxy = project_point(center3 + (ax + ay) * 0.28f, pxy);
-    const bool okyz = project_point(center3 + (ay + az) * 0.28f, pyz);
-    const bool okzx = project_point(center3 + (az + ax) * 0.28f, pzx);
+
+    const float ps = world_per_pixel_at(center3);
+    const float arrow_len = 80.0f * ps;
+    const float plane_ofs = 40.0f * ps;
+
+    const bool okx = project_point(center3 + ax * arrow_len, px);
+    const bool oky = project_point(center3 + ay * arrow_len, py);
+    const bool okz = project_point(center3 + az * arrow_len, pz);
+    const bool okxy = project_point(center3 + (ax + ay) * plane_ofs, pxy);
+    const bool okyz = project_point(center3 + (ay + az) * plane_ofs, pyz);
+    const bool okzx = project_point(center3 + (az + ax) * plane_ofs, pzx);
     if (okx && oky && okxy) {
         const ImU32 fill = handle_is_hot(GizmoHandle::PlaneXY) ? IM_COL32(255, 235, 80, 115) : IM_COL32(235, 200, 70, 70);
         const ImU32 edge = hot_color(GizmoHandle::PlaneXY, IM_COL32(235, 200, 70, 210));
@@ -2124,6 +2589,73 @@ void draw_gizmo_overlay() {
         }
         return;
     }
+    if (has_point_light_selection()) {
+        const lt::PointLight& light = g_editor.scene.point_lights[static_cast<size_t>(g_editor.selected_point_light)];
+        if (g_editor.tool_mode == ToolMode::Move) {
+            draw_move_gizmo_handles(
+                draw_list,
+                light.position,
+                {1.0f, 0.0f, 0.0f},
+                {0.0f, 1.0f, 0.0f},
+                {0.0f, 0.0f, 1.0f},
+                false);
+        }
+        return;
+    }
+    if (has_directional_light_selection()) {
+        const lt::DirectionalLight& light = g_editor.scene.directional_lights[static_cast<size_t>(g_editor.selected_directional_light)];
+        if (g_editor.tool_mode == ToolMode::Move) {
+            draw_move_gizmo_handles(
+                draw_list,
+                light.position,
+                {1.0f, 0.0f, 0.0f},
+                {0.0f, 1.0f, 0.0f},
+                {0.0f, 0.0f, 1.0f},
+                false);
+        } else if (g_editor.tool_mode == ToolMode::Rotate) {
+            ImVec2 px{}, py{}, pz{};
+            ImVec2 center{};
+            if (!project_point(light.position, center)) return;
+            const float ps = world_per_pixel_at(light.position);
+            const float rot_r = 60.0f * ps;
+            project_point(light.position + lt::Vec3{1.0f, 0.0f, 0.0f} * rot_r, px);
+            project_point(light.position + lt::Vec3{0.0f, 1.0f, 0.0f} * rot_r, py);
+            project_point(light.position + lt::Vec3{0.0f, 0.0f, 1.0f} * rot_r, pz);
+            const ImVec2 ax{px.x - center.x, px.y - center.y};
+            const ImVec2 ay{py.x - center.x, py.y - center.y};
+            const ImVec2 az{pz.x - center.x, pz.y - center.y};
+            draw_polyline_ellipse(draw_list, center, ay, az, hot_color(GizmoHandle::AxisX, IM_COL32(235, 80, 80, 255)), hot_thickness(GizmoHandle::AxisX, 2.0f));
+            draw_polyline_ellipse(draw_list, center, az, ax, hot_color(GizmoHandle::AxisY, IM_COL32(80, 210, 105, 255)), hot_thickness(GizmoHandle::AxisY, 2.0f));
+            draw_polyline_ellipse(draw_list, center, ax, ay, hot_color(GizmoHandle::AxisZ, IM_COL32(90, 140, 255, 255)), hot_thickness(GizmoHandle::AxisZ, 2.0f));
+        }
+        // Always draw direction arrow as visual indicator
+        // direction points surface→light; arrow shows light→surface (where light shines)
+        {
+            const lt::Vec3 dir = lt::normalize(light.direction);
+            if (lt::dot(dir, dir) > 0.0f) {
+                const float ps = world_per_pixel_at(light.position);
+                const float arrow_world = 80.0f * ps;
+                const lt::Vec3 tip = light.position - dir * arrow_world;
+                ImVec2 s_pos{}, s_tip{};
+                if (project_point(light.position, s_pos) && project_point(tip, s_tip)) {
+                    const ImU32 arrow_color = IM_COL32(255, 200, 70, 200);
+                    draw_list->AddLine(s_pos, s_tip, arrow_color, 2.0f);
+                    const ImVec2 dv{s_tip.x - s_pos.x, s_tip.y - s_pos.y};
+                    const float len = std::sqrt(dv.x * dv.x + dv.y * dv.y);
+                    if (len > 4.0f) {
+                        const ImVec2 nd{dv.x / len, dv.y / len};
+                        const ImVec2 perp{-nd.y * 7.0f, nd.x * 7.0f};
+                        draw_list->AddTriangleFilled(
+                            s_tip,
+                            {s_tip.x - nd.x * 12.0f + perp.x, s_tip.y - nd.y * 12.0f + perp.y},
+                            {s_tip.x - nd.x * 12.0f - perp.x, s_tip.y - nd.y * 12.0f - perp.y},
+                            arrow_color);
+                    }
+                }
+            }
+        }
+        return;
+    }
     lt::Vec3 center3{};
     float radius3 = 1.0f;
     mesh_center_radius(g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)], center3, radius3);
@@ -2142,9 +2674,11 @@ void draw_gizmo_overlay() {
     } else if (g_editor.tool_mode == ToolMode::Rotate) {
         const lt::Mesh& mesh = g_editor.scene.meshes[static_cast<size_t>(g_editor.selected_mesh)];
         ImVec2 px{}, py{}, pz{};
-        project_point(center3 + local_axis(mesh, {1.0f, 0.0f, 0.0f}) * 0.7f, px);
-        project_point(center3 + local_axis(mesh, {0.0f, 1.0f, 0.0f}) * 0.7f, py);
-        project_point(center3 + local_axis(mesh, {0.0f, 0.0f, 1.0f}) * 0.7f, pz);
+        const float ps = world_per_pixel_at(center3);
+        const float rot_r = 60.0f * ps;
+        project_point(center3 + local_axis(mesh, {1.0f, 0.0f, 0.0f}) * rot_r, px);
+        project_point(center3 + local_axis(mesh, {0.0f, 1.0f, 0.0f}) * rot_r, py);
+        project_point(center3 + local_axis(mesh, {0.0f, 0.0f, 1.0f}) * rot_r, pz);
         const ImVec2 ax{px.x - center.x, px.y - center.y};
         const ImVec2 ay{py.x - center.x, py.y - center.y};
         const ImVec2 az{pz.x - center.x, pz.y - center.y};
@@ -2364,8 +2898,122 @@ void apply_blender_style() {
     c[ImGuiCol_SliderGrabActive] = ImVec4(1.0f, 0.62f, 0.25f, 1.0f);
 }
 
+// ---- Blender .dat icon loader ----
+
+struct IconTriangle {
+    uint8_t x0, y0, x1, y1, x2, y2;
+    uint8_t r, g, b, a;
+};
+
+struct LoadedIcon {
+    std::vector<IconTriangle> triangles;
+};
+
+std::unordered_map<std::string, LoadedIcon> g_blender_icons;
+
+bool load_dat_icon(const std::string& path, const std::string& name) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    std::vector<char> raw((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (raw.size() < 8) return false;
+    if (raw[0] != 'V' || raw[1] != 'C' || raw[2] != 'O') return false;
+
+    const uint8_t* body = reinterpret_cast<const uint8_t*>(raw.data() + 8);
+    const size_t body_size = raw.size() - 8;
+    const size_t count = body_size / 18;
+
+    if (count == 0) return false;
+
+    LoadedIcon icon;
+    icon.triangles.resize(count);
+    const uint8_t* coords = body;
+    const uint8_t* colors = body + count * 6;
+
+    for (size_t i = 0; i < count; ++i) {
+        IconTriangle& tri = icon.triangles[i];
+        tri.x0 = coords[i * 6 + 0]; tri.y0 = coords[i * 6 + 1];
+        tri.x1 = coords[i * 6 + 2]; tri.y1 = coords[i * 6 + 3];
+        tri.x2 = coords[i * 6 + 4]; tri.y2 = coords[i * 6 + 5];
+        tri.r = colors[i * 12 + 0]; tri.g = colors[i * 12 + 1];
+        tri.b = colors[i * 12 + 2]; tri.a = colors[i * 12 + 3];
+    }
+
+    g_blender_icons[name] = std::move(icon);
+    LT_LOG_DEBUG("Loaded Blender icon '{}': {} triangles", name, count);
+    return true;
+}
+
+void load_blender_icons() {
+    // Search paths for Blender icon directory
+    std::vector<std::string> search;
+    if (const char* env = std::getenv("BLENDER_ICONS_DIR")) search.push_back(env);
+    search.push_back("F:/Steam/steamapps/common/Blender/4.5/datafiles/icons");
+    search.push_back("C:/Program Files/Blender Foundation/Blender 4.5/datafiles/icons");
+    search.push_back("./icons");
+
+    // Also try to locate relative to executable
+    wchar_t exe_path[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH)) {
+        std::filesystem::path exe_dir = std::filesystem::path(exe_path).parent_path();
+        search.push_back((exe_dir / "icons").string());
+    }
+
+    std::string icon_dir;
+    for (const auto& p : search) {
+        if (std::filesystem::exists(p)) { icon_dir = p; break; }
+    }
+    if (icon_dir.empty()) {
+        LT_LOG_INFO("No Blender icon directory found; using procedural fallback icons");
+        return;
+    }
+
+    int loaded = 0;
+    for (int i = 0; i < static_cast<int>(EditorIcon::ExitFullscreen) + 1; ++i) {
+        const EditorIconInfo& info = editor_icon_info(static_cast<EditorIcon>(i));
+        if (!info.blender_source) continue;
+        std::string path = icon_dir + "/" + info.blender_source;
+        if (load_dat_icon(path, info.blender_source)) ++loaded;
+    }
+
+    LT_LOG_INFO("Loaded {} Blender icons from '{}'", loaded, icon_dir);
+    if (loaded == 0) LT_LOG_WARN("No Blender icons were loaded; verify the icon directory contains .dat files");
+}
+
+void draw_blender_icon(ImDrawList* draw_list, const LoadedIcon& icon, ImVec2 min, float size, ImU32 tint) {
+    const float scale = size / 255.0f;
+    const int tr = static_cast<int>((tint >> IM_COL32_R_SHIFT) & 0xFF);
+    const int tg = static_cast<int>((tint >> IM_COL32_G_SHIFT) & 0xFF);
+    const int tb = static_cast<int>((tint >> IM_COL32_B_SHIFT) & 0xFF);
+    const int ta = static_cast<int>((tint >> IM_COL32_A_SHIFT) & 0xFF);
+
+    for (const auto& tri : icon.triangles) {
+        const ImVec2 p0{min.x + tri.x0 * scale, min.y + (255 - tri.y0) * scale};
+        const ImVec2 p1{min.x + tri.x1 * scale, min.y + (255 - tri.y1) * scale};
+        const ImVec2 p2{min.x + tri.x2 * scale, min.y + (255 - tri.y2) * scale};
+        const ImU32 col = IM_COL32(
+            (tri.r * tr) / 255,
+            (tri.g * tg) / 255,
+            (tri.b * tb) / 255,
+            (tri.a * ta) / 255);
+        draw_list->AddTriangleFilled(p0, p1, p2, col);
+    }
+}
+
 void draw_editor_icon(ImDrawList* draw_list, EditorIcon icon, ImVec2 min, ImVec2 max, ImU32 color, ImU32 accent = 0) {
     if (!draw_list) return;
+
+    // Prefer loaded Blender icon
+    const EditorIconInfo& info = editor_icon_info(icon);
+    if (info.blender_source) {
+        auto it = g_blender_icons.find(info.blender_source);
+        if (it != g_blender_icons.end()) {
+            const float size = std::min(max.x - min.x, max.y - min.y);
+            draw_blender_icon(draw_list, it->second, min, size, color);
+            return;
+        }
+    }
+
+    // Procedural fallback
     const float w = max.x - min.x;
     const float h = max.y - min.y;
     const float s = std::min(w, h);
@@ -2722,6 +3370,7 @@ float draw_top_bar() {
     const float height = ImGui::GetFrameHeight();
     if (!ImGui::BeginMainMenuBar()) return height;
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("New", "Ctrl+N")) new_scene();
         if (ImGui::MenuItem("Open")) open_scene_dialog();
         if (ImGui::MenuItem("Save", "Ctrl+S")) save_scene();
         if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) save_scene_as_dialog();
@@ -2736,6 +3385,11 @@ float draw_top_bar() {
             if (icon_menu_item(EditorIcon::Sphere, "Analytic Sphere")) add_analytic_sphere();
             ImGui::Separator();
             if (icon_menu_item(EditorIcon::Light, "Area Light")) add_area_light_mesh();
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Add Light")) {
+            if (icon_menu_item(EditorIcon::Light, "Directional Light")) add_directional_light();
+            if (icon_menu_item(EditorIcon::Light, "Point Light")) add_point_light();
             ImGui::EndMenu();
         }
         if (icon_menu_item(EditorIcon::Duplicate, "Duplicate", nullptr, has_selection())) duplicate_selected();
@@ -2798,6 +3452,23 @@ void draw_outliner() {
             const lt::Sphere& sphere = g_editor.scene.spheres[static_cast<size_t>(i)];
             ImGui::PushID(i);
             if (icon_selectable(EditorIcon::Sphere, sphere.name.c_str(), selected)) select_sphere(i);
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+    if (icon_tree_node(EditorIcon::Light, "Lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int i = 0; i < static_cast<int>(g_editor.scene.directional_lights.size()); ++i) {
+            const bool selected = g_editor.selection_kind == SelectionKind::DirectionalLight && g_editor.selected_directional_light == i;
+            const lt::DirectionalLight& light = g_editor.scene.directional_lights[static_cast<size_t>(i)];
+            ImGui::PushID(i);
+            if (icon_selectable(EditorIcon::Light, light.name.c_str(), selected)) select_directional_light(i);
+            ImGui::PopID();
+        }
+        for (int i = 0; i < static_cast<int>(g_editor.scene.point_lights.size()); ++i) {
+            const bool selected = g_editor.selection_kind == SelectionKind::PointLight && g_editor.selected_point_light == i;
+            const lt::PointLight& light = g_editor.scene.point_lights[static_cast<size_t>(i)];
+            ImGui::PushID(i);
+            if (icon_selectable(EditorIcon::Light, light.name.c_str(), selected)) select_point_light(i);
             ImGui::PopID();
         }
         ImGui::TreePop();
@@ -2920,6 +3591,69 @@ void draw_properties() {
                     reset_accumulation(lt::RenderDirty::Geometry);
                 }
                 ImGui::TextDisabled("Analytic sphere");
+            } else if (has_directional_light_selection()) {
+                lt::DirectionalLight& light = g_editor.scene.directional_lights[static_cast<size_t>(g_editor.selected_directional_light)];
+                char name[128] = {};
+                std::strncpy(name, light.name.c_str(), sizeof(name) - 1);
+                if (ImGui::InputText("Name", name, sizeof(name))) {
+                    light.name = name;
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    const std::string unique = unique_object_name(light.name, SelectionKind::DirectionalLight, g_editor.selected_directional_light);
+                    if (light.name != unique) {
+                        light.name = unique;
+                        g_editor.scene.uses_builtin_default_meshes = false;
+                    }
+                }
+                if (edit_vec3("Position", light.position, 0.02f, lt::RenderDirty::Transform)) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                // Direction as yaw/pitch in degrees (more intuitive than raw xyz)
+                lt::Vec3 dir = lt::normalize(light.direction);
+                if (lt::dot(dir, dir) <= 0.0f) dir = {0.0f, -1.0f, 0.0f};
+                float yaw_deg = std::atan2(dir.x, dir.z) * 180.0f / lt::kPi;
+                float pitch_deg = std::asin(std::clamp(dir.y, -1.0f, 1.0f)) * 180.0f / lt::kPi;
+                bool dir_changed = false;
+                if (ImGui::DragFloat("Yaw", &yaw_deg, 1.0f, -180.0f, 180.0f, "%.1f°")) dir_changed = true;
+                if (ImGui::DragFloat("Pitch", &pitch_deg, 1.0f, -89.9f, 89.9f, "%.1f°")) dir_changed = true;
+                if (dir_changed) {
+                    const float yr = yaw_deg * lt::kPi / 180.0f;
+                    const float pr = pitch_deg * lt::kPi / 180.0f;
+                    light.direction = {std::cos(pr) * std::sin(yr), std::sin(pr), std::cos(pr) * std::cos(yr)};
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
+                color_edit("Color", light.color, lt::RenderDirty::Geometry);
+                if (ImGui::DragFloat("Intensity", &light.intensity, 0.1f, 0.0f, 1000.0f, "%.2f")) {
+                    light.intensity = std::max(0.0f, light.intensity);
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
+            } else if (has_point_light_selection()) {
+                lt::PointLight& light = g_editor.scene.point_lights[static_cast<size_t>(g_editor.selected_point_light)];
+                char name[128] = {};
+                std::strncpy(name, light.name.c_str(), sizeof(name) - 1);
+                if (ImGui::InputText("Name", name, sizeof(name))) {
+                    light.name = name;
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    const std::string unique = unique_object_name(light.name, SelectionKind::PointLight, g_editor.selected_point_light);
+                    if (light.name != unique) {
+                        light.name = unique;
+                        g_editor.scene.uses_builtin_default_meshes = false;
+                    }
+                }
+                if (edit_vec3("Position", light.position, 0.02f, lt::RenderDirty::Geometry)) {
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                }
+                color_edit("Color", light.color, lt::RenderDirty::Geometry);
+                if (ImGui::DragFloat("Intensity", &light.intensity, 0.1f, 0.0f, 100000.0f, "%.2f")) {
+                    light.intensity = std::max(0.0f, light.intensity);
+                    g_editor.scene.uses_builtin_default_meshes = false;
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
             } else {
                 ImGui::TextDisabled("No object selected");
             }
@@ -3521,13 +4255,15 @@ void draw_solid_light_helpers(ImDrawList* draw_list) {
         }
     }
 
-    // Directional lights: draw a line from origin toward light direction
+    // Directional lights: draw arrow showing where the light shines (opposite of direction)
     for (const auto& dl : g_editor.scene.directional_lights) {
-        // Compute a world-space origin point roughly in view
-        const lt::Vec3 origin = g_editor.scene.camera.target - lt::normalize(dl.direction) * 2.0f;
-        const lt::Vec3 tip = origin + lt::normalize(dl.direction) * 1.5f;
+        const lt::Vec3 dir = lt::normalize(dl.direction);
+        if (lt::dot(dir, dir) <= 0.0f) continue;
+        const float ps = world_per_pixel_at(dl.position);
+        const float arrow_len = 80.0f * ps;
+        const lt::Vec3 tip = dl.position - dir * arrow_len;
         ImVec2 s_origin{}, s_tip{};
-        if (project_point(origin, s_origin) && project_point(tip, s_tip)) {
+        if (project_point(dl.position, s_origin) && project_point(tip, s_tip)) {
             draw_list->AddLine(s_origin, s_tip, dir_light_color, 1.8f);
             // Arrowhead
             const ImVec2 dir = {s_tip.x - s_origin.x, s_tip.y - s_origin.y};
@@ -3549,6 +4285,25 @@ void draw_solid_selection_outline(ImDrawList* draw_list) {
         draw_mesh_bounds_outline(draw_list, g_editor.selected_mesh, sel_color, 2.2f);
     } else if (g_editor.selection_kind == SelectionKind::Sphere) {
         draw_sphere_outline(draw_list, g_editor.selected_sphere, sel_color, 2.2f);
+    } else if (g_editor.selection_kind == SelectionKind::PointLight) {
+        const lt::PointLight& light = g_editor.scene.point_lights[static_cast<size_t>(g_editor.selected_point_light)];
+        ImVec2 center{};
+        if (project_point(light.position, center)) {
+            const float r = 8.0f;
+            draw_list->AddCircle(center, r, sel_color, 0, 2.2f);
+            draw_list->AddLine({center.x - r - 3.0f, center.y}, {center.x + r + 3.0f, center.y}, sel_color, 2.2f);
+            draw_list->AddLine({center.x, center.y - r - 3.0f}, {center.x, center.y + r + 3.0f}, sel_color, 2.2f);
+        }
+    } else if (g_editor.selection_kind == SelectionKind::DirectionalLight) {
+        const lt::DirectionalLight& light = g_editor.scene.directional_lights[static_cast<size_t>(g_editor.selected_directional_light)];
+        ImVec2 center{};
+        if (project_point(light.position, center)) {
+            const float r = 7.0f;
+            draw_list->AddCircle(center, r, sel_color, 0, 2.2f);
+            // Cross mark for directional light
+            draw_list->AddLine({center.x - r - 2.0f, center.y}, {center.x + r + 2.0f, center.y}, sel_color, 2.2f);
+            draw_list->AddLine({center.x, center.y - r - 2.0f}, {center.x, center.y + r + 2.0f}, sel_color, 2.2f);
+        }
     }
 }
 
@@ -4031,6 +4786,7 @@ void draw_statistics_panel() {
     stat_row("Triangles", "%zu", total_tris);
     stat_row("Light Triangles", "%zu", total_light_tris);
     stat_row("Directional Lights", "%d", static_cast<int>(scene.directional_lights.size()));
+    stat_row("Point Lights", "%d", static_cast<int>(scene.point_lights.size()));
     end_stats_table();
 
     // Refresh pick cache for RenderScene stats if stale (once per generation)
@@ -4423,8 +5179,20 @@ void draw_ui() {
 void handle_global_shortcuts() {
     ImGuiIO& io = ImGui::GetIO();
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) PostQuitMessage(0);
-    if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene_as_dialog();
-    else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) save_scene();
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N)) new_scene();
+    static bool save_shortcut_waiting_for_release = false;
+    const bool save_shortcut_down = io.KeyCtrl && ImGui::IsKeyDown(ImGuiKey_S);
+    if (!save_shortcut_down) {
+        save_shortcut_waiting_for_release = false;
+    }
+    if (!save_shortcut_waiting_for_release && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+        save_shortcut_waiting_for_release = true;
+        if (io.KeyShift) {
+            save_scene_as_dialog();
+        } else {
+            save_scene();
+        }
+    }
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R)) reset_accumulation();
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) delete_selected();
     if (ImGui::IsKeyPressed(ImGuiKey_Space)) g_editor.paused = !g_editor.paused;
@@ -4533,6 +5301,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     io.IniFilename = nullptr;
     load_editor_fonts(io);
     apply_blender_style();
+    load_blender_icons();
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_device, g_context);
     load_scene_file(g_editor.scene_path);

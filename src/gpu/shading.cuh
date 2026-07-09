@@ -735,6 +735,48 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
             direct = add(direct, clamp_sample_radiance_gpu(mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv), mul(light.color, light.intensity)), ndotl)));
         }
     }
+
+    for (int i = 0; i < scene.point_light_count; ++i) {
+        const GpuPointLight light = scene.point_lights[i];
+        if (light.intensity <= 0.0f) continue;
+        const Vec3 to_light = sub(light.position, hit.position);
+        const float dist2 = ddot(to_light, to_light);
+        const float dist = sqrtf(dist2);
+        const float eps = 0.001f;
+        const float falloff = light.intensity / fmaxf(eps, dist2);
+        if (falloff <= 0.0f) continue;
+        const Vec3 light_dir = divv(to_light, dist);
+        const float ndotl_raw = ddot(hit.normal, light_dir);
+        const bool diffuse_transmission = material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission);
+        const float ndotl = (material.double_sided || diffuse_transmission) ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
+        if (ndotl <= 0.0f) continue;
+
+        bool blocked = false;
+        const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
+        Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
+        for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+            GpuHit shadow_hit;
+            if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
+                break;
+            }
+            const float shadow_dist = sqrtf(ddot(sub(shadow_hit.position, hit.position), sub(shadow_hit.position, hit.position)));
+            if (shadow_dist >= dist - 0.01f) break;
+            const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
+            if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
+                shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+                material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
+                shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
+                continue;
+            }
+            blocked = true;
+            break;
+        }
+        if (!blocked) {
+            direct = add(direct, clamp_sample_radiance_gpu(
+                mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv),
+                        mul(light.color, falloff)), ndotl)));
+        }
+    }
     return direct;
 }
 

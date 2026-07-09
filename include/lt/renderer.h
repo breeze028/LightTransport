@@ -266,6 +266,7 @@ private:
     void* device_triangle_indices_ = nullptr;
     void* device_light_indices_ = nullptr;
     void* device_directional_lights_ = nullptr;
+    void* device_point_lights_ = nullptr;
     void* device_bvh_nodes_ = nullptr;
     void* device_mesh_instances_ = nullptr;
     void* device_mesh_instance_indices_ = nullptr;
@@ -289,6 +290,7 @@ private:
     int cached_triangle_indices_ = 0;
     int cached_lights_ = 0;
     int cached_directional_lights_ = 0;
+    int cached_point_lights_ = 0;
     int cached_bvh_nodes_ = 0;
     int cached_mesh_instances_ = 0;
     int cached_mesh_instance_indices_ = 0;
