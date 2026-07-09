@@ -1,5 +1,14 @@
 # CLI 与编辑器
 
+## 相关专题
+
+本页继续作为 CLI 参数和编辑器状态流的入口。涉及渲染辅助数据或 viewport 视觉的细节已经拆到专题文档：
+
+- [10-irradiance-volume.md](10-irradiance-volume.md)：Render 面板中的 Irradiance Volume 控件、后台 bake、缓存和 dirty 规则。
+- [11-lightmap.md](11-lightmap.md)：Lightmap 的编辑器按钮、overlay 预览、CPU/CUDA 上传路径。
+- [12-viewport-view.md](12-viewport-view.md)：viewport 模式切换、GPU picking、选中描边、Material Preview 和 raster G-buffer。
+- [13-svgf.md](13-svgf.md)：SVGF、rasterized G-buffer、AA mode、debug view 的 CLI/编辑器触达点。
+
 ## 命令行入口
 
 `lt_render` 的位置参数：

@@ -1,5 +1,14 @@
 # 渲染管线
 
+## 专题迁移
+
+本页保留路径追踪、加速结构、灯光和 dirty flag 的主干说明。几个体量已经比较大的渲染/编辑器子系统现在拆到了独立专题，深入实现请优先看：
+
+- [10-irradiance-volume.md](10-irradiance-volume.md)：辐照度体积的探针积分、八叉网格、`.ivol` 缓存、CPU/GPU 查询路径。
+- [11-lightmap.md](11-lightmap.md)：lightmap 的 UV 展开、烘焙积分、`.lmap` 缓存、运行时查找。
+- [12-viewport-view.md](12-viewport-view.md)：编辑器 Rendered/Material Preview/Solid/Wireframe 视图、D3D11 picking/outline、raster G-buffer。
+- [13-svgf.md](13-svgf.md)：SVGF 的 AOV、重投影、方差估计、A-trous 滤波、final AA resolve。
+
 ## 一帧怎样生成
 
 CPU 后端的调用链：

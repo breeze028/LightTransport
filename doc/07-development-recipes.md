@@ -2,6 +2,13 @@
 
 本页按“我要实现什么”列出最短修改路径。每项都区分核心实现、可保存/可编辑支持和验证。
 
+如果要改 Irradiance Volume、Lightmap、Viewport View 或 SVGF，先读对应专题再回到本页查跨模块清单：
+
+- [10-irradiance-volume.md](10-irradiance-volume.md)
+- [11-lightmap.md](11-lightmap.md)
+- [12-viewport-view.md](12-viewport-view.md)
+- [13-svgf.md](13-svgf.md)
+
 ## 修改点总表
 
 | 功能类型 | 数据模型 | CPU | CUDA | I/O/导入 | CLI | 编辑器 |
