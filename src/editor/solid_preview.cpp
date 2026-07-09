@@ -252,6 +252,75 @@ float4 PSMain(PSInput input) : SV_TARGET {
 }
 )";
 
+static const char* kGBufferShaderSource = R"(
+cbuffer ConstantBuffer : register(b0) {
+    row_major float4x4 view_proj;
+    float4 camera_pos;
+    float4 light_dir;
+    float4 ambient_color;
+    float4 clay_color;
+    float4 selection_params;
+    float4 camera_forward;
+};
+
+cbuffer MaterialBuffer : register(b1) {
+    float4 base_color;
+    float4 emission;
+    float4 material_params; // roughness, metallic, alpha, texture-enabled
+};
+
+Texture2D base_color_tx : register(t0);
+SamplerState base_color_sampler : register(s0);
+
+struct VSInput {
+    float3 position : POSITION;
+    float3 normal   : NORMAL;
+    float2 uv       : TEXCOORD0;
+    uint object_id   : TEXCOORD1;
+};
+
+struct PSInput {
+    float4 position : SV_POSITION;
+    float3 normal   : NORMAL;
+    float3 world_pos : TEXCOORD0;
+    float2 uv        : TEXCOORD2;
+    nointerpolation uint object_id : TEXCOORD3;
+};
+
+struct PSOutput {
+    float4 albedo : SV_Target0;
+    float4 emission : SV_Target1;
+    float4 normal : SV_Target2;
+    float4 position_depth : SV_Target3;
+    uint object_id : SV_Target4;
+};
+
+PSInput VSMain(VSInput input) {
+    PSInput output;
+    output.position = mul(float4(input.position, 1.0f), view_proj);
+    output.normal = normalize(input.normal);
+    output.world_pos = input.position;
+    output.uv = input.uv;
+    output.object_id = input.object_id;
+    return output;
+}
+
+PSOutput PSMain(PSInput input) {
+    float texture_enabled = material_params.w;
+    float4 texel = lerp(float4(1.0f, 1.0f, 1.0f, 1.0f), base_color_tx.Sample(base_color_sampler, input.uv), texture_enabled);
+    float3 base = max(base_color.rgb * texel.rgb, float3(0.001f, 0.001f, 0.001f));
+    float linear_depth = max(0.0f, dot(input.world_pos - camera_pos.xyz, camera_forward.xyz));
+
+    PSOutput output;
+    output.albedo = float4(base, 1.0f);
+    output.emission = float4(max(emission.rgb, 0.0f), 1.0f);
+    output.normal = float4(normalize(input.normal), 1.0f);
+    output.position_depth = float4(input.world_pos, linear_depth);
+    output.object_id = input.object_id;
+    return output;
+}
+)";
+
 static const char* kOutlineShaderSource = R"(
 cbuffer ConstantBuffer : register(b0) {
     row_major float4x4 view_proj;
@@ -416,6 +485,8 @@ int create_solid_shaders(SolidPreview& sp) {
     ID3DBlob* id_vs_blob = nullptr;
     ID3DBlob* id_ps_blob = nullptr;
     ID3DBlob* selected_id_ps_blob = nullptr;
+    ID3DBlob* gbuffer_vs_blob = nullptr;
+    ID3DBlob* gbuffer_ps_blob = nullptr;
     ID3DBlob* outline_vs_blob = nullptr;
     ID3DBlob* outline_ps_blob = nullptr;
     int ok = 0;
@@ -424,6 +495,7 @@ int create_solid_shaders(SolidPreview& sp) {
     size_t material_len = std::strlen(kMaterialPreviewShaderSource);
     size_t wire_len = std::strlen(kWireShaderSource);
     size_t object_id_len = std::strlen(kObjectIdShaderSource);
+    size_t gbuffer_len = std::strlen(kGBufferShaderSource);
     size_t outline_len = std::strlen(kOutlineShaderSource);
 
     if (!compile_shader(kSolidShaderSource, solid_len, "VSMain", "vs_5_0", &vs_blob)) return ok;
@@ -446,13 +518,21 @@ int create_solid_shaders(SolidPreview& sp) {
     if (!compile_shader(kObjectIdShaderSource, object_id_len, "SelectedPSMain", "ps_5_0", &selected_id_ps_blob)) {
         vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release(); id_vs_blob->Release(); id_ps_blob->Release(); return ok;
     }
-    if (!compile_shader(kOutlineShaderSource, outline_len, "VSMain", "vs_5_0", &outline_vs_blob)) {
+    if (!compile_shader(kGBufferShaderSource, gbuffer_len, "VSMain", "vs_5_0", &gbuffer_vs_blob)) {
         vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
         id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); return ok;
     }
+    if (!compile_shader(kGBufferShaderSource, gbuffer_len, "PSMain", "ps_5_0", &gbuffer_ps_blob)) {
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
+        id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); gbuffer_vs_blob->Release(); return ok;
+    }
+    if (!compile_shader(kOutlineShaderSource, outline_len, "VSMain", "vs_5_0", &outline_vs_blob)) {
+        vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
+        id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); gbuffer_vs_blob->Release(); gbuffer_ps_blob->Release(); return ok;
+    }
     if (!compile_shader(kOutlineShaderSource, outline_len, "PSMain", "ps_5_0", &outline_ps_blob)) {
         vs_blob->Release(); ps_blob->Release(); material_ps_blob->Release(); wire_vs_blob->Release(); wire_ps_blob->Release();
-        id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); outline_vs_blob->Release(); return ok;
+        id_vs_blob->Release(); id_ps_blob->Release(); selected_id_ps_blob->Release(); gbuffer_vs_blob->Release(); gbuffer_ps_blob->Release(); outline_vs_blob->Release(); return ok;
     }
 
     do {
@@ -464,6 +544,8 @@ int create_solid_shaders(SolidPreview& sp) {
         if (g_device->CreateVertexShader(id_vs_blob->GetBufferPointer(), id_vs_blob->GetBufferSize(), nullptr, &sp.id_vs) != S_OK) break;
         if (g_device->CreatePixelShader(id_ps_blob->GetBufferPointer(), id_ps_blob->GetBufferSize(), nullptr, &sp.id_ps) != S_OK) break;
         if (g_device->CreatePixelShader(selected_id_ps_blob->GetBufferPointer(), selected_id_ps_blob->GetBufferSize(), nullptr, &sp.selected_id_ps) != S_OK) break;
+        if (g_device->CreateVertexShader(gbuffer_vs_blob->GetBufferPointer(), gbuffer_vs_blob->GetBufferSize(), nullptr, &sp.gbuffer_vs) != S_OK) break;
+        if (g_device->CreatePixelShader(gbuffer_ps_blob->GetBufferPointer(), gbuffer_ps_blob->GetBufferSize(), nullptr, &sp.gbuffer_ps) != S_OK) break;
         if (g_device->CreateVertexShader(outline_vs_blob->GetBufferPointer(), outline_vs_blob->GetBufferSize(), nullptr, &sp.fullscreen_vs) != S_OK) break;
         if (g_device->CreatePixelShader(outline_ps_blob->GetBufferPointer(), outline_ps_blob->GetBufferSize(), nullptr, &sp.outline_ps) != S_OK) break;
 
@@ -486,6 +568,8 @@ int create_solid_shaders(SolidPreview& sp) {
     id_vs_blob->Release();
     id_ps_blob->Release();
     selected_id_ps_blob->Release();
+    gbuffer_vs_blob->Release();
+    gbuffer_ps_blob->Release();
     outline_vs_blob->Release();
     outline_ps_blob->Release();
     return ok;
@@ -566,6 +650,19 @@ void release_render_targets(SolidPreview& sp) {
     if (sp.outline_srv) { sp.outline_srv->Release(); sp.outline_srv = nullptr; }
     if (sp.outline_rtv) { sp.outline_rtv->Release(); sp.outline_rtv = nullptr; }
     if (sp.outline_texture) { sp.outline_texture->Release(); sp.outline_texture = nullptr; }
+    if (sp.gbuffer_albedo_rtv) { sp.gbuffer_albedo_rtv->Release(); sp.gbuffer_albedo_rtv = nullptr; }
+    if (sp.gbuffer_albedo_texture) { sp.gbuffer_albedo_texture->Release(); sp.gbuffer_albedo_texture = nullptr; }
+    if (sp.gbuffer_albedo_readback) { sp.gbuffer_albedo_readback->Release(); sp.gbuffer_albedo_readback = nullptr; }
+    if (sp.gbuffer_emission_rtv) { sp.gbuffer_emission_rtv->Release(); sp.gbuffer_emission_rtv = nullptr; }
+    if (sp.gbuffer_emission_texture) { sp.gbuffer_emission_texture->Release(); sp.gbuffer_emission_texture = nullptr; }
+    if (sp.gbuffer_emission_readback) { sp.gbuffer_emission_readback->Release(); sp.gbuffer_emission_readback = nullptr; }
+    if (sp.gbuffer_normal_rtv) { sp.gbuffer_normal_rtv->Release(); sp.gbuffer_normal_rtv = nullptr; }
+    if (sp.gbuffer_normal_texture) { sp.gbuffer_normal_texture->Release(); sp.gbuffer_normal_texture = nullptr; }
+    if (sp.gbuffer_normal_readback) { sp.gbuffer_normal_readback->Release(); sp.gbuffer_normal_readback = nullptr; }
+    if (sp.gbuffer_position_depth_rtv) { sp.gbuffer_position_depth_rtv->Release(); sp.gbuffer_position_depth_rtv = nullptr; }
+    if (sp.gbuffer_position_depth_texture) { sp.gbuffer_position_depth_texture->Release(); sp.gbuffer_position_depth_texture = nullptr; }
+    if (sp.gbuffer_position_depth_readback) { sp.gbuffer_position_depth_readback->Release(); sp.gbuffer_position_depth_readback = nullptr; }
+    if (sp.gbuffer_object_id_readback) { sp.gbuffer_object_id_readback->Release(); sp.gbuffer_object_id_readback = nullptr; }
     sp.sample_count = 1;
     sp.sample_quality = 0;
     sp.outline_valid = false;
@@ -648,6 +745,51 @@ bool create_selection_targets(SolidPreview& sp, int width, int height) {
     if (g_device->CreateShaderResourceView(sp.outline_texture, nullptr, &sp.outline_srv) != S_OK) return false;
 
     return true;
+}
+
+bool create_float_gbuffer_target(UINT width,
+                                 UINT height,
+                                 ID3D11Texture2D** texture,
+                                 ID3D11RenderTargetView** rtv,
+                                 ID3D11Texture2D** readback) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (g_device->CreateTexture2D(&desc, nullptr, texture) != S_OK) return false;
+    if (g_device->CreateRenderTargetView(*texture, nullptr, rtv) != S_OK) return false;
+
+    D3D11_TEXTURE2D_DESC readback_desc = desc;
+    readback_desc.Usage = D3D11_USAGE_STAGING;
+    readback_desc.BindFlags = 0;
+    readback_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    return g_device->CreateTexture2D(&readback_desc, nullptr, readback) == S_OK;
+}
+
+bool create_gbuffer_targets(SolidPreview& sp, int width, int height) {
+    const UINT w = static_cast<UINT>(width);
+    const UINT h = static_cast<UINT>(height);
+
+    if (!create_float_gbuffer_target(w, h, &sp.gbuffer_albedo_texture, &sp.gbuffer_albedo_rtv, &sp.gbuffer_albedo_readback)) return false;
+    if (!create_float_gbuffer_target(w, h, &sp.gbuffer_emission_texture, &sp.gbuffer_emission_rtv, &sp.gbuffer_emission_readback)) return false;
+    if (!create_float_gbuffer_target(w, h, &sp.gbuffer_normal_texture, &sp.gbuffer_normal_rtv, &sp.gbuffer_normal_readback)) return false;
+    if (!create_float_gbuffer_target(w, h, &sp.gbuffer_position_depth_texture, &sp.gbuffer_position_depth_rtv, &sp.gbuffer_position_depth_readback)) return false;
+
+    D3D11_TEXTURE2D_DESC id_readback_desc{};
+    id_readback_desc.Width = w;
+    id_readback_desc.Height = h;
+    id_readback_desc.MipLevels = 1;
+    id_readback_desc.ArraySize = 1;
+    id_readback_desc.Format = DXGI_FORMAT_R32_UINT;
+    id_readback_desc.SampleDesc.Count = 1;
+    id_readback_desc.Usage = D3D11_USAGE_STAGING;
+    id_readback_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    return g_device->CreateTexture2D(&id_readback_desc, nullptr, &sp.gbuffer_object_id_readback) == S_OK;
 }
 
 void choose_msaa(SolidPreview& sp) {
@@ -963,6 +1105,8 @@ void build_constant_buffer(SolidPreview& sp) {
 bool upload_solid_constants(SolidPreview& sp,
                             const Scene& scene,
                             ImVec2 viewport_size,
+                            float jitter_x = 0.0f,
+                            float jitter_y = 0.0f,
                             uint32_t selected_id = 0) {
     if (!sp.cb) return false;
 
@@ -992,6 +1136,8 @@ bool upload_solid_constants(SolidPreview& sp,
     proj[5]  = h;
     proj[10] = f / (f - n);
     proj[11] = 1.0f;
+    proj[8] = -2.0f * jitter_x / std::max(1.0f, viewport_size.x);
+    proj[9] = 2.0f * jitter_y / std::max(1.0f, viewport_size.y);
     proj[14] = -n * f / (f - n);
 
     float view_proj[16] = {0};
@@ -1030,6 +1176,10 @@ bool upload_solid_constants(SolidPreview& sp,
     cb_data.selection_params[1] = static_cast<float>(sp.width);
     cb_data.selection_params[2] = static_cast<float>(sp.height);
     cb_data.selection_params[3] = 0.0f;
+    cb_data.camera_forward[0] = forward.x;
+    cb_data.camera_forward[1] = forward.y;
+    cb_data.camera_forward[2] = forward.z;
+    cb_data.camera_forward[3] = 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (g_context->Map(sp.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped) != S_OK) {
@@ -1082,6 +1232,27 @@ bool has_selection_resources(const SolidPreview& sp) {
         sp.selected_depth_srv &&
         sp.outline_rtv &&
         sp.outline_srv;
+}
+
+bool has_gbuffer_resources(const SolidPreview& sp) {
+    return sp.gbuffer_vs &&
+        sp.gbuffer_ps &&
+        sp.gbuffer_albedo_rtv &&
+        sp.gbuffer_albedo_texture &&
+        sp.gbuffer_albedo_readback &&
+        sp.gbuffer_emission_rtv &&
+        sp.gbuffer_emission_texture &&
+        sp.gbuffer_emission_readback &&
+        sp.gbuffer_normal_rtv &&
+        sp.gbuffer_normal_texture &&
+        sp.gbuffer_normal_readback &&
+        sp.gbuffer_position_depth_rtv &&
+        sp.gbuffer_position_depth_texture &&
+        sp.gbuffer_position_depth_readback &&
+        sp.object_id_rtv &&
+        sp.object_id_texture &&
+        sp.gbuffer_object_id_readback &&
+        sp.scene_depth_dsv;
 }
 
 void bind_preview_geometry(SolidPreview& sp) {
@@ -1143,7 +1314,7 @@ bool render_scene_id_pass(SolidPreview& sp, const Scene& scene, ImVec2 viewport_
 
 bool render_selected_id_pass(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size, uint32_t selected_id) {
     if (!sp.vb || !sp.ib || !sp.id_vs || !sp.selected_id_ps || selected_id == 0 || !has_selection_resources(sp)) return false;
-    if (!upload_solid_constants(sp, scene, viewport_size, selected_id)) return false;
+    if (!upload_solid_constants(sp, scene, viewport_size, 0.0f, 0.0f, selected_id)) return false;
 
     ID3D11ShaderResourceView* null_srvs[3] = {};
     g_context->PSSetShaderResources(0, 3, null_srvs);
@@ -1208,6 +1379,95 @@ bool render_outline_texture(SolidPreview& sp) {
     return true;
 }
 
+struct ReadbackFloat4 {
+    float x, y, z, w;
+};
+
+bool map_readback(ID3D11Texture2D* texture, D3D11_MAPPED_SUBRESOURCE& mapped) {
+    return texture && g_context->Map(texture, 0, D3D11_MAP_READ, 0, &mapped) == S_OK;
+}
+
+void unmap_readback(ID3D11Texture2D* texture) {
+    if (texture) {
+        g_context->Unmap(texture, 0);
+    }
+}
+
+bool read_gbuffer_to_framebuffer(SolidPreview& sp, Framebuffer& framebuffer) {
+    const size_t count = static_cast<size_t>(sp.width) * static_cast<size_t>(sp.height);
+    if (framebuffer.width != sp.width || framebuffer.height != sp.height) {
+        framebuffer.resize(sp.width, sp.height);
+    }
+    if (framebuffer.aov.albedo.size() != count) {
+        framebuffer.aov.resize(count);
+    }
+
+    g_context->CopyResource(sp.gbuffer_albedo_readback, sp.gbuffer_albedo_texture);
+    g_context->CopyResource(sp.gbuffer_emission_readback, sp.gbuffer_emission_texture);
+    g_context->CopyResource(sp.gbuffer_normal_readback, sp.gbuffer_normal_texture);
+    g_context->CopyResource(sp.gbuffer_position_depth_readback, sp.gbuffer_position_depth_texture);
+    g_context->CopyResource(sp.gbuffer_object_id_readback, sp.object_id_texture);
+
+    D3D11_MAPPED_SUBRESOURCE albedo_map{};
+    D3D11_MAPPED_SUBRESOURCE emission_map{};
+    D3D11_MAPPED_SUBRESOURCE normal_map{};
+    D3D11_MAPPED_SUBRESOURCE position_depth_map{};
+    D3D11_MAPPED_SUBRESOURCE object_id_map{};
+    if (!map_readback(sp.gbuffer_albedo_readback, albedo_map)) return false;
+    if (!map_readback(sp.gbuffer_emission_readback, emission_map)) {
+        unmap_readback(sp.gbuffer_albedo_readback);
+        return false;
+    }
+    if (!map_readback(sp.gbuffer_normal_readback, normal_map)) {
+        unmap_readback(sp.gbuffer_emission_readback);
+        unmap_readback(sp.gbuffer_albedo_readback);
+        return false;
+    }
+    if (!map_readback(sp.gbuffer_position_depth_readback, position_depth_map)) {
+        unmap_readback(sp.gbuffer_normal_readback);
+        unmap_readback(sp.gbuffer_emission_readback);
+        unmap_readback(sp.gbuffer_albedo_readback);
+        return false;
+    }
+    if (!map_readback(sp.gbuffer_object_id_readback, object_id_map)) {
+        unmap_readback(sp.gbuffer_position_depth_readback);
+        unmap_readback(sp.gbuffer_normal_readback);
+        unmap_readback(sp.gbuffer_emission_readback);
+        unmap_readback(sp.gbuffer_albedo_readback);
+        return false;
+    }
+
+    for (int y = 0; y < sp.height; ++y) {
+        const auto* albedo_row = reinterpret_cast<const ReadbackFloat4*>(
+            static_cast<const uint8_t*>(albedo_map.pData) + static_cast<size_t>(y) * albedo_map.RowPitch);
+        const auto* emission_row = reinterpret_cast<const ReadbackFloat4*>(
+            static_cast<const uint8_t*>(emission_map.pData) + static_cast<size_t>(y) * emission_map.RowPitch);
+        const auto* normal_row = reinterpret_cast<const ReadbackFloat4*>(
+            static_cast<const uint8_t*>(normal_map.pData) + static_cast<size_t>(y) * normal_map.RowPitch);
+        const auto* position_depth_row = reinterpret_cast<const ReadbackFloat4*>(
+            static_cast<const uint8_t*>(position_depth_map.pData) + static_cast<size_t>(y) * position_depth_map.RowPitch);
+        const auto* object_id_row = reinterpret_cast<const uint32_t*>(
+            static_cast<const uint8_t*>(object_id_map.pData) + static_cast<size_t>(y) * object_id_map.RowPitch);
+        for (int x = 0; x < sp.width; ++x) {
+            const size_t index = static_cast<size_t>(y) * static_cast<size_t>(sp.width) + static_cast<size_t>(x);
+            framebuffer.aov.albedo[index] = {albedo_row[x].x, albedo_row[x].y, albedo_row[x].z};
+            framebuffer.aov.emission[index] = {emission_row[x].x, emission_row[x].y, emission_row[x].z};
+            framebuffer.aov.normal[index] = {normal_row[x].x, normal_row[x].y, normal_row[x].z};
+            framebuffer.aov.world_position[index] = {position_depth_row[x].x, position_depth_row[x].y, position_depth_row[x].z};
+            framebuffer.aov.linear_depth[index] = position_depth_row[x].w;
+            framebuffer.aov.object_id[index] = object_id_row[x];
+        }
+    }
+
+    unmap_readback(sp.gbuffer_object_id_readback);
+    unmap_readback(sp.gbuffer_position_depth_readback);
+    unmap_readback(sp.gbuffer_normal_readback);
+    unmap_readback(sp.gbuffer_emission_readback);
+    unmap_readback(sp.gbuffer_albedo_readback);
+    framebuffer.aov.rasterized = true;
+    return true;
+}
+
 bool decode_selection_id(const SolidPreview& sp, uint32_t object_id, SelectionKind& kind, int& object_index) {
     if (object_id == 0 || object_id > sp.selection_refs.size()) return false;
     const SolidSelectionRef& ref = sp.selection_refs[static_cast<size_t>(object_id - 1)];
@@ -1252,6 +1512,8 @@ void release_solid_preview(SolidPreview& sp) {
     if (sp.id_vs) { sp.id_vs->Release(); sp.id_vs = nullptr; }
     if (sp.id_ps) { sp.id_ps->Release(); sp.id_ps = nullptr; }
     if (sp.selected_id_ps) { sp.selected_id_ps->Release(); sp.selected_id_ps = nullptr; }
+    if (sp.gbuffer_vs) { sp.gbuffer_vs->Release(); sp.gbuffer_vs = nullptr; }
+    if (sp.gbuffer_ps) { sp.gbuffer_ps->Release(); sp.gbuffer_ps = nullptr; }
     if (sp.fullscreen_vs) { sp.fullscreen_vs->Release(); sp.fullscreen_vs = nullptr; }
     if (sp.outline_ps) { sp.outline_ps->Release(); sp.outline_ps = nullptr; }
     if (sp.wire_rasterizer) { sp.wire_rasterizer->Release(); sp.wire_rasterizer = nullptr; }
@@ -1316,6 +1578,10 @@ void resize_solid_preview(SolidPreview& sp, int width, int height) {
     }
 
     if (!create_selection_targets(sp, width, height)) {
+        release_render_targets(sp);
+        return;
+    }
+    if (!create_gbuffer_targets(sp, width, height)) {
         release_render_targets(sp);
         return;
     }
@@ -1537,6 +1803,117 @@ ID3D11ShaderResourceView* render_selection_outline(SolidPreview& sp,
     sp.outline_content_generation = g_editor.content_generation;
     sp.outline_object_id = selected_id;
     return sp.outline_srv;
+}
+
+bool render_svgf_gbuffer_targets(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size, const RenderSettings& settings) {
+    const int width = std::max(64, static_cast<int>(viewport_size.x));
+    const int height = std::max(64, static_cast<int>(viewport_size.y));
+    init_solid_preview(sp);
+    resize_solid_preview(sp, width, height);
+    update_solid_preview_buffers(sp, scene);
+    if (!sp.vb || !sp.ib || sp.draw_ranges.empty() || !has_gbuffer_resources(sp)) return false;
+    if (!upload_solid_constants(sp, scene, viewport_size, settings.camera_jitter_x, settings.camera_jitter_y)) return false;
+
+    ID3D11ShaderResourceView* null_srvs[1] = {};
+    g_context->PSSetShaderResources(0, 1, null_srvs);
+
+    ID3D11RenderTargetView* previous_rtv = nullptr;
+    ID3D11DepthStencilView* previous_dsv = nullptr;
+    g_context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
+
+    const float clear_black[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float clear_albedo[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    g_context->ClearRenderTargetView(sp.gbuffer_albedo_rtv, clear_albedo);
+    g_context->ClearRenderTargetView(sp.gbuffer_emission_rtv, clear_black);
+    g_context->ClearRenderTargetView(sp.gbuffer_normal_rtv, clear_black);
+    g_context->ClearRenderTargetView(sp.gbuffer_position_depth_rtv, clear_black);
+    g_context->ClearRenderTargetView(sp.object_id_rtv, clear_black);
+    g_context->ClearDepthStencilView(sp.scene_depth_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    ID3D11RenderTargetView* rtvs[5] = {
+        sp.gbuffer_albedo_rtv,
+        sp.gbuffer_emission_rtv,
+        sp.gbuffer_normal_rtv,
+        sp.gbuffer_position_depth_rtv,
+        sp.object_id_rtv,
+    };
+    g_context->OMSetRenderTargets(5, rtvs, sp.scene_depth_dsv);
+    g_context->OMSetDepthStencilState(sp.solid_depth_state, 0);
+    g_context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    set_preview_viewport(sp);
+    bind_preview_geometry(sp);
+    g_context->VSSetShader(sp.gbuffer_vs, nullptr, 0);
+    g_context->PSSetShader(sp.gbuffer_ps, nullptr, 0);
+    g_context->PSSetConstantBuffers(1, 1, &sp.material_cb);
+    g_context->PSSetSamplers(0, 1, &sp.material_sampler);
+    for (const SolidDrawRange& range : sp.draw_ranges) {
+        if (!upload_material_preview_constants(sp, range.material_index)) continue;
+        ID3D11ShaderResourceView* srv = material_preview_srv(sp, range.material_index);
+        g_context->PSSetShaderResources(0, 1, &srv);
+        g_context->DrawIndexed(range.index_count, range.start_index, 0);
+    }
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    g_context->PSSetShaderResources(0, 1, &null_srv);
+    restore_render_target(previous_rtv, previous_dsv);
+    return true;
+}
+
+bool render_svgf_gbuffer(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size, const RenderSettings& settings, Framebuffer& framebuffer) {
+    if (!render_svgf_gbuffer_targets(sp, scene, viewport_size, settings)) {
+        return false;
+    }
+    return read_gbuffer_to_framebuffer(sp, framebuffer);
+}
+
+bool render_svgf_gbuffer_interop(SolidPreview& sp,
+                                 const Scene& scene,
+                                 ImVec2 viewport_size,
+                                 const RenderSettings& settings,
+                                 RasterizedGBufferInterop& interop) {
+    release_svgf_gbuffer_interop(interop);
+    if (!render_svgf_gbuffer_targets(sp, scene, viewport_size, settings)) {
+        return false;
+    }
+    if (!sp.gbuffer_albedo_texture ||
+        !sp.gbuffer_emission_texture ||
+        !sp.gbuffer_normal_texture ||
+        !sp.gbuffer_position_depth_texture ||
+        !sp.object_id_texture) {
+        return false;
+    }
+
+    sp.gbuffer_albedo_texture->AddRef();
+    sp.gbuffer_emission_texture->AddRef();
+    sp.gbuffer_normal_texture->AddRef();
+    sp.gbuffer_position_depth_texture->AddRef();
+    sp.object_id_texture->AddRef();
+    interop.albedo_texture = sp.gbuffer_albedo_texture;
+    interop.emission_texture = sp.gbuffer_emission_texture;
+    interop.normal_texture = sp.gbuffer_normal_texture;
+    interop.position_depth_texture = sp.gbuffer_position_depth_texture;
+    interop.object_id_texture = sp.object_id_texture;
+    interop.width = sp.width;
+    interop.height = sp.height;
+    interop.valid = true;
+    return true;
+}
+
+void release_svgf_gbuffer_interop(RasterizedGBufferInterop& interop) {
+    auto release_resource = [](void*& resource) {
+        if (resource) {
+            static_cast<ID3D11Resource*>(resource)->Release();
+            resource = nullptr;
+        }
+    };
+    release_resource(interop.albedo_texture);
+    release_resource(interop.emission_texture);
+    release_resource(interop.normal_texture);
+    release_resource(interop.position_depth_texture);
+    release_resource(interop.object_id_texture);
+    interop.width = 0;
+    interop.height = 0;
+    interop.valid = false;
 }
 
 } // namespace lt::editor

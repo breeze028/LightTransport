@@ -5,6 +5,84 @@ void CpuPathTracer::reset() {
     scene_uploaded_ = false;
 }
 
+Ray make_center_camera_ray(const Camera& camera, int x, int y, const RenderSettings& settings) {
+    const float aspect = static_cast<float>(settings.width) / static_cast<float>(settings.height);
+    const float half_height = std::tan(camera.fov_degrees * kPi / 360.0f);
+    const float half_width = aspect * half_height;
+    const Vec3 forward = normalize(camera.target - camera.position);
+    const float right_sign = camera.right_sign < 0.0f ? -1.0f : 1.0f;
+    const Vec3 right = normalize(cross(forward, camera.up)) * right_sign;
+    const Vec3 up = cross(right, forward) * right_sign;
+    const float sample_x = 0.5f + settings.camera_jitter_x;
+    const float sample_y = 0.5f + settings.camera_jitter_y;
+    const float u = ((static_cast<float>(x) + sample_x) / static_cast<float>(settings.width) * 2.0f - 1.0f) * half_width;
+    const float v = (1.0f - (static_cast<float>(y) + sample_y) / static_cast<float>(settings.height) * 2.0f) * half_height;
+    return {camera.position, normalize(forward + right * u + up * v)};
+}
+
+uint32_t primary_object_id(const Hit& hit) {
+    if (hit.mesh >= 0) {
+        return static_cast<uint32_t>(hit.mesh + 1);
+    }
+    if (hit.triangle >= 0) {
+        return 0x40000000u | static_cast<uint32_t>(hit.triangle + 1);
+    }
+    if (hit.material >= 0) {
+        return 0x80000000u | static_cast<uint32_t>(hit.material + 1);
+    }
+    return 0u;
+}
+
+void write_primary_aov(const RenderScene& render_scene,
+                       const Scene& scene,
+                       const RenderSettings& settings,
+                       int x,
+                       int y,
+                       size_t idx,
+                       Framebuffer& framebuffer) {
+    Framebuffer::AovBuffers& aov = framebuffer.aov;
+    aov.albedo[idx] = {1.0f, 1.0f, 1.0f};
+    aov.emission[idx] = {};
+    aov.normal[idx] = {};
+    aov.world_position[idx] = {};
+    aov.linear_depth[idx] = kInfinity;
+    aov.object_id[idx] = 0u;
+
+    Ray ray = make_center_camera_ray(scene.camera, x, y, settings);
+    Rng visibility_rng(make_pixel_seed(static_cast<uint32_t>(x), static_cast<uint32_t>(y), settings.frame_index ^ 0x9e3779b9u));
+    for (int transparent_step = 0; transparent_step < 8; ++transparent_step) {
+        Hit hit;
+        if (!intersect_scene(render_scene, ray, hit, settings.acceleration_structure)) {
+            return;
+        }
+        if (hit.material < 0 || hit.material >= static_cast<int>(scene.materials.size())) {
+            return;
+        }
+        const std::shared_ptr<Material>& material = scene.materials[static_cast<size_t>(hit.material)];
+        if (!material) {
+            return;
+        }
+        if (!material_visible(*material, hit.uv, visibility_rng)) {
+            ray = {hit.position + ray.direction * 0.002f, ray.direction};
+            continue;
+        }
+
+        hit.normal = apply_normal_map(*material, hit, ray.direction);
+        Vec3 emission = material->emitted(hit.uv);
+        if (hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
+            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction);
+        }
+        const Vec3 forward = normalize(scene.camera.target - scene.camera.position);
+        aov.albedo[idx] = max(material->base_color(hit.uv), Vec3{0.001f, 0.001f, 0.001f});
+        aov.emission[idx] = max(emission, Vec3{});
+        aov.normal[idx] = hit.normal;
+        aov.world_position[idx] = hit.position;
+        aov.linear_depth[idx] = std::max(0.0f, dot(hit.position - scene.camera.position, forward));
+        aov.object_id[idx] = primary_object_id(hit);
+        return;
+    }
+}
+
 void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) {
     framebuffer.resize(settings.width, settings.height);
     if (!scene_uploaded_ ||
@@ -71,6 +149,10 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
     std::atomic<int> next_row{0};
     std::vector<std::thread> workers;
     workers.reserve(thread_count);
+    const bool use_rasterized_aov = svgf_denoising_enabled(settings) && has_rasterized_svgf_aov(framebuffer);
+    if (svgf_denoising_enabled(settings) && !use_rasterized_aov) {
+        framebuffer.aov.clear();
+    }
 
     const auto render_rows = [&]() {
         for (;;) {
@@ -93,8 +175,16 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
                         lightmap.get());
                 }
                 sample = sample / static_cast<float>(settings.samples_per_pixel);
-                framebuffer.accumulation[idx] += sample;
-                framebuffer.rgba[idx] = to_rgba8(framebuffer.accumulation[idx] / static_cast<float>(settings.frame_index + 1u));
+                if (svgf_denoising_enabled(settings)) {
+                    framebuffer.aov.radiance[idx] = sample;
+                    if (!use_rasterized_aov) {
+                        write_primary_aov(render_scene, scene, settings, x, y, idx, framebuffer);
+                    }
+                    framebuffer.rgba[idx] = to_rgba8(sample);
+                } else {
+                    framebuffer.accumulation[idx] += sample;
+                    framebuffer.rgba[idx] = to_rgba8(framebuffer.accumulation[idx] / static_cast<float>(settings.frame_index + 1u));
+                }
             }
         }
     };
@@ -104,5 +194,8 @@ void CpuPathTracer::render(const Scene& scene, const RenderSettings& settings, F
     }
     for (std::thread& worker : workers) {
         worker.join();
+    }
+    if (svgf_denoising_enabled(settings)) {
+        apply_svgf_denoiser(scene, settings, framebuffer);
     }
 }

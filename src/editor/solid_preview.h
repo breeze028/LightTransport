@@ -102,6 +102,8 @@ struct SolidPreview {
     ID3D11VertexShader* id_vs = nullptr;
     ID3D11PixelShader* id_ps = nullptr;
     ID3D11PixelShader* selected_id_ps = nullptr;
+    ID3D11VertexShader* gbuffer_vs = nullptr;
+    ID3D11PixelShader* gbuffer_ps = nullptr;
     ID3D11VertexShader* fullscreen_vs = nullptr;
     ID3D11PixelShader* outline_ps = nullptr;
 
@@ -125,6 +127,20 @@ struct SolidPreview {
     ID3D11RenderTargetView* outline_rtv = nullptr;
     ID3D11ShaderResourceView* outline_srv = nullptr;
 
+    ID3D11Texture2D* gbuffer_albedo_texture = nullptr;
+    ID3D11RenderTargetView* gbuffer_albedo_rtv = nullptr;
+    ID3D11Texture2D* gbuffer_albedo_readback = nullptr;
+    ID3D11Texture2D* gbuffer_emission_texture = nullptr;
+    ID3D11RenderTargetView* gbuffer_emission_rtv = nullptr;
+    ID3D11Texture2D* gbuffer_emission_readback = nullptr;
+    ID3D11Texture2D* gbuffer_normal_texture = nullptr;
+    ID3D11RenderTargetView* gbuffer_normal_rtv = nullptr;
+    ID3D11Texture2D* gbuffer_normal_readback = nullptr;
+    ID3D11Texture2D* gbuffer_position_depth_texture = nullptr;
+    ID3D11RenderTargetView* gbuffer_position_depth_rtv = nullptr;
+    ID3D11Texture2D* gbuffer_position_depth_readback = nullptr;
+    ID3D11Texture2D* gbuffer_object_id_readback = nullptr;
+
     bool outline_valid = false;
     uint64_t outline_generation = 0;
     uint64_t outline_content_generation = 0;
@@ -143,6 +159,7 @@ struct SolidConstantBuffer {
     float ambient_color[4];
     float clay_color[4];
     float selection_params[4];
+    float camera_forward[4];
 };
 
 void init_solid_preview(SolidPreview& sp);
@@ -163,6 +180,13 @@ ID3D11ShaderResourceView* render_selection_outline(SolidPreview& sp,
                                                    ImVec2 viewport_size,
                                                    SelectionKind kind,
                                                    int object_index);
+bool render_svgf_gbuffer(SolidPreview& sp, const Scene& scene, ImVec2 viewport_size, const RenderSettings& settings, Framebuffer& framebuffer);
+bool render_svgf_gbuffer_interop(SolidPreview& sp,
+                                 const Scene& scene,
+                                 ImVec2 viewport_size,
+                                 const RenderSettings& settings,
+                                 RasterizedGBufferInterop& interop);
+void release_svgf_gbuffer_interop(RasterizedGBufferInterop& interop);
 
 extern SolidPreview g_solid_preview;
 

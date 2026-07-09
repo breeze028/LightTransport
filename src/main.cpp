@@ -89,6 +89,14 @@ int main(int argc, char** argv) {
     for (uint32_t frame = 0; frame < frames; ++frame) {
         options.settings.frame_index = frame;
         options.settings.dirty = frame == 0 ? lt::RenderDirty::All : lt::RenderDirty::None;
+        if (lt::temporal_jitter_enabled(options.settings)) {
+            const lt::Vec2 jitter = lt::temporal_jitter(frame);
+            options.settings.camera_jitter_x = jitter.x;
+            options.settings.camera_jitter_y = jitter.y;
+        } else {
+            options.settings.camera_jitter_x = 0.0f;
+            options.settings.camera_jitter_y = 0.0f;
+        }
         renderer->render(loaded.scene, options.settings, framebuffer);
         if (!options.quiet) {
             std::cout << "\r" << renderer->name() << " frame " << (frame + 1u) << "/" << frames << std::flush;

@@ -47,6 +47,27 @@ enum class LightmapBakeBackend : int {
     Cpu = 1,
 };
 
+enum class DenoiserMode : int {
+    Off = 0,
+    Svgf = 1,
+};
+
+enum class DenoiserDebugView : int {
+    Final = 0,
+    Raw = 1,
+    Albedo = 2,
+    Normal = 3,
+    Depth = 4,
+    Variance = 5,
+    HistoryLength = 6,
+};
+
+enum class AntialiasingMode : int {
+    Off = 0,
+    StablePostAA = 1,
+    TAA = 2,
+};
+
 enum class LightmapBakePhase : int {
     Idle = 0,
     LoadingCache = 1,
@@ -148,9 +169,59 @@ struct RenderSettings {
     char lightmap_cache_path[1024] = {};
     char lightmap_cache_key[1024] = {};
     LightmapBakeProgress* lightmap_bake_progress = nullptr;
+    DenoiserMode denoiser_mode = DenoiserMode::Off;
+    int svgf_iterations = 5;
+    float svgf_alpha = 0.05f;
+    float svgf_moments_alpha = 0.20f;
+    float svgf_phi_color = 4.0f;
+    float svgf_phi_normal = 128.0f;
+    float svgf_phi_depth = 1.0f;
+    bool svgf_rasterized_gbuffer = true;
+    DenoiserDebugView svgf_debug_view = DenoiserDebugView::Final;
+    AntialiasingMode antialiasing_mode = AntialiasingMode::StablePostAA;
+    float camera_jitter_x = 0.0f;
+    float camera_jitter_y = 0.0f;
     uint32_t frame_index = 0;
     RenderDirty dirty = RenderDirty::All;
 };
+
+inline float halton(uint32_t index, uint32_t base) {
+    float result = 0.0f;
+    float weight = 1.0f / static_cast<float>(base);
+    while (index > 0u) {
+        result += weight * static_cast<float>(index % base);
+        index /= base;
+        weight /= static_cast<float>(base);
+    }
+    return result;
+}
+
+inline Vec2 temporal_jitter(uint32_t frame_index) {
+    constexpr float kJitterScale = 0.25f;
+    const uint32_t sample = frame_index + 1u;
+    return {(halton(sample, 2u) - 0.5f) * kJitterScale, (halton(sample, 3u) - 0.5f) * kJitterScale};
+}
+
+inline bool antialiasing_final_view(const RenderSettings& settings) {
+    return settings.denoiser_mode == DenoiserMode::Svgf &&
+        settings.svgf_debug_view == DenoiserDebugView::Final;
+}
+
+inline bool temporal_antialiasing_enabled(const RenderSettings& settings) {
+    return antialiasing_final_view(settings) &&
+        settings.antialiasing_mode == AntialiasingMode::TAA;
+}
+
+inline bool post_antialiasing_enabled(const RenderSettings& settings) {
+    return antialiasing_final_view(settings) &&
+        settings.antialiasing_mode == AntialiasingMode::StablePostAA;
+}
+
+inline bool temporal_jitter_enabled(const RenderSettings& settings) {
+    return temporal_antialiasing_enabled(settings) &&
+        settings.frame_index > 0u &&
+        settings.dirty == RenderDirty::None;
+}
 
 inline bool scene_has_npr_styles(const Scene& scene) {
     for (const std::shared_ptr<Material>& material : scene.materials) {
@@ -173,6 +244,10 @@ inline bool lightmap_rendering_enabled(const RenderSettings& settings) {
     return settings.use_lightmap;
 }
 
+inline bool svgf_denoising_enabled(const RenderSettings& settings) {
+    return settings.denoiser_mode == DenoiserMode::Svgf;
+}
+
 inline bool uses_next_event_estimation(const RenderSettings& settings) {
     return settings.sampling_mode == PathSamplingMode::NextEventEstimation ||
         settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling;
@@ -188,25 +263,172 @@ struct Framebuffer {
     std::vector<Vec3> accumulation;
     std::vector<uint32_t> rgba;
 
+    struct AovBuffers {
+        std::vector<Vec3> radiance;
+        std::vector<Vec3> albedo;
+        std::vector<Vec3> emission;
+        std::vector<Vec3> normal;
+        std::vector<Vec3> world_position;
+        std::vector<float> linear_depth;
+        std::vector<uint32_t> object_id;
+        bool rasterized = false;
+
+        void resize(size_t count) {
+            radiance.assign(count, Vec3{});
+            albedo.assign(count, Vec3{});
+            emission.assign(count, Vec3{});
+            normal.assign(count, Vec3{});
+            world_position.assign(count, Vec3{});
+            linear_depth.assign(count, kInfinity);
+            object_id.assign(count, 0u);
+            rasterized = false;
+        }
+
+        void clear() {
+            std::fill(radiance.begin(), radiance.end(), Vec3{});
+            std::fill(albedo.begin(), albedo.end(), Vec3{});
+            std::fill(emission.begin(), emission.end(), Vec3{});
+            std::fill(normal.begin(), normal.end(), Vec3{});
+            std::fill(world_position.begin(), world_position.end(), Vec3{});
+            std::fill(linear_depth.begin(), linear_depth.end(), kInfinity);
+            std::fill(object_id.begin(), object_id.end(), 0u);
+            rasterized = false;
+        }
+    };
+
+    struct SvgfHistory {
+        std::vector<Vec3> illumination;
+        std::vector<float> moment1;
+        std::vector<float> moment2;
+        std::vector<float> history_length;
+        std::vector<Vec3> normal;
+        std::vector<Vec3> world_position;
+        std::vector<float> linear_depth;
+        std::vector<uint32_t> object_id;
+        Camera camera;
+        float jitter_x = 0.0f;
+        float jitter_y = 0.0f;
+        bool valid = false;
+
+        void resize(size_t count) {
+            illumination.assign(count, Vec3{});
+            moment1.assign(count, 0.0f);
+            moment2.assign(count, 0.0f);
+            history_length.assign(count, 0.0f);
+            normal.assign(count, Vec3{});
+            world_position.assign(count, Vec3{});
+            linear_depth.assign(count, kInfinity);
+            object_id.assign(count, 0u);
+            jitter_x = 0.0f;
+            jitter_y = 0.0f;
+            valid = false;
+        }
+
+        void clear() {
+            std::fill(illumination.begin(), illumination.end(), Vec3{});
+            std::fill(moment1.begin(), moment1.end(), 0.0f);
+            std::fill(moment2.begin(), moment2.end(), 0.0f);
+            std::fill(history_length.begin(), history_length.end(), 0.0f);
+            std::fill(normal.begin(), normal.end(), Vec3{});
+            std::fill(world_position.begin(), world_position.end(), Vec3{});
+            std::fill(linear_depth.begin(), linear_depth.end(), kInfinity);
+            std::fill(object_id.begin(), object_id.end(), 0u);
+            jitter_x = 0.0f;
+            jitter_y = 0.0f;
+            valid = false;
+        }
+    };
+
+    struct TaaHistory {
+        std::vector<Vec3> color;
+        std::vector<float> history_length;
+        std::vector<Vec3> normal;
+        std::vector<Vec3> world_position;
+        std::vector<float> linear_depth;
+        std::vector<uint32_t> object_id;
+        Camera camera;
+        float jitter_x = 0.0f;
+        float jitter_y = 0.0f;
+        bool valid = false;
+
+        void resize(size_t count) {
+            color.assign(count, Vec3{});
+            history_length.assign(count, 0.0f);
+            normal.assign(count, Vec3{});
+            world_position.assign(count, Vec3{});
+            linear_depth.assign(count, kInfinity);
+            object_id.assign(count, 0u);
+            jitter_x = 0.0f;
+            jitter_y = 0.0f;
+            valid = false;
+        }
+
+        void clear() {
+            std::fill(color.begin(), color.end(), Vec3{});
+            std::fill(history_length.begin(), history_length.end(), 0.0f);
+            std::fill(normal.begin(), normal.end(), Vec3{});
+            std::fill(world_position.begin(), world_position.end(), Vec3{});
+            std::fill(linear_depth.begin(), linear_depth.end(), kInfinity);
+            std::fill(object_id.begin(), object_id.end(), 0u);
+            jitter_x = 0.0f;
+            jitter_y = 0.0f;
+            valid = false;
+        }
+    };
+
+    AovBuffers aov;
+    SvgfHistory svgf_history;
+    TaaHistory taa_history;
+
     void resize(int w, int h) {
         if (w == width && h == height) {
             return;
         }
         width = w;
         height = h;
-        accumulation.assign(static_cast<size_t>(w) * static_cast<size_t>(h), Vec3{});
-        rgba.assign(static_cast<size_t>(w) * static_cast<size_t>(h), 0xff000000u);
+        const size_t count = static_cast<size_t>(w) * static_cast<size_t>(h);
+        accumulation.assign(count, Vec3{});
+        rgba.assign(count, 0xff000000u);
+        aov.resize(count);
+        svgf_history.resize(count);
+        taa_history.resize(count);
     }
 
     void clear() {
         std::fill(accumulation.begin(), accumulation.end(), Vec3{});
         std::fill(rgba.begin(), rgba.end(), 0xff000000u);
+        aov.clear();
+        svgf_history.clear();
+        taa_history.clear();
     }
 
     void clear_accumulation() {
         std::fill(accumulation.begin(), accumulation.end(), Vec3{});
     }
 };
+
+struct RasterizedGBufferInterop {
+    void* albedo_texture = nullptr;
+    void* emission_texture = nullptr;
+    void* normal_texture = nullptr;
+    void* position_depth_texture = nullptr;
+    void* object_id_texture = nullptr;
+    int width = 0;
+    int height = 0;
+    bool valid = false;
+};
+
+inline bool has_rasterized_svgf_aov(const Framebuffer& framebuffer) {
+    const size_t count = static_cast<size_t>(std::max(0, framebuffer.width)) *
+        static_cast<size_t>(std::max(0, framebuffer.height));
+    return framebuffer.aov.rasterized &&
+        framebuffer.aov.albedo.size() == count &&
+        framebuffer.aov.emission.size() == count &&
+        framebuffer.aov.normal.size() == count &&
+        framebuffer.aov.world_position.size() == count &&
+        framebuffer.aov.linear_depth.size() == count &&
+        framebuffer.aov.object_id.size() == count;
+}
 
 std::shared_ptr<void> build_irradiance_volume_gpu(
     const RenderScene& render_scene, const Scene& scene, const RenderSettings& settings);
@@ -247,6 +469,11 @@ public:
     void reset() override;
     bool has_cached_data() const override { return scene_uploaded_; }
     void render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) override;
+    void render_with_rasterized_gbuffer_interop(
+        const Scene& scene,
+        const RenderSettings& settings,
+        Framebuffer& framebuffer,
+        const RasterizedGBufferInterop& interop);
 
 private:
     void render_cpu_fallback(
@@ -258,6 +485,37 @@ private:
 
     void* device_accumulation_ = nullptr;
     void* device_rgba_ = nullptr;
+    void* device_svgf_radiance_ = nullptr;
+    void* device_svgf_albedo_ = nullptr;
+    void* device_svgf_emission_ = nullptr;
+    void* device_svgf_normal_ = nullptr;
+    void* device_svgf_world_position_ = nullptr;
+    void* device_svgf_depth_ = nullptr;
+    void* device_svgf_object_id_ = nullptr;
+    void* device_svgf_history_illumination_ = nullptr;
+    void* device_svgf_history_moment1_ = nullptr;
+    void* device_svgf_history_moment2_ = nullptr;
+    void* device_svgf_history_length_ = nullptr;
+    void* device_svgf_history_normal_ = nullptr;
+    void* device_svgf_history_world_position_ = nullptr;
+    void* device_svgf_history_depth_ = nullptr;
+    void* device_svgf_history_object_id_ = nullptr;
+    void* device_svgf_temporal_illumination_ = nullptr;
+    void* device_svgf_temporal_moment1_ = nullptr;
+    void* device_svgf_temporal_moment2_ = nullptr;
+    void* device_svgf_temporal_variance_ = nullptr;
+    void* device_svgf_temporal_history_length_ = nullptr;
+    void* device_svgf_ping_illumination_ = nullptr;
+    void* device_svgf_pong_illumination_ = nullptr;
+    void* device_svgf_ping_variance_ = nullptr;
+    void* device_svgf_pong_variance_ = nullptr;
+    void* device_svgf_final_color_ = nullptr;
+    void* device_taa_history_color_ = nullptr;
+    void* device_taa_history_normal_ = nullptr;
+    void* device_taa_history_world_position_ = nullptr;
+    void* device_taa_history_depth_ = nullptr;
+    void* device_taa_history_object_id_ = nullptr;
+    void* device_taa_history_length_ = nullptr;
     void* device_scene_ = nullptr;
     void* device_materials_ = nullptr;
     void* device_textures_ = nullptr;
@@ -305,6 +563,15 @@ private:
     bool cached_render_scene_valid_ = false;
     bool cached_irradiance_volume_enabled_ = false;
     bool cached_lightmap_enabled_ = false;
+    bool svgf_history_valid_ = false;
+    Camera svgf_history_camera_;
+    float svgf_history_jitter_x_ = 0.0f;
+    float svgf_history_jitter_y_ = 0.0f;
+    bool taa_history_valid_ = false;
+    Camera taa_history_camera_;
+    float taa_history_jitter_x_ = 0.0f;
+    float taa_history_jitter_y_ = 0.0f;
+    RasterizedGBufferInterop svgf_gbuffer_interop_;
     std::vector<std::string> reported_fallback_reasons_;
 };
 

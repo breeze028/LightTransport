@@ -1,4 +1,5 @@
 #include "lt/renderer.h"
+#include "lt/denoiser.h"
 #include "lt/log.h"
 
 #include <xatlas.h>

@@ -89,6 +89,7 @@ add_library(lt_core
     src/log.cpp
     src/cpu/path_tracer.cpp
     src/cpu/cuda_stub.cpp
+    src/denoise/svgf.cpp
     src/fbx_loader.cpp
     src/gltf_loader.cpp
     src/material.cpp

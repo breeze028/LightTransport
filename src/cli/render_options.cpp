@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <ostream>
 #include <utility>
 
@@ -49,6 +50,7 @@ RenderOptions parse_render_options(int argc, char** argv) {
     options.settings.samples_per_pixel = 1;
     options.settings.max_bounces = 6;
 
+    bool explicit_max_bounces = false;
     for (int i = 3; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument == "--cuda") {
@@ -97,8 +99,52 @@ RenderOptions parse_render_options(int argc, char** argv) {
             }
         } else if (argument == "--spp" && i + 1 < argc) {
             options.settings.samples_per_pixel = std::max(1, std::atoi(argv[++i]));
+        } else if (argument == "--denoiser" && i + 1 < argc) {
+            const std::string denoiser = argv[++i];
+            options.settings.denoiser_mode = denoiser == "svgf" ? DenoiserMode::Svgf : DenoiserMode::Off;
+        } else if ((argument == "--aa" || argument == "--antialiasing") && i + 1 < argc) {
+            const std::string aa = argv[++i];
+            if (aa == "off") {
+                options.settings.antialiasing_mode = AntialiasingMode::Off;
+            } else if (aa == "taa" || aa == "taa-experimental") {
+                options.settings.antialiasing_mode = AntialiasingMode::TAA;
+            } else if (aa == "stable" || aa == "post" || aa == "stable-post" || aa == "stable-post-aa") {
+                options.settings.antialiasing_mode = AntialiasingMode::StablePostAA;
+            } else {
+                std::cerr << "Unknown antialiasing mode '" << aa << "'; expected off, stable, or taa\n";
+            }
+        } else if (argument == "--svgf-iterations" && i + 1 < argc) {
+            options.settings.svgf_iterations = std::clamp(std::atoi(argv[++i]), 0, 8);
+        } else if (argument == "--svgf-alpha" && i + 1 < argc) {
+            options.settings.svgf_alpha = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f);
+        } else if (argument == "--svgf-moments-alpha" && i + 1 < argc) {
+            options.settings.svgf_moments_alpha = std::clamp(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f);
+        } else if (argument == "--svgf-phi-color" && i + 1 < argc) {
+            options.settings.svgf_phi_color = std::max(0.001f, static_cast<float>(std::atof(argv[++i])));
+        } else if (argument == "--svgf-phi-normal" && i + 1 < argc) {
+            options.settings.svgf_phi_normal = std::max(0.001f, static_cast<float>(std::atof(argv[++i])));
+        } else if (argument == "--svgf-phi-depth" && i + 1 < argc) {
+            options.settings.svgf_phi_depth = std::max(0.001f, static_cast<float>(std::atof(argv[++i])));
+        } else if (argument == "--svgf-debug" && i + 1 < argc) {
+            const std::string view = argv[++i];
+            if (view == "raw") {
+                options.settings.svgf_debug_view = DenoiserDebugView::Raw;
+            } else if (view == "albedo") {
+                options.settings.svgf_debug_view = DenoiserDebugView::Albedo;
+            } else if (view == "normal") {
+                options.settings.svgf_debug_view = DenoiserDebugView::Normal;
+            } else if (view == "depth") {
+                options.settings.svgf_debug_view = DenoiserDebugView::Depth;
+            } else if (view == "variance") {
+                options.settings.svgf_debug_view = DenoiserDebugView::Variance;
+            } else if (view == "history") {
+                options.settings.svgf_debug_view = DenoiserDebugView::HistoryLength;
+            } else {
+                options.settings.svgf_debug_view = DenoiserDebugView::Final;
+            }
         } else if (argument == "--max-bounces" && i + 1 < argc) {
             options.settings.max_bounces = std::clamp(std::atoi(argv[++i]), 1, 32);
+            explicit_max_bounces = true;
         } else if (argument == "--frames" && i + 1 < argc) {
             options.settings.frame_index = static_cast<uint32_t>(std::max(0, std::atoi(argv[++i]) - 1));
         } else if (argument == "--size" && i + 2 < argc) {
@@ -233,6 +279,9 @@ RenderOptions parse_render_options(int argc, char** argv) {
         } else if (argument == "--hatch-shadow-only") {
             options.global_hatch_shadow_only = true;
         }
+    }
+    if (svgf_denoising_enabled(options.settings) && !explicit_max_bounces) {
+        options.settings.max_bounces = 2;
     }
     return options;
 }

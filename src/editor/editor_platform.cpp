@@ -144,7 +144,18 @@ void reset_accumulation(lt::RenderDirty dirty) {
         lt::has_dirty(dirty, lt::RenderDirty::Lightmap)) {
         ++g_editor.content_generation;
     }
-    g_editor.frame_index = 0;
+    const uint32_t dirty_bits = static_cast<uint32_t>(dirty);
+    const uint32_t camera_render_bits =
+        static_cast<uint32_t>(lt::RenderDirty::Camera) |
+        static_cast<uint32_t>(lt::RenderDirty::Render);
+    const bool camera_only_dirty =
+        (dirty_bits & static_cast<uint32_t>(lt::RenderDirty::Camera)) != 0u &&
+        (dirty_bits & ~camera_render_bits) == 0u;
+    const bool preserve_svgf_camera_history =
+        lt::svgf_denoising_enabled(g_editor.settings) && camera_only_dirty;
+    if (!preserve_svgf_camera_history) {
+        g_editor.frame_index = 0;
+    }
     g_editor.framebuffer.clear_accumulation();
 }
 

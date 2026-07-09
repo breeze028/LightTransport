@@ -3,6 +3,8 @@
 
 #if LT_HAS_CUDA
 
+#include <d3d11.h>
+#include <cuda_d3d11_interop.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -35,6 +37,34 @@ namespace {
 #include "../cpu/shading.inl"
 #include "../cpu/irradiance_volume_bake.inl"
 #include "../cpu/lightmap_bake.inl"
+
+struct GBufferFloat4 {
+    float x, y, z, w;
+};
+
+__global__ void unpack_rasterized_gbuffer_kernel(
+    const GBufferFloat4* albedo4,
+    const GBufferFloat4* emission4,
+    const GBufferFloat4* normal4,
+    const GBufferFloat4* position_depth4,
+    Vec3* albedo,
+    Vec3* emission,
+    Vec3* normal,
+    Vec3* world_position,
+    float* depth,
+    int count) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    const GBufferFloat4 a = albedo4[idx];
+    const GBufferFloat4 e = emission4[idx];
+    const GBufferFloat4 n = normal4[idx];
+    const GBufferFloat4 p = position_depth4[idx];
+    albedo[idx] = {a.x, a.y, a.z};
+    emission[idx] = {e.x, e.y, e.z};
+    normal[idx] = {n.x, n.y, n.z};
+    world_position[idx] = {p.x, p.y, p.z};
+    depth[idx] = p.w;
+}
 
 struct PackedGpuIrradianceVolume {
     GpuIrradianceVolume volume;
@@ -739,6 +769,37 @@ CudaPathTracer::~CudaPathTracer() {
 void CudaPathTracer::reset() {
     cudaFree(device_accumulation_);
     cudaFree(device_rgba_);
+    cudaFree(device_svgf_radiance_);
+    cudaFree(device_svgf_albedo_);
+    cudaFree(device_svgf_emission_);
+    cudaFree(device_svgf_normal_);
+    cudaFree(device_svgf_world_position_);
+    cudaFree(device_svgf_depth_);
+    cudaFree(device_svgf_object_id_);
+    cudaFree(device_svgf_history_illumination_);
+    cudaFree(device_svgf_history_moment1_);
+    cudaFree(device_svgf_history_moment2_);
+    cudaFree(device_svgf_history_length_);
+    cudaFree(device_svgf_history_normal_);
+    cudaFree(device_svgf_history_world_position_);
+    cudaFree(device_svgf_history_depth_);
+    cudaFree(device_svgf_history_object_id_);
+    cudaFree(device_svgf_temporal_illumination_);
+    cudaFree(device_svgf_temporal_moment1_);
+    cudaFree(device_svgf_temporal_moment2_);
+    cudaFree(device_svgf_temporal_variance_);
+    cudaFree(device_svgf_temporal_history_length_);
+    cudaFree(device_svgf_ping_illumination_);
+    cudaFree(device_svgf_pong_illumination_);
+    cudaFree(device_svgf_ping_variance_);
+    cudaFree(device_svgf_pong_variance_);
+    cudaFree(device_svgf_final_color_);
+    cudaFree(device_taa_history_color_);
+    cudaFree(device_taa_history_normal_);
+    cudaFree(device_taa_history_world_position_);
+    cudaFree(device_taa_history_depth_);
+    cudaFree(device_taa_history_object_id_);
+    cudaFree(device_taa_history_length_);
     cudaFree(device_scene_);
     cudaFree(device_materials_);
     cudaFree(device_textures_);
@@ -760,6 +821,37 @@ void CudaPathTracer::reset() {
     cudaFree(device_lightmap_texels_);
     device_accumulation_ = nullptr;
     device_rgba_ = nullptr;
+    device_svgf_radiance_ = nullptr;
+    device_svgf_albedo_ = nullptr;
+    device_svgf_emission_ = nullptr;
+    device_svgf_normal_ = nullptr;
+    device_svgf_world_position_ = nullptr;
+    device_svgf_depth_ = nullptr;
+    device_svgf_object_id_ = nullptr;
+    device_svgf_history_illumination_ = nullptr;
+    device_svgf_history_moment1_ = nullptr;
+    device_svgf_history_moment2_ = nullptr;
+    device_svgf_history_length_ = nullptr;
+    device_svgf_history_normal_ = nullptr;
+    device_svgf_history_world_position_ = nullptr;
+    device_svgf_history_depth_ = nullptr;
+    device_svgf_history_object_id_ = nullptr;
+    device_svgf_temporal_illumination_ = nullptr;
+    device_svgf_temporal_moment1_ = nullptr;
+    device_svgf_temporal_moment2_ = nullptr;
+    device_svgf_temporal_variance_ = nullptr;
+    device_svgf_temporal_history_length_ = nullptr;
+    device_svgf_ping_illumination_ = nullptr;
+    device_svgf_pong_illumination_ = nullptr;
+    device_svgf_ping_variance_ = nullptr;
+    device_svgf_pong_variance_ = nullptr;
+    device_svgf_final_color_ = nullptr;
+    device_taa_history_color_ = nullptr;
+    device_taa_history_normal_ = nullptr;
+    device_taa_history_world_position_ = nullptr;
+    device_taa_history_depth_ = nullptr;
+    device_taa_history_object_id_ = nullptr;
+    device_taa_history_length_ = nullptr;
     device_scene_ = nullptr;
     device_materials_ = nullptr;
     device_textures_ = nullptr;
@@ -805,6 +897,14 @@ void CudaPathTracer::reset() {
     cached_render_scene_valid_ = false;
     cached_irradiance_volume_enabled_ = false;
     cached_lightmap_enabled_ = false;
+    svgf_history_valid_ = false;
+    svgf_history_camera_ = {};
+    svgf_history_jitter_x_ = 0.0f;
+    svgf_history_jitter_y_ = 0.0f;
+    taa_history_valid_ = false;
+    taa_history_camera_ = {};
+    taa_history_jitter_x_ = 0.0f;
+    taa_history_jitter_y_ = 0.0f;
     release_texture_objects(texture_arrays_, texture_objects_);
 }
 
@@ -827,6 +927,153 @@ void CudaPathTracer::render_cpu_fallback(
     }
     CpuPathTracer fallback;
     fallback.render(scene, settings, framebuffer);
+}
+
+void CudaPathTracer::render_with_rasterized_gbuffer_interop(
+    const Scene& scene,
+    const RenderSettings& settings,
+    Framebuffer& framebuffer,
+    const RasterizedGBufferInterop& interop) {
+    svgf_gbuffer_interop_ = interop;
+    render(scene, settings, framebuffer);
+    svgf_gbuffer_interop_ = {};
+}
+
+bool upload_rasterized_gbuffer_interop_to_cuda(
+    const RasterizedGBufferInterop& interop,
+    int width,
+    int height,
+    Vec3* albedo,
+    Vec3* emission,
+    Vec3* normal,
+    Vec3* world_position,
+    float* depth,
+    uint32_t* object_id,
+    cudaError_t& cuda_error) {
+    cuda_error = cudaSuccess;
+    if (!interop.valid ||
+        interop.width != width ||
+        interop.height != height ||
+        !interop.albedo_texture ||
+        !interop.emission_texture ||
+        !interop.normal_texture ||
+        !interop.position_depth_texture ||
+        !interop.object_id_texture) {
+        cuda_error = cudaErrorInvalidValue;
+        return false;
+    }
+
+    cudaGraphicsResource_t resources[5] = {};
+    bool mapped = false;
+    GBufferFloat4* temp_albedo = nullptr;
+    GBufferFloat4* temp_emission = nullptr;
+    GBufferFloat4* temp_normal = nullptr;
+    GBufferFloat4* temp_position_depth = nullptr;
+
+    const auto cleanup = [&]() {
+        if (mapped) {
+            const cudaError_t unmap_error = cudaGraphicsUnmapResources(5, resources, 0);
+            if (cuda_error == cudaSuccess && unmap_error != cudaSuccess) {
+                cuda_error = unmap_error;
+            }
+            mapped = false;
+        }
+        for (cudaGraphicsResource_t& resource : resources) {
+            if (resource) {
+                const cudaError_t unregister_error = cudaGraphicsUnregisterResource(resource);
+                if (cuda_error == cudaSuccess && unregister_error != cudaSuccess) {
+                    cuda_error = unregister_error;
+                }
+                resource = nullptr;
+            }
+        }
+        cudaFree(temp_albedo);
+        cudaFree(temp_emission);
+        cudaFree(temp_normal);
+        cudaFree(temp_position_depth);
+    };
+
+    void* textures[5] = {
+        interop.albedo_texture,
+        interop.emission_texture,
+        interop.normal_texture,
+        interop.position_depth_texture,
+        interop.object_id_texture,
+    };
+    for (int i = 0; i < 5; ++i) {
+        cuda_error = cudaGraphicsD3D11RegisterResource(
+            &resources[i],
+            static_cast<ID3D11Resource*>(textures[i]),
+            cudaGraphicsRegisterFlagsReadOnly);
+        if (cuda_error != cudaSuccess) {
+            cleanup();
+            return false;
+        }
+    }
+
+    cuda_error = cudaGraphicsMapResources(5, resources, 0);
+    if (cuda_error != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    mapped = true;
+
+    cudaArray_t arrays[5] = {};
+    for (int i = 0; i < 5; ++i) {
+        cuda_error = cudaGraphicsSubResourceGetMappedArray(&arrays[i], resources[i], 0, 0);
+        if (cuda_error != cudaSuccess) {
+            cleanup();
+            return false;
+        }
+    }
+
+    const size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const size_t float4_pitch = static_cast<size_t>(width) * sizeof(GBufferFloat4);
+    const size_t object_id_pitch = static_cast<size_t>(width) * sizeof(uint32_t);
+    cuda_error = cudaMalloc(&temp_albedo, pixels * sizeof(GBufferFloat4));
+    if (cuda_error == cudaSuccess) cuda_error = cudaMalloc(&temp_emission, pixels * sizeof(GBufferFloat4));
+    if (cuda_error == cudaSuccess) cuda_error = cudaMalloc(&temp_normal, pixels * sizeof(GBufferFloat4));
+    if (cuda_error == cudaSuccess) cuda_error = cudaMalloc(&temp_position_depth, pixels * sizeof(GBufferFloat4));
+    if (cuda_error != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+
+    cuda_error = cudaMemcpy2DFromArray(temp_albedo, float4_pitch, arrays[0], 0, 0, float4_pitch, height, cudaMemcpyDeviceToDevice);
+    if (cuda_error == cudaSuccess) {
+        cuda_error = cudaMemcpy2DFromArray(temp_emission, float4_pitch, arrays[1], 0, 0, float4_pitch, height, cudaMemcpyDeviceToDevice);
+    }
+    if (cuda_error == cudaSuccess) {
+        cuda_error = cudaMemcpy2DFromArray(temp_normal, float4_pitch, arrays[2], 0, 0, float4_pitch, height, cudaMemcpyDeviceToDevice);
+    }
+    if (cuda_error == cudaSuccess) {
+        cuda_error = cudaMemcpy2DFromArray(temp_position_depth, float4_pitch, arrays[3], 0, 0, float4_pitch, height, cudaMemcpyDeviceToDevice);
+    }
+    if (cuda_error == cudaSuccess) {
+        cuda_error = cudaMemcpy2DFromArray(object_id, object_id_pitch, arrays[4], 0, 0, object_id_pitch, height, cudaMemcpyDeviceToDevice);
+    }
+    if (cuda_error != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+
+    const int count = static_cast<int>(pixels);
+    const int block_size = 256;
+    const int grid_size = (count + block_size - 1) / block_size;
+    unpack_rasterized_gbuffer_kernel<<<grid_size, block_size>>>(
+        temp_albedo,
+        temp_emission,
+        temp_normal,
+        temp_position_depth,
+        albedo,
+        emission,
+        normal,
+        world_position,
+        depth,
+        count);
+    cuda_error = cudaDeviceSynchronize();
+    cleanup();
+    return cuda_error == cudaSuccess;
 }
 
 void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) {
@@ -852,6 +1099,53 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         reset();
         render_cpu_fallback(scene, settings, framebuffer, "could not allocate scene buffer", cuda_error_text(cuda_error));
         return;
+    }
+    const auto allocate_svgf_buffer = [&](void*& ptr, size_t bytes, const char* name) {
+        if (ptr) {
+            return true;
+        }
+        cuda_error = cudaMalloc(&ptr, bytes);
+        if (cuda_error != cudaSuccess) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, name, cuda_error_text(cuda_error));
+            return false;
+        }
+        return true;
+    };
+    if (svgf_denoising_enabled(settings)) {
+        if (!allocate_svgf_buffer(device_svgf_radiance_, pixels * sizeof(Vec3), "could not allocate SVGF radiance buffer") ||
+            !allocate_svgf_buffer(device_svgf_albedo_, pixels * sizeof(Vec3), "could not allocate SVGF albedo buffer") ||
+            !allocate_svgf_buffer(device_svgf_emission_, pixels * sizeof(Vec3), "could not allocate SVGF emission buffer") ||
+            !allocate_svgf_buffer(device_svgf_normal_, pixels * sizeof(Vec3), "could not allocate SVGF normal buffer") ||
+            !allocate_svgf_buffer(device_svgf_world_position_, pixels * sizeof(Vec3), "could not allocate SVGF position buffer") ||
+            !allocate_svgf_buffer(device_svgf_depth_, pixels * sizeof(float), "could not allocate SVGF depth buffer") ||
+            !allocate_svgf_buffer(device_svgf_object_id_, pixels * sizeof(uint32_t), "could not allocate SVGF object id buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_illumination_, pixels * sizeof(Vec3), "could not allocate SVGF history illumination buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_moment1_, pixels * sizeof(float), "could not allocate SVGF history moment buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_moment2_, pixels * sizeof(float), "could not allocate SVGF history moment buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_length_, pixels * sizeof(float), "could not allocate SVGF history length buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_normal_, pixels * sizeof(Vec3), "could not allocate SVGF history normal buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_world_position_, pixels * sizeof(Vec3), "could not allocate SVGF history position buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_depth_, pixels * sizeof(float), "could not allocate SVGF history depth buffer") ||
+            !allocate_svgf_buffer(device_svgf_history_object_id_, pixels * sizeof(uint32_t), "could not allocate SVGF history object id buffer") ||
+            !allocate_svgf_buffer(device_svgf_temporal_illumination_, pixels * sizeof(Vec3), "could not allocate SVGF temporal illumination buffer") ||
+            !allocate_svgf_buffer(device_svgf_temporal_moment1_, pixels * sizeof(float), "could not allocate SVGF temporal moment buffer") ||
+            !allocate_svgf_buffer(device_svgf_temporal_moment2_, pixels * sizeof(float), "could not allocate SVGF temporal moment buffer") ||
+            !allocate_svgf_buffer(device_svgf_temporal_variance_, pixels * sizeof(float), "could not allocate SVGF temporal variance buffer") ||
+            !allocate_svgf_buffer(device_svgf_temporal_history_length_, pixels * sizeof(float), "could not allocate SVGF temporal history buffer") ||
+            !allocate_svgf_buffer(device_svgf_ping_illumination_, pixels * sizeof(Vec3), "could not allocate SVGF ping illumination buffer") ||
+            !allocate_svgf_buffer(device_svgf_pong_illumination_, pixels * sizeof(Vec3), "could not allocate SVGF pong illumination buffer") ||
+            !allocate_svgf_buffer(device_svgf_ping_variance_, pixels * sizeof(float), "could not allocate SVGF ping variance buffer") ||
+            !allocate_svgf_buffer(device_svgf_pong_variance_, pixels * sizeof(float), "could not allocate SVGF pong variance buffer") ||
+            !allocate_svgf_buffer(device_svgf_final_color_, pixels * sizeof(Vec3), "could not allocate SVGF final color buffer") ||
+            !allocate_svgf_buffer(device_taa_history_color_, pixels * sizeof(Vec3), "could not allocate TAA history color buffer") ||
+            !allocate_svgf_buffer(device_taa_history_normal_, pixels * sizeof(Vec3), "could not allocate TAA history normal buffer") ||
+            !allocate_svgf_buffer(device_taa_history_world_position_, pixels * sizeof(Vec3), "could not allocate TAA history position buffer") ||
+            !allocate_svgf_buffer(device_taa_history_depth_, pixels * sizeof(float), "could not allocate TAA history depth buffer") ||
+            !allocate_svgf_buffer(device_taa_history_object_id_, pixels * sizeof(uint32_t), "could not allocate TAA history object id buffer") ||
+            !allocate_svgf_buffer(device_taa_history_length_, pixels * sizeof(float), "could not allocate TAA history length buffer")) {
+            return;
+        }
     }
     cached_pixels_ = pixels;
 
@@ -1056,7 +1350,32 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         }
     }
 
-    if (settings.frame_index == 0u || has_dirty(settings.dirty, RenderDirty::Render)) {
+    const bool svgf_history_invalidated =
+        settings.frame_index == 0u ||
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform) ||
+        has_dirty(settings.dirty, RenderDirty::Material) ||
+        has_dirty(settings.dirty, RenderDirty::Texture) ||
+        has_dirty(settings.dirty, RenderDirty::Environment) ||
+        has_dirty(settings.dirty, RenderDirty::IrradianceVolume) ||
+        has_dirty(settings.dirty, RenderDirty::Lightmap);
+    if (svgf_history_invalidated) {
+        svgf_history_valid_ = false;
+    }
+
+    const bool taa_history_invalidated =
+        settings.frame_index == 0u ||
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Material) ||
+        has_dirty(settings.dirty, RenderDirty::Texture) ||
+        has_dirty(settings.dirty, RenderDirty::Environment) ||
+        has_dirty(settings.dirty, RenderDirty::IrradianceVolume) ||
+        has_dirty(settings.dirty, RenderDirty::Lightmap);
+    if (taa_history_invalidated) {
+        taa_history_valid_ = false;
+    }
+
+    if (!svgf_denoising_enabled(settings) && (settings.frame_index == 0u || has_dirty(settings.dirty, RenderDirty::Render))) {
         cuda_error = cudaMemset(device_accumulation, 0, pixels * sizeof(Vec3));
         if (cuda_error != cudaSuccess) {
             reset();
@@ -1071,12 +1390,198 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
 
     const dim3 block(16, 16);
     const dim3 grid((settings.width + block.x - 1) / block.x, (settings.height + block.y - 1) / block.y);
-    render_kernel<<<grid, block>>>(device_scene, settings, device_accumulation, device_rgba);
-    const cudaError_t render_error = cudaDeviceSynchronize();
-    if (render_error != cudaSuccess) {
-        reset();
-        render_cpu_fallback(scene, settings, framebuffer, "CUDA kernel failed", cuda_error_text(render_error));
-        return;
+    if (svgf_denoising_enabled(settings)) {
+        Vec3* radiance = static_cast<Vec3*>(device_svgf_radiance_);
+        Vec3* albedo = static_cast<Vec3*>(device_svgf_albedo_);
+        Vec3* emission = static_cast<Vec3*>(device_svgf_emission_);
+        Vec3* normal = static_cast<Vec3*>(device_svgf_normal_);
+        Vec3* world_position = static_cast<Vec3*>(device_svgf_world_position_);
+        float* depth = static_cast<float*>(device_svgf_depth_);
+        uint32_t* object_id = static_cast<uint32_t*>(device_svgf_object_id_);
+        Vec3* history_illumination = static_cast<Vec3*>(device_svgf_history_illumination_);
+        float* history_moment1 = static_cast<float*>(device_svgf_history_moment1_);
+        float* history_moment2 = static_cast<float*>(device_svgf_history_moment2_);
+        float* history_length = static_cast<float*>(device_svgf_history_length_);
+        Vec3* history_normal = static_cast<Vec3*>(device_svgf_history_normal_);
+        Vec3* history_world_position = static_cast<Vec3*>(device_svgf_history_world_position_);
+        float* history_depth = static_cast<float*>(device_svgf_history_depth_);
+        uint32_t* history_object_id = static_cast<uint32_t*>(device_svgf_history_object_id_);
+        Vec3* temporal_illumination = static_cast<Vec3*>(device_svgf_temporal_illumination_);
+        float* temporal_moment1 = static_cast<float*>(device_svgf_temporal_moment1_);
+        float* temporal_moment2 = static_cast<float*>(device_svgf_temporal_moment2_);
+        float* temporal_variance = static_cast<float*>(device_svgf_temporal_variance_);
+        float* temporal_history_length = static_cast<float*>(device_svgf_temporal_history_length_);
+        Vec3* ping_illumination = static_cast<Vec3*>(device_svgf_ping_illumination_);
+        Vec3* pong_illumination = static_cast<Vec3*>(device_svgf_pong_illumination_);
+        float* ping_variance = static_cast<float*>(device_svgf_ping_variance_);
+        float* pong_variance = static_cast<float*>(device_svgf_pong_variance_);
+        Vec3* final_color = static_cast<Vec3*>(device_svgf_final_color_);
+        Vec3* taa_history_color = static_cast<Vec3*>(device_taa_history_color_);
+        Vec3* taa_history_normal = static_cast<Vec3*>(device_taa_history_normal_);
+        Vec3* taa_history_world_position = static_cast<Vec3*>(device_taa_history_world_position_);
+        float* taa_history_depth = static_cast<float*>(device_taa_history_depth_);
+        uint32_t* taa_history_object_id = static_cast<uint32_t*>(device_taa_history_object_id_);
+        float* taa_history_length = static_cast<float*>(device_taa_history_length_);
+
+        render_svgf_input_kernel<<<grid, block>>>(
+            device_scene, settings, radiance, albedo, emission, normal, world_position, depth, object_id);
+        bool used_rasterized_gbuffer = false;
+        if (svgf_gbuffer_interop_.valid) {
+            cudaError_t interop_error = cudaSuccess;
+            used_rasterized_gbuffer = upload_rasterized_gbuffer_interop_to_cuda(
+                svgf_gbuffer_interop_,
+                settings.width,
+                settings.height,
+                albedo,
+                emission,
+                normal,
+                world_position,
+                depth,
+                object_id,
+                interop_error);
+            if (!used_rasterized_gbuffer) {
+                std::string key = "CUDA SVGF D3D11 interop unavailable";
+                if (interop_error != cudaSuccess) {
+                    key += ": ";
+                    key += cuda_error_text(interop_error);
+                }
+                if (std::find(reported_fallback_reasons_.begin(), reported_fallback_reasons_.end(), key) == reported_fallback_reasons_.end()) {
+                    reported_fallback_reasons_.push_back(key);
+                    LT_LOG_WARN("CUDA SVGF using manual traced G-buffer: {}", key);
+                } else {
+                    LT_LOG_DEBUG("CUDA SVGF using manual traced G-buffer: {}", key);
+                }
+            }
+        }
+        if (!used_rasterized_gbuffer && has_rasterized_svgf_aov(framebuffer)) {
+            cuda_error = cudaMemcpy(albedo, framebuffer.aov.albedo.data(), pixels * sizeof(Vec3), cudaMemcpyHostToDevice);
+            if (cuda_error == cudaSuccess) {
+                cuda_error = cudaMemcpy(emission, framebuffer.aov.emission.data(), pixels * sizeof(Vec3), cudaMemcpyHostToDevice);
+            }
+            if (cuda_error == cudaSuccess) {
+                cuda_error = cudaMemcpy(normal, framebuffer.aov.normal.data(), pixels * sizeof(Vec3), cudaMemcpyHostToDevice);
+            }
+            if (cuda_error == cudaSuccess) {
+                cuda_error = cudaMemcpy(world_position, framebuffer.aov.world_position.data(), pixels * sizeof(Vec3), cudaMemcpyHostToDevice);
+            }
+            if (cuda_error == cudaSuccess) {
+                cuda_error = cudaMemcpy(depth, framebuffer.aov.linear_depth.data(), pixels * sizeof(float), cudaMemcpyHostToDevice);
+            }
+            if (cuda_error == cudaSuccess) {
+                cuda_error = cudaMemcpy(object_id, framebuffer.aov.object_id.data(), pixels * sizeof(uint32_t), cudaMemcpyHostToDevice);
+            }
+            if (cuda_error != cudaSuccess) {
+                reset();
+                render_cpu_fallback(scene, settings, framebuffer, "could not upload rasterized CUDA SVGF G-buffer", cuda_error_text(cuda_error));
+                return;
+            }
+            used_rasterized_gbuffer = true;
+        }
+        svgf_temporal_kernel<<<grid, block>>>(
+            settings,
+            svgf_history_camera_,
+            svgf_history_jitter_x_,
+            svgf_history_jitter_y_,
+            svgf_history_valid_ ? 1 : 0,
+            radiance,
+            albedo,
+            emission,
+            normal,
+            world_position,
+            depth,
+            object_id,
+            history_illumination,
+            history_moment1,
+            history_moment2,
+            history_length,
+            history_normal,
+            history_world_position,
+            history_depth,
+            history_object_id,
+            temporal_illumination,
+            temporal_moment1,
+            temporal_moment2,
+            temporal_variance,
+            temporal_history_length);
+        cuda_error = cudaMemcpy(ping_illumination, temporal_illumination, pixels * sizeof(Vec3), cudaMemcpyDeviceToDevice);
+        if (cuda_error == cudaSuccess) {
+            cuda_error = cudaMemcpy(ping_variance, temporal_variance, pixels * sizeof(float), cudaMemcpyDeviceToDevice);
+        }
+        if (cuda_error != cudaSuccess) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "could not initialize CUDA SVGF ping buffers", cuda_error_text(cuda_error));
+            return;
+        }
+        const int iterations = std::clamp(settings.svgf_iterations, 0, 8);
+        for (int i = 0; i < iterations; ++i) {
+            svgf_atrous_kernel<<<grid, block>>>(
+                settings, 1 << i, ping_illumination, ping_variance, normal, depth, object_id, pong_illumination, pong_variance);
+            std::swap(ping_illumination, pong_illumination);
+            std::swap(ping_variance, pong_variance);
+        }
+        svgf_resolve_kernel<<<grid, block>>>(
+            settings,
+            radiance,
+            albedo,
+            emission,
+            normal,
+            world_position,
+            depth,
+            object_id,
+            ping_illumination,
+            ping_variance,
+            temporal_moment1,
+            temporal_moment2,
+            temporal_history_length,
+            history_illumination,
+            history_moment1,
+            history_moment2,
+            history_length,
+            history_normal,
+            history_world_position,
+            history_depth,
+            history_object_id,
+            final_color);
+        taa_resolve_kernel<<<grid, block>>>(
+            settings,
+            taa_history_camera_,
+            taa_history_jitter_x_,
+            taa_history_jitter_y_,
+            taa_history_valid_ ? 1 : 0,
+            final_color,
+            normal,
+            world_position,
+            depth,
+            object_id,
+            taa_history_color,
+            taa_history_normal,
+            taa_history_world_position,
+            taa_history_depth,
+            taa_history_object_id,
+            taa_history_length,
+            device_rgba);
+        const cudaError_t svgf_error = cudaDeviceSynchronize();
+        if (svgf_error != cudaSuccess) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "CUDA SVGF kernel failed", cuda_error_text(svgf_error));
+            return;
+        }
+        svgf_history_camera_ = scene.camera;
+        svgf_history_jitter_x_ = settings.camera_jitter_x;
+        svgf_history_jitter_y_ = settings.camera_jitter_y;
+        svgf_history_valid_ = true;
+        taa_history_camera_ = scene.camera;
+        taa_history_jitter_x_ = settings.camera_jitter_x;
+        taa_history_jitter_y_ = settings.camera_jitter_y;
+        taa_history_valid_ = true;
+    } else {
+        render_kernel<<<grid, block>>>(device_scene, settings, device_accumulation, device_rgba);
+        const cudaError_t render_error = cudaDeviceSynchronize();
+        if (render_error != cudaSuccess) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "CUDA kernel failed", cuda_error_text(render_error));
+            return;
+        }
     }
     const cudaError_t rgba_error = cudaMemcpy(framebuffer.rgba.data(), device_rgba, pixels * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     if (rgba_error != cudaSuccess) {

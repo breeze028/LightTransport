@@ -32,6 +32,14 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     render_cpu_fallback(scene, settings, framebuffer, "CUDA backend is not built");
 }
 
+void CudaPathTracer::render_with_rasterized_gbuffer_interop(
+    const Scene& scene,
+    const RenderSettings& settings,
+    Framebuffer& framebuffer,
+    const RasterizedGBufferInterop&) {
+    render_cpu_fallback(scene, settings, framebuffer, "CUDA backend is not built");
+}
+
 std::shared_ptr<void> build_irradiance_volume_gpu(
     const RenderScene&, const Scene&, const RenderSettings&) {
     LT_LOG_WARN("GPU irradiance volume bake requested but CUDA is not available. "

@@ -6,8 +6,10 @@ Ray make_camera_ray(const Camera& camera, int x, int y, const RenderSettings& se
     const float right_sign = camera.right_sign < 0.0f ? -1.0f : 1.0f;
     const Vec3 right = normalize(cross(forward, camera.up)) * right_sign;
     const Vec3 up = cross(right, forward) * right_sign;
-    const float u = ((static_cast<float>(x) + rng.next_float()) / static_cast<float>(settings.width) * 2.0f - 1.0f) * half_width;
-    const float v = (1.0f - (static_cast<float>(y) + rng.next_float()) / static_cast<float>(settings.height) * 2.0f) * half_height;
+    const float sample_x = svgf_denoising_enabled(settings) ? 0.5f + settings.camera_jitter_x : rng.next_float();
+    const float sample_y = svgf_denoising_enabled(settings) ? 0.5f + settings.camera_jitter_y : rng.next_float();
+    const float u = ((static_cast<float>(x) + sample_x) / static_cast<float>(settings.width) * 2.0f - 1.0f) * half_width;
+    const float v = (1.0f - (static_cast<float>(y) + sample_y) / static_cast<float>(settings.height) * 2.0f) * half_height;
     return {camera.position, normalize(forward + right * u + up * v)};
 }
 

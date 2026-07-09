@@ -68,3 +68,16 @@ __device__ Ray camera_ray(const Camera& camera, int x, int y, int width, int hei
     return {camera.position, dnormalize(add(add(forward, mul(right, u)), mul(up, v)))};
 }
 
+__device__ Ray camera_ray_with_sample(const Camera& camera, int x, int y, int width, int height, float sample_x, float sample_y) {
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    const float half_height = tanf(camera.fov_degrees * kPi / 360.0f);
+    const float half_width = aspect * half_height;
+    const Vec3 forward = dnormalize(sub(camera.target, camera.position));
+    const float right_sign = camera.right_sign < 0.0f ? -1.0f : 1.0f;
+    const Vec3 right = mul(dnormalize(dcross(forward, camera.up)), right_sign);
+    const Vec3 up = mul(dcross(right, forward), right_sign);
+    const float u = ((static_cast<float>(x) + sample_x) / static_cast<float>(width) * 2.0f - 1.0f) * half_width;
+    const float v = (1.0f - (static_cast<float>(y) + sample_y) / static_cast<float>(height) * 2.0f) * half_height;
+    return {camera.position, dnormalize(add(add(forward, mul(right, u)), mul(up, v)))};
+}
+

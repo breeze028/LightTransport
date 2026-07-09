@@ -1331,7 +1331,11 @@ void poll_render_result() {
         result.framebuffer.width == g_editor.framebuffer.width &&
         result.framebuffer.height == g_editor.framebuffer.height;
     if (!current_result && !compatible_stale_result) return;
-    if (current_result) {
+    const bool preserve_svgf_stale_history =
+        !current_result &&
+        compatible_stale_result &&
+        lt::svgf_denoising_enabled(g_editor.settings);
+    if (current_result || preserve_svgf_stale_history) {
         g_editor.framebuffer = std::move(result.framebuffer);
         g_editor.frame_index = result.completed_frame + 1u;
     } else {
@@ -1348,7 +1352,29 @@ void launch_render_task() {
     if (g_editor.viewport_preview_mode != ViewportPreviewMode::Rendered) return;
     lt::Scene scene = g_editor.scene;
     lt::RenderSettings settings = g_editor.settings;
+    settings.frame_index = g_editor.frame_index;
+    settings.dirty = g_editor.dirty;
+    if (lt::temporal_jitter_enabled(settings)) {
+        const lt::Vec2 jitter = lt::temporal_jitter(settings.frame_index);
+        settings.camera_jitter_x = jitter.x;
+        settings.camera_jitter_y = jitter.y;
+    } else {
+        settings.camera_jitter_x = 0.0f;
+        settings.camera_jitter_y = 0.0f;
+    }
     lt::Framebuffer framebuffer = g_editor.framebuffer;
+    lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene)
+        ? static_cast<lt::IRenderer*>(&g_editor.cpu)
+        : g_editor.renderer;
+    lt::RasterizedGBufferInterop gbuffer_interop;
+    framebuffer.aov.rasterized = false;
+    if (lt::svgf_denoising_enabled(settings) && settings.svgf_rasterized_gbuffer) {
+        if (renderer == static_cast<lt::IRenderer*>(&g_editor.cuda)) {
+            render_svgf_gbuffer_interop(g_solid_preview, scene, g_editor.viewport_size, settings, gbuffer_interop);
+        } else {
+            render_svgf_gbuffer(g_solid_preview, scene, g_editor.viewport_size, settings, framebuffer);
+        }
+    }
     const uint64_t generation = g_editor.render_generation;
     const uint64_t content_generation = g_editor.content_generation;
     copy_setting_text(settings.irradiance_volume_cache_key, g_editor.scene_path);
@@ -1359,15 +1385,24 @@ void launch_render_task() {
     settings.lightmap_bake_progress = g_editor.lightmap_bake_progress.get();
     const bool consume_force_rebake = settings.irradiance_volume_force_rebake;
     const bool consume_lightmap_force_rebake = settings.lightmap_force_rebake;
-    lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene)
-        ? static_cast<lt::IRenderer*>(&g_editor.cpu)
-        : g_editor.renderer;
-    settings.frame_index = g_editor.frame_index;
-    settings.dirty = g_editor.dirty;
     g_editor.dirty = lt::RenderDirty::None;
-    g_render_future = std::async(std::launch::async, [scene = std::move(scene), settings, framebuffer = std::move(framebuffer), generation, content_generation, renderer]() mutable {
+    g_render_future = std::async(std::launch::async, [
+        scene = std::move(scene),
+        settings,
+        framebuffer = std::move(framebuffer),
+        generation,
+        content_generation,
+        renderer,
+        cuda_renderer = &g_editor.cuda,
+        gbuffer_interop
+    ]() mutable {
         const auto begin = std::chrono::steady_clock::now();
-        renderer->render(scene, settings, framebuffer);
+        if (gbuffer_interop.valid && renderer == static_cast<lt::IRenderer*>(cuda_renderer)) {
+            cuda_renderer->render_with_rasterized_gbuffer_interop(scene, settings, framebuffer, gbuffer_interop);
+        } else {
+            renderer->render(scene, settings, framebuffer);
+        }
+        release_svgf_gbuffer_interop(gbuffer_interop);
         const auto end = std::chrono::steady_clock::now();
         const double elapsed_ms = std::chrono::duration<double, std::milli>(end - begin).count();
         return RenderResult{generation, content_generation, settings.frame_index, elapsed_ms, std::move(framebuffer)};
@@ -3407,7 +3442,10 @@ float draw_top_bar() {
         ImGui::EndMenu();
     }
     ImGui::Separator();
-    const lt::IRenderer* effective_renderer = lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene) ? static_cast<const lt::IRenderer*>(&g_editor.cpu) : g_editor.renderer;
+    const lt::IRenderer* effective_renderer =
+        lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)
+            ? static_cast<const lt::IRenderer*>(&g_editor.cpu)
+            : g_editor.renderer;
     ImGui::Text("%s | %s | samples %u | %.2f ms | %s",
                 tool_mode_name(g_editor.tool_mode),
                 effective_renderer->name(),
@@ -3989,6 +4027,57 @@ void draw_properties() {
             if (ImGui::DragInt("Max bounces", &g_editor.settings.max_bounces, 1.0f, 1, 32)) {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
+            }
+            const char* denoisers[] = {"Off", "SVGF"};
+            int denoiser = static_cast<int>(g_editor.settings.denoiser_mode);
+            if (ImGui::Combo("Denoiser", &denoiser, denoisers, IM_ARRAYSIZE(denoisers))) {
+                g_editor.settings.denoiser_mode = static_cast<lt::DenoiserMode>(denoiser);
+                if (lt::svgf_denoising_enabled(g_editor.settings)) {
+                    g_editor.settings.max_bounces = 2;
+                }
+                reset_accumulation();
+            }
+            if (lt::svgf_denoising_enabled(g_editor.settings) && icon_collapsing_header(EditorIcon::Render, "SVGF")) {
+                if (ImGui::Checkbox("Rasterized G-Buffer", &g_editor.settings.svgf_rasterized_gbuffer)) {
+                    reset_accumulation();
+                }
+                const char* aa_modes[] = {"Off", "Stable Post AA", "TAA"};
+                int aa_mode = static_cast<int>(g_editor.settings.antialiasing_mode);
+                aa_mode = std::clamp(aa_mode, 0, IM_ARRAYSIZE(aa_modes) - 1);
+                if (ImGui::Combo("Antialiasing", &aa_mode, aa_modes, IM_ARRAYSIZE(aa_modes))) {
+                    g_editor.settings.antialiasing_mode = static_cast<lt::AntialiasingMode>(aa_mode);
+                    reset_accumulation();
+                }
+                const char* debug_views[] = {"Final", "Raw", "Albedo", "Normal", "Depth", "Variance", "History"};
+                int debug_view = static_cast<int>(g_editor.settings.svgf_debug_view);
+                if (ImGui::Combo("Debug View", &debug_view, debug_views, IM_ARRAYSIZE(debug_views))) {
+                    g_editor.settings.svgf_debug_view = static_cast<lt::DenoiserDebugView>(debug_view);
+                    reset_accumulation();
+                }
+                if (ImGui::DragInt("SVGF Iterations", &g_editor.settings.svgf_iterations, 1.0f, 0, 8)) {
+                    g_editor.settings.svgf_iterations = std::clamp(g_editor.settings.svgf_iterations, 0, 8);
+                    reset_accumulation();
+                }
+                if (ImGui::DragFloat("Alpha", &g_editor.settings.svgf_alpha, 0.002f, 0.0f, 1.0f, "%.3f")) {
+                    g_editor.settings.svgf_alpha = std::clamp(g_editor.settings.svgf_alpha, 0.0f, 1.0f);
+                    reset_accumulation();
+                }
+                if (ImGui::DragFloat("Moments Alpha", &g_editor.settings.svgf_moments_alpha, 0.002f, 0.0f, 1.0f, "%.3f")) {
+                    g_editor.settings.svgf_moments_alpha = std::clamp(g_editor.settings.svgf_moments_alpha, 0.0f, 1.0f);
+                    reset_accumulation();
+                }
+                if (ImGui::DragFloat("Phi Color", &g_editor.settings.svgf_phi_color, 0.05f, 0.001f, 100.0f, "%.3f")) {
+                    g_editor.settings.svgf_phi_color = std::max(0.001f, g_editor.settings.svgf_phi_color);
+                    reset_accumulation();
+                }
+                if (ImGui::DragFloat("Phi Normal", &g_editor.settings.svgf_phi_normal, 1.0f, 0.001f, 512.0f, "%.3f")) {
+                    g_editor.settings.svgf_phi_normal = std::max(0.001f, g_editor.settings.svgf_phi_normal);
+                    reset_accumulation();
+                }
+                if (ImGui::DragFloat("Phi Depth", &g_editor.settings.svgf_phi_depth, 0.02f, 0.001f, 16.0f, "%.3f")) {
+                    g_editor.settings.svgf_phi_depth = std::max(0.001f, g_editor.settings.svgf_phi_depth);
+                    reset_accumulation();
+                }
             }
             ImGui::Checkbox("Hide Wireframes", &g_editor.hide_dirty_wireframes);
             const char* accel_modes[] = {"Auto", "Flat BVH", "Two-level BVH"};
@@ -4823,6 +4912,10 @@ void draw_statistics_panel() {
     stat_row("Sample Time", "%.2f ms", g_editor.last_sample_ms);
     stat_row("Max Bounces", "%d", g_editor.settings.max_bounces);
     stat_row("Samples/Frame", "%d", g_editor.settings.samples_per_pixel);
+    stat_row("Denoiser", "%s", lt::svgf_denoising_enabled(g_editor.settings) ? "SVGF" : "Off");
+    if (lt::svgf_denoising_enabled(g_editor.settings)) {
+        stat_row("SVGF G-Buffer", "%s", g_editor.settings.svgf_rasterized_gbuffer ? "Rasterized" : "Manual Trace");
+    }
     stat_row("Acceleration", "%s",
         g_editor.settings.acceleration_structure == lt::AccelerationStructure::Auto ? "Auto" :
         g_editor.settings.acceleration_structure == lt::AccelerationStructure::Flat ? "Flat BVH" :
