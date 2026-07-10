@@ -476,6 +476,18 @@ public:
         const RasterizedGBufferInterop& interop);
 
 private:
+    void release_svgf_gbuffer_interop_cache();
+    bool upload_rasterized_gbuffer_interop_to_cuda(
+        const RasterizedGBufferInterop& interop,
+        int width,
+        int height,
+        Vec3* albedo,
+        Vec3* emission,
+        Vec3* normal,
+        Vec3* world_position,
+        float* depth,
+        uint32_t* object_id,
+        int& cuda_error_code);
     void render_cpu_fallback(
         const Scene& scene,
         const RenderSettings& settings,
@@ -516,6 +528,10 @@ private:
     void* device_taa_history_depth_ = nullptr;
     void* device_taa_history_object_id_ = nullptr;
     void* device_taa_history_length_ = nullptr;
+    void* device_svgf_gbuffer_temp_albedo_ = nullptr;
+    void* device_svgf_gbuffer_temp_emission_ = nullptr;
+    void* device_svgf_gbuffer_temp_normal_ = nullptr;
+    void* device_svgf_gbuffer_temp_position_depth_ = nullptr;
     void* device_scene_ = nullptr;
     void* device_materials_ = nullptr;
     void* device_textures_ = nullptr;
@@ -572,6 +588,10 @@ private:
     float taa_history_jitter_x_ = 0.0f;
     float taa_history_jitter_y_ = 0.0f;
     RasterizedGBufferInterop svgf_gbuffer_interop_;
+    void* svgf_gbuffer_cuda_resources_[5] = {};
+    void* svgf_gbuffer_d3d_resources_[5] = {};
+    int svgf_gbuffer_width_ = 0;
+    int svgf_gbuffer_height_ = 0;
     std::vector<std::string> reported_fallback_reasons_;
 };
 

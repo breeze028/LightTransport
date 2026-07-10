@@ -110,7 +110,8 @@ __global__ void render_svgf_input_kernel(
     Vec3* normal,
     Vec3* world_position,
     float* depth,
-    uint32_t* object_id) {
+    uint32_t* object_id,
+    bool write_primary_aov) {
     const GpuScene& scene = *scene_ptr;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -126,7 +127,9 @@ __global__ void render_svgf_input_kernel(
             settings));
     }
     radiance[idx] = divv(sample, static_cast<float>(settings.samples_per_pixel));
-    write_primary_aov_gpu(scene, settings, x, y, idx, albedo, emission, normal, world_position, depth, object_id);
+    if (write_primary_aov) {
+        write_primary_aov_gpu(scene, settings, x, y, idx, albedo, emission, normal, world_position, depth, object_id);
+    }
 }
 
 __device__ bool svgf_has_surface_gpu(const float* depth, const uint32_t* object_id, const Vec3* normal, int idx) {
