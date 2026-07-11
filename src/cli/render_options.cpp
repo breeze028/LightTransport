@@ -57,6 +57,10 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.prefer_cuda = true;
         } else if (argument == "--cpu") {
             options.prefer_cuda = false;
+        } else if (argument == "--cuda-wavefront") {
+            options.settings.cuda_wavefront = true;
+        } else if (argument == "--cuda-megakernel") {
+            options.settings.cuda_wavefront = false;
         } else if (argument == "--verbose") {
             options.log_console_level = LogLevel::Debug;
             options.log_file_level = LogLevel::Debug;

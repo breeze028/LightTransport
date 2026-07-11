@@ -6,6 +6,12 @@
 #include <d3d11.h>
 #include <cuda_d3d11_interop.h>
 #include <cuda_runtime.h>
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define LT_HAS_NVTX3 1
+#else
+#define LT_HAS_NVTX3 0
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -23,6 +29,24 @@
 
 namespace lt {
 namespace {
+
+class ScopedNvtxRange {
+public:
+    explicit ScopedNvtxRange(const char* name) {
+#if LT_HAS_NVTX3
+        nvtxRangePushA(name);
+#else
+        (void)name;
+#endif
+    }
+    ~ScopedNvtxRange() {
+#if LT_HAS_NVTX3
+        nvtxRangePop();
+#endif
+    }
+    ScopedNvtxRange(const ScopedNvtxRange&) = delete;
+    ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
+};
 
 #include "types.cuh"
 #include "math.cuh"
@@ -171,6 +195,18 @@ const char* cuda_error_text(cudaError_t error) {
     return error == cudaSuccess ? nullptr : cudaGetErrorString(error);
 }
 
+void configure_cuda_wait_policy_once() {
+    static bool configured = false;
+    if (configured) {
+        return;
+    }
+    configured = true;
+    const cudaError_t error = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    if (error != cudaSuccess && error != cudaErrorSetOnActiveProcess) {
+        LT_LOG_DEBUG("CUDA blocking wait policy unavailable: {}", cudaGetErrorString(error));
+    }
+}
+
 #include "irradiance_volume_bake.cuh"
 #include "lightmap_bake.cuh"
 
@@ -231,21 +267,24 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
     void* dev_scene = nullptr;
     void* dev_materials = nullptr;
     void* dev_triangles = nullptr;
+    void* dev_traversal_triangles = nullptr;
     void* dev_spheres = nullptr;
     void* dev_triangle_indices = nullptr;
     void* dev_light_indices = nullptr;
     void* dev_directional_lights = nullptr;
     void* dev_point_lights = nullptr;
     void* dev_bvh_nodes = nullptr;
+    void* dev_traversal_bvh_nodes = nullptr;
     void* dev_mesh_instances = nullptr;
     void* dev_mesh_instance_indices = nullptr;
     void* dev_tlas_nodes = nullptr;
+    void* dev_traversal_tlas_nodes = nullptr;
     void* dev_textures_buf = nullptr;
-    int hint_materials = 0, hint_triangles = 0, hint_spheres = 0;
+    int hint_materials = 0, hint_triangles = 0, hint_traversal_triangles = 0, hint_spheres = 0;
     int hint_triangle_indices = 0, hint_light_indices = 0;
-    int hint_directional_lights = 0, hint_point_lights = 0, hint_bvh_nodes = 0;
+    int hint_directional_lights = 0, hint_point_lights = 0, hint_bvh_nodes = 0, hint_traversal_bvh_nodes = 0;
     int hint_mesh_instances = 0, hint_mesh_instance_indices = 0;
-    int hint_tlas_nodes = 0, hint_textures = 0;
+    int hint_tlas_nodes = 0, hint_traversal_tlas_nodes = 0, hint_textures = 0;
     std::vector<void*> texture_arrays;
     std::vector<uint64_t> texture_objects;
 
@@ -254,15 +293,18 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
         cudaFree(dev_scene);
         cudaFree(dev_materials);
         cudaFree(dev_triangles);
+        cudaFree(dev_traversal_triangles);
         cudaFree(dev_spheres);
         cudaFree(dev_triangle_indices);
         cudaFree(dev_light_indices);
         cudaFree(dev_directional_lights);
         cudaFree(dev_point_lights);
         cudaFree(dev_bvh_nodes);
+        cudaFree(dev_traversal_bvh_nodes);
         cudaFree(dev_mesh_instances);
         cudaFree(dev_mesh_instance_indices);
         cudaFree(dev_tlas_nodes);
+        cudaFree(dev_traversal_tlas_nodes);
         cudaFree(dev_textures_buf);
         release_texture_objects(texture_arrays, texture_objects);
     };
@@ -275,15 +317,18 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
 
     if (!upload_buffer(dev_materials, hint_materials, packed.materials) ||
         !upload_buffer(dev_triangles, hint_triangles, packed.triangles) ||
+        !upload_buffer(dev_traversal_triangles, hint_traversal_triangles, packed.traversal_triangles) ||
         !upload_buffer(dev_spheres, hint_spheres, packed.spheres) ||
         !upload_buffer(dev_triangle_indices, hint_triangle_indices, packed.triangle_indices) ||
         !upload_buffer(dev_light_indices, hint_light_indices, packed.light_indices) ||
         !upload_buffer(dev_directional_lights, hint_directional_lights, packed.directional_lights) ||
         !upload_buffer(dev_point_lights, hint_point_lights, packed.point_lights) ||
         !upload_buffer(dev_bvh_nodes, hint_bvh_nodes, packed.bvh_nodes) ||
+        !upload_buffer(dev_traversal_bvh_nodes, hint_traversal_bvh_nodes, packed.traversal_bvh_nodes) ||
         !upload_buffer(dev_mesh_instances, hint_mesh_instances, packed.mesh_instances) ||
         !upload_buffer(dev_mesh_instance_indices, hint_mesh_instance_indices, packed.mesh_instance_indices) ||
         !upload_buffer(dev_tlas_nodes, hint_tlas_nodes, packed.tlas_nodes) ||
+        !upload_buffer(dev_traversal_tlas_nodes, hint_traversal_tlas_nodes, packed.traversal_tlas_nodes) ||
         !upload_buffer(dev_textures_buf, hint_textures, packed.textures) ||
         !upload_texture_objects(scene, packed, texture_arrays, texture_objects)) {
         LT_LOG_ERROR("GPU irradiance volume bake: scene upload failed");
@@ -294,15 +339,18 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
     packed.scene.materials = static_cast<GpuMaterial*>(dev_materials);
     packed.scene.textures = static_cast<GpuTexture*>(dev_textures_buf);
     packed.scene.triangles = static_cast<GpuTriangle*>(dev_triangles);
+    packed.scene.traversal_triangles = static_cast<GpuTraversalTriangle*>(dev_traversal_triangles);
     packed.scene.spheres = static_cast<GpuSphere*>(dev_spheres);
     packed.scene.triangle_indices = static_cast<int*>(dev_triangle_indices);
     packed.scene.light_indices = static_cast<int*>(dev_light_indices);
     packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(dev_directional_lights);
     packed.scene.point_lights = static_cast<GpuPointLight*>(dev_point_lights);
     packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(dev_bvh_nodes);
+    packed.scene.traversal_bvh_nodes = static_cast<GpuTraversalBvhNode*>(dev_traversal_bvh_nodes);
     packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(dev_mesh_instances);
     packed.scene.mesh_instance_indices = static_cast<int*>(dev_mesh_instance_indices);
     packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(dev_tlas_nodes);
+    packed.scene.traversal_tlas_nodes = static_cast<GpuTraversalBvhNode*>(dev_traversal_tlas_nodes);
 
     cuda_error = cudaMemcpy(static_cast<GpuScene*>(dev_scene), &packed.scene,
         sizeof(GpuScene), cudaMemcpyHostToDevice);
@@ -499,21 +547,24 @@ std::shared_ptr<void> build_lightmap_gpu(
     void* dev_scene = nullptr;
     void* dev_materials = nullptr;
     void* dev_triangles = nullptr;
+    void* dev_traversal_triangles = nullptr;
     void* dev_spheres = nullptr;
     void* dev_triangle_indices = nullptr;
     void* dev_light_indices = nullptr;
     void* dev_directional_lights = nullptr;
     void* dev_point_lights = nullptr;
     void* dev_bvh_nodes = nullptr;
+    void* dev_traversal_bvh_nodes = nullptr;
     void* dev_mesh_instances = nullptr;
     void* dev_mesh_instance_indices = nullptr;
     void* dev_tlas_nodes = nullptr;
+    void* dev_traversal_tlas_nodes = nullptr;
     void* dev_textures_buf = nullptr;
-    int hint_materials = 0, hint_triangles = 0, hint_spheres = 0;
+    int hint_materials = 0, hint_triangles = 0, hint_traversal_triangles = 0, hint_spheres = 0;
     int hint_triangle_indices = 0, hint_light_indices = 0;
-    int hint_directional_lights = 0, hint_point_lights = 0, hint_bvh_nodes = 0;
+    int hint_directional_lights = 0, hint_point_lights = 0, hint_bvh_nodes = 0, hint_traversal_bvh_nodes = 0;
     int hint_mesh_instances = 0, hint_mesh_instance_indices = 0;
-    int hint_tlas_nodes = 0, hint_textures = 0;
+    int hint_tlas_nodes = 0, hint_traversal_tlas_nodes = 0, hint_textures = 0;
     std::vector<void*> texture_arrays;
     std::vector<uint64_t> texture_objects;
 
@@ -522,15 +573,18 @@ std::shared_ptr<void> build_lightmap_gpu(
         cudaFree(dev_scene);
         cudaFree(dev_materials);
         cudaFree(dev_triangles);
+        cudaFree(dev_traversal_triangles);
         cudaFree(dev_spheres);
         cudaFree(dev_triangle_indices);
         cudaFree(dev_light_indices);
         cudaFree(dev_directional_lights);
         cudaFree(dev_point_lights);
         cudaFree(dev_bvh_nodes);
+        cudaFree(dev_traversal_bvh_nodes);
         cudaFree(dev_mesh_instances);
         cudaFree(dev_mesh_instance_indices);
         cudaFree(dev_tlas_nodes);
+        cudaFree(dev_traversal_tlas_nodes);
         cudaFree(dev_textures_buf);
         release_texture_objects(texture_arrays, texture_objects);
     };
@@ -543,15 +597,18 @@ std::shared_ptr<void> build_lightmap_gpu(
 
     if (!upload_buffer(dev_materials, hint_materials, packed.materials) ||
         !upload_buffer(dev_triangles, hint_triangles, packed.triangles) ||
+        !upload_buffer(dev_traversal_triangles, hint_traversal_triangles, packed.traversal_triangles) ||
         !upload_buffer(dev_spheres, hint_spheres, packed.spheres) ||
         !upload_buffer(dev_triangle_indices, hint_triangle_indices, packed.triangle_indices) ||
         !upload_buffer(dev_light_indices, hint_light_indices, packed.light_indices) ||
         !upload_buffer(dev_directional_lights, hint_directional_lights, packed.directional_lights) ||
         !upload_buffer(dev_point_lights, hint_point_lights, packed.point_lights) ||
         !upload_buffer(dev_bvh_nodes, hint_bvh_nodes, packed.bvh_nodes) ||
+        !upload_buffer(dev_traversal_bvh_nodes, hint_traversal_bvh_nodes, packed.traversal_bvh_nodes) ||
         !upload_buffer(dev_mesh_instances, hint_mesh_instances, packed.mesh_instances) ||
         !upload_buffer(dev_mesh_instance_indices, hint_mesh_instance_indices, packed.mesh_instance_indices) ||
         !upload_buffer(dev_tlas_nodes, hint_tlas_nodes, packed.tlas_nodes) ||
+        !upload_buffer(dev_traversal_tlas_nodes, hint_traversal_tlas_nodes, packed.traversal_tlas_nodes) ||
         !upload_buffer(dev_textures_buf, hint_textures, packed.textures) ||
         !upload_texture_objects(scene, packed, texture_arrays, texture_objects)) {
         LT_LOG_ERROR("GPU lightmap bake: scene upload failed");
@@ -562,15 +619,18 @@ std::shared_ptr<void> build_lightmap_gpu(
     packed.scene.materials = static_cast<GpuMaterial*>(dev_materials);
     packed.scene.textures = static_cast<GpuTexture*>(dev_textures_buf);
     packed.scene.triangles = static_cast<GpuTriangle*>(dev_triangles);
+    packed.scene.traversal_triangles = static_cast<GpuTraversalTriangle*>(dev_traversal_triangles);
     packed.scene.spheres = static_cast<GpuSphere*>(dev_spheres);
     packed.scene.triangle_indices = static_cast<int*>(dev_triangle_indices);
     packed.scene.light_indices = static_cast<int*>(dev_light_indices);
     packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(dev_directional_lights);
     packed.scene.point_lights = static_cast<GpuPointLight*>(dev_point_lights);
     packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(dev_bvh_nodes);
+    packed.scene.traversal_bvh_nodes = static_cast<GpuTraversalBvhNode*>(dev_traversal_bvh_nodes);
     packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(dev_mesh_instances);
     packed.scene.mesh_instance_indices = static_cast<int*>(dev_mesh_instance_indices);
     packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(dev_tlas_nodes);
+    packed.scene.traversal_tlas_nodes = static_cast<GpuTraversalBvhNode*>(dev_traversal_tlas_nodes);
 
     cuda_error = cudaMemcpy(static_cast<GpuScene*>(dev_scene), &packed.scene,
         sizeof(GpuScene), cudaMemcpyHostToDevice);
@@ -758,6 +818,7 @@ std::shared_ptr<void> build_lightmap_gpu(
 }
 
 bool CudaPathTracer::available() const {
+    configure_cuda_wait_policy_once();
     int count = 0;
     return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
@@ -828,21 +889,43 @@ void CudaPathTracer::reset() {
     cudaFree(device_materials_);
     cudaFree(device_textures_);
     cudaFree(device_triangles_);
+    cudaFree(device_traversal_triangles_);
     cudaFree(device_spheres_);
     cudaFree(device_triangle_indices_);
     cudaFree(device_light_indices_);
     cudaFree(device_directional_lights_);
     cudaFree(device_point_lights_);
     cudaFree(device_bvh_nodes_);
+    cudaFree(device_traversal_bvh_nodes_);
     cudaFree(device_mesh_instances_);
     cudaFree(device_mesh_instance_indices_);
     cudaFree(device_tlas_nodes_);
+    cudaFree(device_traversal_tlas_nodes_);
     cudaFree(device_irradiance_volume_directions_);
     cudaFree(device_irradiance_volume_irradiance_);
     cudaFree(device_irradiance_volume_grids_);
     cudaFree(device_irradiance_volume_cells_);
     cudaFree(device_irradiance_volume_debug_probes_);
     cudaFree(device_lightmap_texels_);
+    cudaFree(device_wavefront_rays_);
+    cudaFree(device_wavefront_throughputs_);
+    cudaFree(device_wavefront_radiance_);
+    cudaFree(device_wavefront_previous_positions_);
+    cudaFree(device_wavefront_previous_bsdf_pdfs_);
+    cudaFree(device_wavefront_rngs_);
+    cudaFree(device_wavefront_pixels_);
+    cudaFree(device_wavefront_states_);
+    cudaFree(device_wavefront_compact_hits_);
+    cudaFree(device_wavefront_hits_);
+    cudaFree(device_wavefront_active_indices_);
+    cudaFree(device_wavefront_next_indices_);
+    cudaFree(device_wavefront_shade_indices_);
+    cudaFree(device_wavefront_shadow_indices_);
+    cudaFree(device_wavefront_gi_indices_);
+    cudaFree(device_wavefront_bsdf_indices_);
+    cudaFree(device_wavefront_queue_counters_);
+    cudaFree(device_wavefront_samples_);
+    cudaFree(device_wavefront_sample_sum_);
     device_accumulation_ = nullptr;
     device_rgba_ = nullptr;
     device_svgf_radiance_ = nullptr;
@@ -880,21 +963,43 @@ void CudaPathTracer::reset() {
     device_materials_ = nullptr;
     device_textures_ = nullptr;
     device_triangles_ = nullptr;
+    device_traversal_triangles_ = nullptr;
     device_spheres_ = nullptr;
     device_triangle_indices_ = nullptr;
     device_light_indices_ = nullptr;
     device_directional_lights_ = nullptr;
     device_point_lights_ = nullptr;
     device_bvh_nodes_ = nullptr;
+    device_traversal_bvh_nodes_ = nullptr;
     device_mesh_instances_ = nullptr;
     device_mesh_instance_indices_ = nullptr;
     device_tlas_nodes_ = nullptr;
+    device_traversal_tlas_nodes_ = nullptr;
     device_irradiance_volume_directions_ = nullptr;
     device_irradiance_volume_irradiance_ = nullptr;
     device_irradiance_volume_grids_ = nullptr;
     device_irradiance_volume_cells_ = nullptr;
     device_irradiance_volume_debug_probes_ = nullptr;
     device_lightmap_texels_ = nullptr;
+    device_wavefront_rays_ = nullptr;
+    device_wavefront_throughputs_ = nullptr;
+    device_wavefront_radiance_ = nullptr;
+    device_wavefront_previous_positions_ = nullptr;
+    device_wavefront_previous_bsdf_pdfs_ = nullptr;
+    device_wavefront_rngs_ = nullptr;
+    device_wavefront_pixels_ = nullptr;
+    device_wavefront_states_ = nullptr;
+    device_wavefront_compact_hits_ = nullptr;
+    device_wavefront_hits_ = nullptr;
+    device_wavefront_active_indices_ = nullptr;
+    device_wavefront_next_indices_ = nullptr;
+    device_wavefront_shade_indices_ = nullptr;
+    device_wavefront_shadow_indices_ = nullptr;
+    device_wavefront_gi_indices_ = nullptr;
+    device_wavefront_bsdf_indices_ = nullptr;
+    device_wavefront_queue_counters_ = nullptr;
+    device_wavefront_samples_ = nullptr;
+    device_wavefront_sample_sum_ = nullptr;
     cached_render_scene_ = {};
     cached_irradiance_volume_.reset();
     cached_lightmap_.reset();
@@ -902,15 +1007,18 @@ void CudaPathTracer::reset() {
     cached_materials_ = 0;
     cached_textures_ = 0;
     cached_triangles_ = 0;
+    cached_traversal_triangles_ = 0;
     cached_spheres_ = 0;
     cached_triangle_indices_ = 0;
     cached_lights_ = 0;
     cached_directional_lights_ = 0;
     cached_point_lights_ = 0;
     cached_bvh_nodes_ = 0;
+    cached_traversal_bvh_nodes_ = 0;
     cached_mesh_instances_ = 0;
     cached_mesh_instance_indices_ = 0;
     cached_tlas_nodes_ = 0;
+    cached_traversal_tlas_nodes_ = 0;
     cached_irradiance_volume_directions_ = 0;
     cached_irradiance_volume_irradiance_ = 0;
     cached_irradiance_volume_grids_ = 0;
@@ -1118,11 +1226,129 @@ bool CudaPathTracer::upload_rasterized_gbuffer_interop_to_cuda(
 }
 
 void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, Framebuffer& framebuffer) {
+    const ScopedNvtxRange frame_range("LightTransport CUDA frame");
+    configure_cuda_wait_policy_once();
     framebuffer.resize(settings.width, settings.height);
     const size_t pixels = static_cast<size_t>(settings.width) * static_cast<size_t>(settings.height);
 
-    if (cached_pixels_ != pixels) {
-        reset();
+    if (cached_pixels_ != pixels && cached_pixels_ != 0) {
+        cudaFree(device_accumulation_);
+        cudaFree(device_rgba_);
+        cudaFree(device_svgf_radiance_);
+        cudaFree(device_svgf_albedo_);
+        cudaFree(device_svgf_emission_);
+        cudaFree(device_svgf_normal_);
+        cudaFree(device_svgf_world_position_);
+        cudaFree(device_svgf_depth_);
+        cudaFree(device_svgf_object_id_);
+        cudaFree(device_svgf_history_illumination_);
+        cudaFree(device_svgf_history_moment1_);
+        cudaFree(device_svgf_history_moment2_);
+        cudaFree(device_svgf_history_length_);
+        cudaFree(device_svgf_history_normal_);
+        cudaFree(device_svgf_history_world_position_);
+        cudaFree(device_svgf_history_depth_);
+        cudaFree(device_svgf_history_object_id_);
+        cudaFree(device_svgf_temporal_illumination_);
+        cudaFree(device_svgf_temporal_moment1_);
+        cudaFree(device_svgf_temporal_moment2_);
+        cudaFree(device_svgf_temporal_variance_);
+        cudaFree(device_svgf_temporal_history_length_);
+        cudaFree(device_svgf_ping_illumination_);
+        cudaFree(device_svgf_pong_illumination_);
+        cudaFree(device_svgf_ping_variance_);
+        cudaFree(device_svgf_pong_variance_);
+        cudaFree(device_svgf_final_color_);
+        cudaFree(device_taa_history_color_);
+        cudaFree(device_taa_history_normal_);
+        cudaFree(device_taa_history_world_position_);
+        cudaFree(device_taa_history_depth_);
+        cudaFree(device_taa_history_object_id_);
+        cudaFree(device_taa_history_length_);
+        cudaFree(device_svgf_gbuffer_temp_albedo_);
+        cudaFree(device_svgf_gbuffer_temp_emission_);
+        cudaFree(device_svgf_gbuffer_temp_normal_);
+        cudaFree(device_svgf_gbuffer_temp_position_depth_);
+        cudaFree(device_wavefront_rays_);
+        cudaFree(device_wavefront_throughputs_);
+        cudaFree(device_wavefront_radiance_);
+        cudaFree(device_wavefront_previous_positions_);
+        cudaFree(device_wavefront_previous_bsdf_pdfs_);
+        cudaFree(device_wavefront_rngs_);
+        cudaFree(device_wavefront_pixels_);
+        cudaFree(device_wavefront_states_);
+        cudaFree(device_wavefront_compact_hits_);
+        cudaFree(device_wavefront_hits_);
+        cudaFree(device_wavefront_active_indices_);
+        cudaFree(device_wavefront_next_indices_);
+        cudaFree(device_wavefront_shade_indices_);
+        cudaFree(device_wavefront_shadow_indices_);
+        cudaFree(device_wavefront_gi_indices_);
+        cudaFree(device_wavefront_bsdf_indices_);
+        cudaFree(device_wavefront_queue_counters_);
+        cudaFree(device_wavefront_samples_);
+        cudaFree(device_wavefront_sample_sum_);
+
+        device_accumulation_ = nullptr;
+        device_rgba_ = nullptr;
+        device_svgf_radiance_ = nullptr;
+        device_svgf_albedo_ = nullptr;
+        device_svgf_emission_ = nullptr;
+        device_svgf_normal_ = nullptr;
+        device_svgf_world_position_ = nullptr;
+        device_svgf_depth_ = nullptr;
+        device_svgf_object_id_ = nullptr;
+        device_svgf_history_illumination_ = nullptr;
+        device_svgf_history_moment1_ = nullptr;
+        device_svgf_history_moment2_ = nullptr;
+        device_svgf_history_length_ = nullptr;
+        device_svgf_history_normal_ = nullptr;
+        device_svgf_history_world_position_ = nullptr;
+        device_svgf_history_depth_ = nullptr;
+        device_svgf_history_object_id_ = nullptr;
+        device_svgf_temporal_illumination_ = nullptr;
+        device_svgf_temporal_moment1_ = nullptr;
+        device_svgf_temporal_moment2_ = nullptr;
+        device_svgf_temporal_variance_ = nullptr;
+        device_svgf_temporal_history_length_ = nullptr;
+        device_svgf_ping_illumination_ = nullptr;
+        device_svgf_pong_illumination_ = nullptr;
+        device_svgf_ping_variance_ = nullptr;
+        device_svgf_pong_variance_ = nullptr;
+        device_svgf_final_color_ = nullptr;
+        device_taa_history_color_ = nullptr;
+        device_taa_history_normal_ = nullptr;
+        device_taa_history_world_position_ = nullptr;
+        device_taa_history_depth_ = nullptr;
+        device_taa_history_object_id_ = nullptr;
+        device_taa_history_length_ = nullptr;
+        device_svgf_gbuffer_temp_albedo_ = nullptr;
+        device_svgf_gbuffer_temp_emission_ = nullptr;
+        device_svgf_gbuffer_temp_normal_ = nullptr;
+        device_svgf_gbuffer_temp_position_depth_ = nullptr;
+        device_wavefront_rays_ = nullptr;
+        device_wavefront_throughputs_ = nullptr;
+        device_wavefront_radiance_ = nullptr;
+        device_wavefront_previous_positions_ = nullptr;
+        device_wavefront_previous_bsdf_pdfs_ = nullptr;
+        device_wavefront_rngs_ = nullptr;
+        device_wavefront_pixels_ = nullptr;
+        device_wavefront_states_ = nullptr;
+        device_wavefront_compact_hits_ = nullptr;
+        device_wavefront_hits_ = nullptr;
+        device_wavefront_active_indices_ = nullptr;
+        device_wavefront_next_indices_ = nullptr;
+        device_wavefront_shade_indices_ = nullptr;
+        device_wavefront_shadow_indices_ = nullptr;
+        device_wavefront_gi_indices_ = nullptr;
+        device_wavefront_bsdf_indices_ = nullptr;
+        device_wavefront_queue_counters_ = nullptr;
+        device_wavefront_samples_ = nullptr;
+        device_wavefront_sample_sum_ = nullptr;
+        cached_pixels_ = 0;
+        svgf_history_valid_ = false;
+        taa_history_valid_ = false;
+        release_svgf_gbuffer_interop_cache();
     }
 
     cudaError_t cuda_error = cudaSuccess;
@@ -1185,6 +1411,31 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !allocate_svgf_buffer(device_taa_history_depth_, pixels * sizeof(float), "could not allocate TAA history depth buffer") ||
             !allocate_svgf_buffer(device_taa_history_object_id_, pixels * sizeof(uint32_t), "could not allocate TAA history object id buffer") ||
             !allocate_svgf_buffer(device_taa_history_length_, pixels * sizeof(float), "could not allocate TAA history length buffer")) {
+            return;
+        }
+    }
+    const bool wavefront_enabled = settings.cuda_wavefront &&
+        !(settings.use_irradiance_volume && settings.irradiance_volume_debug_probes);
+    if (wavefront_enabled) {
+        if (!allocate_svgf_buffer(device_wavefront_rays_, pixels * sizeof(Ray), "could not allocate wavefront ray buffer") ||
+            !allocate_svgf_buffer(device_wavefront_throughputs_, pixels * sizeof(Vec3), "could not allocate wavefront throughput buffer") ||
+            !allocate_svgf_buffer(device_wavefront_radiance_, pixels * sizeof(Vec3), "could not allocate wavefront radiance buffer") ||
+            !allocate_svgf_buffer(device_wavefront_previous_positions_, pixels * sizeof(Vec3), "could not allocate wavefront previous-position buffer") ||
+            !allocate_svgf_buffer(device_wavefront_previous_bsdf_pdfs_, pixels * sizeof(float), "could not allocate wavefront previous-pdf buffer") ||
+            !allocate_svgf_buffer(device_wavefront_rngs_, pixels * sizeof(uint32_t), "could not allocate wavefront rng buffer") ||
+            !allocate_svgf_buffer(device_wavefront_pixels_, pixels * sizeof(int), "could not allocate wavefront pixel buffer") ||
+            !allocate_svgf_buffer(device_wavefront_states_, pixels * sizeof(uint32_t), "could not allocate wavefront state buffer") ||
+            !allocate_svgf_buffer(device_wavefront_compact_hits_, pixels * sizeof(GpuCompactHit), "could not allocate wavefront compact hit buffer") ||
+            !allocate_svgf_buffer(device_wavefront_hits_, pixels * sizeof(GpuHit), "could not allocate wavefront hit buffer") ||
+            !allocate_svgf_buffer(device_wavefront_active_indices_, pixels * sizeof(int), "could not allocate wavefront active queue") ||
+            !allocate_svgf_buffer(device_wavefront_next_indices_, pixels * sizeof(int), "could not allocate wavefront next queue") ||
+            !allocate_svgf_buffer(device_wavefront_shade_indices_, pixels * sizeof(int), "could not allocate wavefront shade queue") ||
+            !allocate_svgf_buffer(device_wavefront_shadow_indices_, pixels * sizeof(int), "could not allocate wavefront shadow queue") ||
+            !allocate_svgf_buffer(device_wavefront_gi_indices_, pixels * sizeof(int), "could not allocate wavefront GI queue") ||
+            !allocate_svgf_buffer(device_wavefront_bsdf_indices_, pixels * sizeof(int), "could not allocate wavefront bsdf queue") ||
+            !allocate_svgf_buffer(device_wavefront_queue_counters_, sizeof(GpuWavefrontQueueCounters), "could not allocate wavefront queue counters") ||
+            !allocate_svgf_buffer(device_wavefront_samples_, pixels * sizeof(Vec3), "could not allocate wavefront sample buffer") ||
+            !allocate_svgf_buffer(device_wavefront_sample_sum_, pixels * sizeof(Vec3), "could not allocate wavefront sample sum buffer")) {
             return;
         }
     }
@@ -1311,15 +1562,18 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         if (!upload_buffer(device_materials_, cached_materials_, packed.materials) ||
             !upload_buffer(device_textures_, cached_textures_, packed.textures) ||
             !upload_buffer(device_triangles_, cached_triangles_, packed.triangles) ||
+            !upload_buffer(device_traversal_triangles_, cached_traversal_triangles_, packed.traversal_triangles) ||
             !upload_buffer(device_spheres_, cached_spheres_, packed.spheres) ||
             !upload_buffer(device_triangle_indices_, cached_triangle_indices_, packed.triangle_indices) ||
             !upload_buffer(device_light_indices_, cached_lights_, packed.light_indices) ||
             !upload_buffer(device_directional_lights_, cached_directional_lights_, packed.directional_lights) ||
             !upload_buffer(device_point_lights_, cached_point_lights_, packed.point_lights) ||
             !upload_buffer(device_bvh_nodes_, cached_bvh_nodes_, packed.bvh_nodes) ||
+            !upload_buffer(device_traversal_bvh_nodes_, cached_traversal_bvh_nodes_, packed.traversal_bvh_nodes) ||
             !upload_buffer(device_mesh_instances_, cached_mesh_instances_, packed.mesh_instances) ||
             !upload_buffer(device_mesh_instance_indices_, cached_mesh_instance_indices_, packed.mesh_instance_indices) ||
-            !upload_buffer(device_tlas_nodes_, cached_tlas_nodes_, packed.tlas_nodes)) {
+            !upload_buffer(device_tlas_nodes_, cached_tlas_nodes_, packed.tlas_nodes) ||
+            !upload_buffer(device_traversal_tlas_nodes_, cached_traversal_tlas_nodes_, packed.traversal_tlas_nodes)) {
             reset();
             render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA scene buffers");
             return;
@@ -1327,15 +1581,18 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.materials = static_cast<GpuMaterial*>(device_materials_);
         packed.scene.textures = static_cast<GpuTexture*>(device_textures_);
         packed.scene.triangles = static_cast<GpuTriangle*>(device_triangles_);
+        packed.scene.traversal_triangles = static_cast<GpuTraversalTriangle*>(device_traversal_triangles_);
         packed.scene.spheres = static_cast<GpuSphere*>(device_spheres_);
         packed.scene.triangle_indices = static_cast<int*>(device_triangle_indices_);
         packed.scene.light_indices = static_cast<int*>(device_light_indices_);
         packed.scene.directional_lights = static_cast<GpuDirectionalLight*>(device_directional_lights_);
         packed.scene.point_lights = static_cast<GpuPointLight*>(device_point_lights_);
         packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(device_bvh_nodes_);
+        packed.scene.traversal_bvh_nodes = static_cast<GpuTraversalBvhNode*>(device_traversal_bvh_nodes_);
         packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(device_mesh_instances_);
         packed.scene.mesh_instance_indices = static_cast<int*>(device_mesh_instance_indices_);
         packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(device_tlas_nodes_);
+        packed.scene.traversal_tlas_nodes = static_cast<GpuTraversalBvhNode*>(device_traversal_tlas_nodes_);
         if (!upload_gpu_irradiance_volume(irradiance_volume.get(), packed.scene.irradiance_volume)) {
             reset();
             render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA irradiance volume");
@@ -1431,6 +1688,178 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
 
     const dim3 block(16, 16);
     const dim3 grid((settings.width + block.x - 1) / block.x, (settings.height + block.y - 1) / block.y);
+    const auto render_wavefront_samples = [&](
+        Vec3* sample_sum,
+        bool use_svgf_camera_jitter,
+        GpuWavefrontSvgfAov svgf_aov) -> cudaError_t {
+        const int pixel_count = static_cast<int>(pixels);
+        const int queue_block_size = 256;
+        const auto queue_grid_size = [queue_block_size](int count) {
+            return (count + queue_block_size - 1) / queue_block_size;
+        };
+        GpuWavefrontPaths paths{
+            static_cast<Ray*>(device_wavefront_rays_),
+            static_cast<Vec3*>(device_wavefront_throughputs_),
+            static_cast<Vec3*>(device_wavefront_radiance_),
+            static_cast<Vec3*>(device_wavefront_previous_positions_),
+            static_cast<float*>(device_wavefront_previous_bsdf_pdfs_),
+            static_cast<uint32_t*>(device_wavefront_rngs_),
+            static_cast<int*>(device_wavefront_pixels_),
+            static_cast<uint32_t*>(device_wavefront_states_),
+        };
+        GpuWavefrontIntersectPaths intersect_paths{
+            static_cast<Ray*>(device_wavefront_rays_),
+            static_cast<Vec3*>(device_wavefront_throughputs_),
+            static_cast<Vec3*>(device_wavefront_radiance_),
+            static_cast<uint32_t*>(device_wavefront_rngs_),
+            static_cast<int*>(device_wavefront_pixels_),
+            static_cast<uint32_t*>(device_wavefront_states_),
+        };
+        GpuCompactHit* compact_hits = static_cast<GpuCompactHit*>(device_wavefront_compact_hits_);
+        GpuHit* hits = static_cast<GpuHit*>(device_wavefront_hits_);
+        int* active_indices = static_cast<int*>(device_wavefront_active_indices_);
+        int* next_indices = static_cast<int*>(device_wavefront_next_indices_);
+        int* shade_indices = static_cast<int*>(device_wavefront_shade_indices_);
+        int* shadow_indices = static_cast<int*>(device_wavefront_shadow_indices_);
+        int* gi_indices = static_cast<int*>(device_wavefront_gi_indices_);
+        int* bsdf_indices = static_cast<int*>(device_wavefront_bsdf_indices_);
+        GpuWavefrontQueueCounters* queue_counters =
+            static_cast<GpuWavefrontQueueCounters*>(device_wavefront_queue_counters_);
+        Vec3* samples = static_cast<Vec3*>(device_wavefront_samples_);
+        cudaError_t render_error = cudaMemset(sample_sum, 0, pixels * sizeof(Vec3));
+        bool has_alpha_visibility = false;
+        bool has_transmission = false;
+        for (const std::shared_ptr<Material>& material : scene.materials) {
+            if (!material) {
+                continue;
+            }
+            has_alpha_visibility = has_alpha_visibility || material->alpha_mode != AlphaMode::Opaque;
+            const BrdfModel model = material->model();
+            has_transmission = has_transmission ||
+                model == BrdfModel::Dielectric ||
+                model == BrdfModel::DiffuseTransmission;
+            if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
+                has_transmission = has_transmission ||
+                    standard->transmission_weight > 0.0f ||
+                    standard->transmission_input.texture != nullptr;
+            }
+        }
+        constexpr int kExtraTransmissionBounces = 12;
+        const int max_path_steps = std::max(1, settings.max_bounces) +
+            (has_transmission ? kExtraTransmissionBounces : 0);
+        const bool has_direct_lights =
+            !cached_render_scene_.light_triangle_indices.empty() ||
+            !scene.directional_lights.empty() ||
+            !scene.point_lights.empty();
+        const bool use_two_level = use_two_level_accel(cached_render_scene_, settings.acceleration_structure);
+
+        for (int sample_index = 0;
+             render_error == cudaSuccess && sample_index < settings.samples_per_pixel;
+             ++sample_index) {
+            int* sample_active_indices = active_indices;
+            int* sample_next_indices = next_indices;
+            const int full_queue_grid = queue_grid_size(pixel_count);
+            {
+                const ScopedNvtxRange range("wavefront initialize");
+                wavefront_initialize_kernel<<<queue_grid_size(pixel_count), queue_block_size>>>(
+                    device_scene,
+                    settings,
+                    paths,
+                    sample_active_indices,
+                    queue_counters,
+                    samples,
+                    svgf_aov,
+                    pixel_count,
+                    sample_index,
+                    use_svgf_camera_jitter);
+            }
+            for (int step = 0; render_error == cudaSuccess && step < max_path_steps; ++step) {
+                const ScopedNvtxRange step_range("wavefront step");
+                wavefront_prepare_step_kernel<<<1, 1>>>(queue_counters);
+
+                {
+                    const ScopedNvtxRange range("wavefront intersect");
+                    if (has_alpha_visibility && use_two_level && step == 0) {
+                        wavefront_intersect_kernel<true, true, true><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else if (has_alpha_visibility && use_two_level) {
+                        wavefront_intersect_kernel<true, true, false><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else if (has_alpha_visibility && step == 0) {
+                        wavefront_intersect_kernel<true, false, true><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else if (has_alpha_visibility) {
+                        wavefront_intersect_kernel<true, false, false><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else if (use_two_level && step == 0) {
+                        wavefront_intersect_kernel<false, true, true><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else if (use_two_level) {
+                        wavefront_intersect_kernel<false, true, false><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else if (step == 0) {
+                        wavefront_intersect_kernel<false, false, true><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    } else {
+                        wavefront_intersect_kernel<false, false, false><<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
+                            shade_indices, queue_counters, samples);
+                    }
+                }
+
+                {
+                    const ScopedNvtxRange range("wavefront surface setup");
+                    wavefront_direct_light_kernel<<<full_queue_grid, queue_block_size>>>(
+                        device_scene, settings, paths, compact_hits, hits, shade_indices,
+                        gi_indices, shadow_indices, bsdf_indices, queue_counters, svgf_aov, samples);
+                }
+
+                if (settings.use_lightmap || settings.use_irradiance_volume) {
+                    wavefront_gi_kernel<<<full_queue_grid, queue_block_size>>>(
+                        device_scene, settings, paths, hits, gi_indices,
+                        bsdf_indices, queue_counters, samples);
+                }
+
+                if (settings.sampling_mode != PathSamplingMode::Unidirectional) {
+                    if (has_direct_lights) {
+                        const ScopedNvtxRange range("wavefront direct visibility");
+                        wavefront_direct_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, shadow_indices,
+                            queue_counters, samples);
+                    }
+                    {
+                        const ScopedNvtxRange range("wavefront BSDF sample");
+                        wavefront_bsdf_sample_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, bsdf_indices,
+                            sample_next_indices, queue_counters, samples);
+                    }
+                }
+
+                if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+                    wavefront_bsdf_sample_kernel<<<full_queue_grid, queue_block_size>>>(
+                        device_scene, settings, paths, hits, bsdf_indices,
+                        sample_next_indices, queue_counters, samples);
+                }
+
+                wavefront_promote_next_kernel<<<1, 1>>>(queue_counters);
+                std::swap(sample_active_indices, sample_next_indices);
+            }
+            if (render_error == cudaSuccess) {
+                wavefront_finalize_active_kernel<<<full_queue_grid, queue_block_size>>>(
+                    paths, sample_active_indices, queue_counters, samples);
+                wavefront_accumulate_sample_kernel<<<full_queue_grid, queue_block_size>>>(
+                    samples, sample_sum, pixel_count);
+            }
+        }
+        return render_error;
+    };
     if (svgf_denoising_enabled(settings)) {
         Vec3* radiance = static_cast<Vec3*>(device_svgf_radiance_);
         Vec3* albedo = static_cast<Vec3*>(device_svgf_albedo_);
@@ -1492,7 +1921,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 }
             }
         }
-        if (!used_rasterized_gbuffer && has_rasterized_svgf_aov(framebuffer)) {
+        if (!wavefront_enabled && !used_rasterized_gbuffer && has_rasterized_svgf_aov(framebuffer)) {
             cuda_error = cudaMemcpy(albedo, framebuffer.aov.albedo.data(), pixels * sizeof(Vec3), cudaMemcpyHostToDevice);
             if (cuda_error == cudaSuccess) {
                 cuda_error = cudaMemcpy(emission, framebuffer.aov.emission.data(), pixels * sizeof(Vec3), cudaMemcpyHostToDevice);
@@ -1519,17 +1948,41 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         // A valid raster G-buffer replaces the manually traced primary AOVs. Upload it
         // before launching the radiance kernel so the kernel can skip that otherwise
         // redundant primary-ray traversal.
-        render_svgf_input_kernel<<<grid, block>>>(
-            device_scene,
-            settings,
-            radiance,
-            albedo,
-            emission,
-            normal,
-            world_position,
-            depth,
-            object_id,
-            !used_rasterized_gbuffer);
+        if (wavefront_enabled) {
+            Vec3* sample_sum = static_cast<Vec3*>(device_wavefront_sample_sum_);
+            const GpuWavefrontSvgfAov svgf_aov = used_rasterized_gbuffer
+                ? GpuWavefrontSvgfAov{}
+                : GpuWavefrontSvgfAov{albedo, emission, normal, world_position, depth, object_id};
+            cuda_error = render_wavefront_samples(sample_sum, true, svgf_aov);
+            if (cuda_error == cudaSuccess) {
+                const int pixel_count = static_cast<int>(pixels);
+                const int queue_block_size = 256;
+                const int queue_grid_size = (pixel_count + queue_block_size - 1) / queue_block_size;
+                wavefront_svgf_radiance_kernel<<<queue_grid_size, queue_block_size>>>(
+                    settings, sample_sum, radiance, pixel_count);
+                cuda_error = cudaGetLastError();
+            }
+            if (cuda_error != cudaSuccess) {
+                reset();
+                render_cpu_fallback(scene, settings, framebuffer, "CUDA wavefront SVGF input failed", cuda_error_text(cuda_error));
+                return;
+            }
+        } else {
+            render_svgf_input_kernel<<<grid, block>>>(
+                device_scene,
+                settings,
+                radiance,
+                albedo,
+                emission,
+                normal,
+                world_position,
+                depth,
+                object_id,
+                !used_rasterized_gbuffer);
+        }
+        const ScopedNvtxRange svgf_range("SVGF");
+        {
+        const ScopedNvtxRange range("SVGF temporal");
         svgf_temporal_kernel<<<grid, block>>>(
             settings,
             svgf_history_camera_,
@@ -1556,22 +2009,22 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             temporal_moment2,
             temporal_variance,
             temporal_history_length);
-        cuda_error = cudaMemcpy(ping_illumination, temporal_illumination, pixels * sizeof(Vec3), cudaMemcpyDeviceToDevice);
-        if (cuda_error == cudaSuccess) {
-            cuda_error = cudaMemcpy(ping_variance, temporal_variance, pixels * sizeof(float), cudaMemcpyDeviceToDevice);
-        }
-        if (cuda_error != cudaSuccess) {
-            reset();
-            render_cpu_fallback(scene, settings, framebuffer, "could not initialize CUDA SVGF ping buffers", cuda_error_text(cuda_error));
-            return;
         }
         const int iterations = std::clamp(settings.svgf_iterations, 0, 8);
+        Vec3* filtered_illumination = temporal_illumination;
+        float* filtered_variance = temporal_variance;
         for (int i = 0; i < iterations; ++i) {
+            const ScopedNvtxRange range("SVGF A-Trous");
+            Vec3* output_illumination = (i & 1) == 0 ? ping_illumination : pong_illumination;
+            float* output_variance = (i & 1) == 0 ? ping_variance : pong_variance;
             svgf_atrous_kernel<<<grid, block>>>(
-                settings, 1 << i, ping_illumination, ping_variance, normal, depth, object_id, pong_illumination, pong_variance);
-            std::swap(ping_illumination, pong_illumination);
-            std::swap(ping_variance, pong_variance);
+                settings, 1 << i, filtered_illumination, filtered_variance, normal, depth, object_id,
+                output_illumination, output_variance);
+            filtered_illumination = output_illumination;
+            filtered_variance = output_variance;
         }
+        {
+        const ScopedNvtxRange range("SVGF resolve");
         svgf_resolve_kernel<<<grid, block>>>(
             settings,
             radiance,
@@ -1581,8 +2034,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             world_position,
             depth,
             object_id,
-            ping_illumination,
-            ping_variance,
+            filtered_illumination,
+            filtered_variance,
             temporal_moment1,
             temporal_moment2,
             temporal_history_length,
@@ -1595,6 +2048,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             history_depth,
             history_object_id,
             final_color);
+        }
         taa_resolve_kernel<<<grid, block>>>(
             settings,
             taa_history_camera_,
@@ -1628,8 +2082,22 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         taa_history_jitter_y_ = settings.camera_jitter_y;
         taa_history_valid_ = true;
     } else {
-        render_kernel<<<grid, block>>>(device_scene, settings, device_accumulation, device_rgba);
-        const cudaError_t render_error = cudaDeviceSynchronize();
+        cudaError_t render_error = cudaSuccess;
+        if (wavefront_enabled) {
+            const int pixel_count = static_cast<int>(pixels);
+            const int queue_block_size = 256;
+            Vec3* sample_sum = static_cast<Vec3*>(device_wavefront_sample_sum_);
+            render_error = render_wavefront_samples(sample_sum, false, {});
+            if (render_error == cudaSuccess) {
+                const int queue_grid_size = (pixel_count + queue_block_size - 1) / queue_block_size;
+                wavefront_resolve_kernel<<<queue_grid_size, queue_block_size>>>(
+                    settings, sample_sum, device_accumulation, device_rgba, pixel_count);
+                render_error = cudaDeviceSynchronize();
+            }
+        } else {
+            render_kernel<<<grid, block>>>(device_scene, settings, device_accumulation, device_rgba);
+            render_error = cudaDeviceSynchronize();
+        }
         if (render_error != cudaSuccess) {
             reset();
             render_cpu_fallback(scene, settings, framebuffer, "CUDA kernel failed", cuda_error_text(render_error));

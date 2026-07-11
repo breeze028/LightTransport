@@ -257,16 +257,33 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
     gpu.mesh_instance_count = static_cast<int>(render_scene.mesh_instances.size());
     gpu.tlas_node_count = static_cast<int>(render_scene.tlas_nodes.size());
     packed.triangles.resize(render_scene.triangles.size());
+    packed.traversal_triangles.resize(render_scene.triangles.size());
     packed.spheres.resize(render_scene.spheres.size());
     packed.triangle_indices = gpu.use_two_level ? render_scene.triangle_indices : render_scene.flat_triangle_indices;
     const std::vector<BvhNode>& source_bvh_nodes = gpu.use_two_level ? render_scene.bvh_nodes : render_scene.flat_bvh_nodes;
     packed.bvh_nodes.resize(source_bvh_nodes.size());
+    packed.traversal_bvh_nodes.resize(source_bvh_nodes.size());
     packed.mesh_instances.resize(render_scene.mesh_instances.size());
     packed.mesh_instance_indices = render_scene.mesh_instance_indices;
     packed.tlas_nodes.resize(render_scene.tlas_nodes.size());
+    packed.traversal_tlas_nodes.resize(render_scene.tlas_nodes.size());
+    const auto make_traversal_node = [](const BvhNode& node) {
+        GpuTraversalBvhNode gpu_node;
+        gpu_node.bounds_min = node.bounds.min;
+        gpu_node.bounds_max = node.bounds.max;
+        if (node.count > 0) {
+            gpu_node.left_or_first = node.first;
+            gpu_node.right_or_neg_count = -node.count;
+        } else {
+            gpu_node.left_or_first = node.left;
+            gpu_node.right_or_neg_count = node.right;
+        }
+        return gpu_node;
+    };
     for (size_t i = 0; i < source_bvh_nodes.size(); ++i) {
         const BvhNode& node = source_bvh_nodes[i];
         packed.bvh_nodes[i] = {node.bounds.min, node.bounds.max, node.left, node.right, node.first, node.count};
+        packed.traversal_bvh_nodes[i] = make_traversal_node(node);
     }
     for (size_t i = 0; i < render_scene.mesh_instances.size(); ++i) {
         const RenderScene::MeshInstance& instance = render_scene.mesh_instances[i];
@@ -275,6 +292,7 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
     for (size_t i = 0; i < render_scene.tlas_nodes.size(); ++i) {
         const BvhNode& node = render_scene.tlas_nodes[i];
         packed.tlas_nodes[i] = {node.bounds.min, node.bounds.max, node.left, node.right, node.first, node.count};
+        packed.traversal_tlas_nodes[i] = make_traversal_node(node);
     }
     packed.light_indices.reserve(render_scene.light_triangle_indices.size());
     for (int i = 0; i < gpu.triangle_count; ++i) {
@@ -295,6 +313,15 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
             tri.v0, tri.v1, tri.v2, tri.normal, tri.n0, tri.n1, tri.n2, tri.tangent, tri.bitangent, tri.centroid,
             emission, tri.uv0, tri.uv1, tri.uv2, tri.lightmap_uv0, tri.lightmap_uv1, tri.lightmap_uv2,
             tri.material, tri.mesh, light_double_sided, tri.has_lightmap ? 1 : 0,
+        };
+        packed.traversal_triangles[static_cast<size_t>(i)] = {
+            tri.v0,
+            sub(tri.v1, tri.v0),
+            sub(tri.v2, tri.v0),
+            tri.material |
+                (scene.materials[static_cast<size_t>(tri.material)]->alpha_mode != AlphaMode::Opaque
+                    ? kTraversalMaterialAlphaBit
+                    : 0),
         };
     }
     for (int i = 0; i < gpu.sphere_count; ++i) {

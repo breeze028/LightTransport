@@ -1,6 +1,7 @@
 #include "scene_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <numeric>
 
@@ -39,6 +40,16 @@ int longest_axis(Vec3 extent) {
     return 0;
 }
 
+float surface_area(const Aabb& bounds) {
+    const Vec3 extent = bounds.max - bounds.min;
+    return std::max(0.0f, 2.0f * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x));
+}
+
+int centroid_bin(float centroid, float minimum, float extent, int bin_count) {
+    const float normalized = (centroid - minimum) / extent;
+    return std::clamp(static_cast<int>(normalized * static_cast<float>(bin_count)), 0, bin_count - 1);
+}
+
 int build_bvh_recursive(RenderScene& scene, std::vector<int>& indices, std::vector<BvhNode>& nodes, int first, int count) {
     BvhNode node;
     for (int i = first; i < first + count; ++i) {
@@ -57,16 +68,95 @@ int build_bvh_recursive(RenderScene& scene, std::vector<int>& indices, std::vect
     for (int i = first; i < first + count; ++i) {
         expand(centroid_bounds, scene.triangles[static_cast<size_t>(indices[static_cast<size_t>(i)])].centroid);
     }
-    const int axis = longest_axis(centroid_bounds.max - centroid_bounds.min);
-    const int mid = first + count / 2;
-    std::nth_element(
-        indices.begin() + first,
-        indices.begin() + mid,
-        indices.begin() + first + count,
-        [&](int a, int b) {
-            return axis_value(scene.triangles[static_cast<size_t>(a)].centroid, axis) <
-                axis_value(scene.triangles[static_cast<size_t>(b)].centroid, axis);
-        });
+    constexpr int kBinCount = 16;
+    struct Bin {
+        Aabb bounds;
+        int count = 0;
+    };
+    int best_axis = -1;
+    int best_split = -1;
+    float best_cost = kInfinity;
+    const Vec3 centroid_extent = centroid_bounds.max - centroid_bounds.min;
+    for (int axis = 0; axis < 3; ++axis) {
+        const float extent = axis_value(centroid_extent, axis);
+        if (extent <= 1.0e-7f) {
+            continue;
+        }
+        std::array<Bin, kBinCount> bins;
+        for (int i = first; i < first + count; ++i) {
+            const int triangle_index = indices[static_cast<size_t>(i)];
+            const Triangle& triangle = scene.triangles[static_cast<size_t>(triangle_index)];
+            const int bin = centroid_bin(axis_value(triangle.centroid, axis), axis_value(centroid_bounds.min, axis), extent, kBinCount);
+            ++bins[static_cast<size_t>(bin)].count;
+            expand(bins[static_cast<size_t>(bin)].bounds, triangle_bounds(triangle));
+        }
+        std::array<Aabb, kBinCount - 1> left_bounds;
+        std::array<Aabb, kBinCount - 1> right_bounds;
+        std::array<int, kBinCount - 1> left_counts{};
+        std::array<int, kBinCount - 1> right_counts{};
+        Aabb left;
+        int left_count = 0;
+        for (int bin = 0; bin < kBinCount - 1; ++bin) {
+            const Bin& source = bins[static_cast<size_t>(bin)];
+            left_count += source.count;
+            if (source.count > 0) {
+                expand(left, source.bounds);
+            }
+            left_bounds[static_cast<size_t>(bin)] = left;
+            left_counts[static_cast<size_t>(bin)] = left_count;
+        }
+        Aabb right;
+        int right_count = 0;
+        for (int bin = kBinCount - 1; bin > 0; --bin) {
+            const Bin& source = bins[static_cast<size_t>(bin)];
+            right_count += source.count;
+            if (source.count > 0) {
+                expand(right, source.bounds);
+            }
+            right_bounds[static_cast<size_t>(bin - 1)] = right;
+            right_counts[static_cast<size_t>(bin - 1)] = right_count;
+        }
+        for (int split = 0; split < kBinCount - 1; ++split) {
+            const int lhs_count = left_counts[static_cast<size_t>(split)];
+            const int rhs_count = right_counts[static_cast<size_t>(split)];
+            if (lhs_count == 0 || rhs_count == 0) {
+                continue;
+            }
+            const float cost = surface_area(left_bounds[static_cast<size_t>(split)]) * static_cast<float>(lhs_count) +
+                surface_area(right_bounds[static_cast<size_t>(split)]) * static_cast<float>(rhs_count);
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_axis = axis;
+                best_split = split;
+            }
+        }
+    }
+
+    int mid = first;
+    if (best_axis >= 0) {
+        const float minimum = axis_value(centroid_bounds.min, best_axis);
+        const float extent = axis_value(centroid_extent, best_axis);
+        const auto partition_point = std::partition(
+            indices.begin() + first,
+            indices.begin() + first + count,
+            [&](int triangle_index) {
+                const Vec3 centroid = scene.triangles[static_cast<size_t>(triangle_index)].centroid;
+                return centroid_bin(axis_value(centroid, best_axis), minimum, extent, kBinCount) <= best_split;
+            });
+        mid = static_cast<int>(partition_point - indices.begin());
+    }
+    if (mid == first || mid == first + count) {
+        const int axis = longest_axis(centroid_extent);
+        mid = first + count / 2;
+        std::nth_element(
+            indices.begin() + first,
+            indices.begin() + mid,
+            indices.begin() + first + count,
+            [&](int a, int b) {
+                return axis_value(scene.triangles[static_cast<size_t>(a)].centroid, axis) <
+                    axis_value(scene.triangles[static_cast<size_t>(b)].centroid, axis);
+            });
+    }
 
     nodes[static_cast<size_t>(node_index)].left = build_bvh_recursive(scene, indices, nodes, first, mid - first);
     nodes[static_cast<size_t>(node_index)].right = build_bvh_recursive(scene, indices, nodes, mid, first + count - mid);

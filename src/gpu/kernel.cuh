@@ -16,12 +16,666 @@ __global__ void render_kernel(const GpuScene* scene_ptr, RenderSettings settings
     rgba[idx] = rgba8_gpu(divv(accumulation[idx], static_cast<float>(settings.frame_index + 1u)));
 }
 
-__device__ float svgf_luminance_gpu(Vec3 c) {
-    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+struct GpuWavefrontPaths {
+    Ray* rays = nullptr;
+    Vec3* throughputs = nullptr;
+    Vec3* radiance = nullptr;
+    Vec3* previous_positions = nullptr;
+    float* previous_bsdf_pdfs = nullptr;
+    uint32_t* rngs = nullptr;
+    int* pixels = nullptr;
+    uint32_t* states = nullptr;
+};
+
+struct GpuWavefrontPathRef {
+    Ray& ray;
+    Vec3& throughput;
+    Vec3& radiance;
+    Vec3& previous_position;
+    float& previous_bsdf_pdf;
+    uint32_t& rng;
+    int& pixel;
+    uint32_t& state;
+};
+
+struct GpuWavefrontIntersectPaths {
+    Ray* rays = nullptr;
+    Vec3* throughputs = nullptr;
+    Vec3* radiance = nullptr;
+    uint32_t* rngs = nullptr;
+    int* pixels = nullptr;
+    uint32_t* states = nullptr;
+};
+
+struct GpuWavefrontIntersectPathRef {
+    Ray& ray;
+    Vec3& throughput;
+    Vec3& radiance;
+    uint32_t& rng;
+    int& pixel;
+    uint32_t& state;
+};
+
+struct GpuWavefrontSvgfAov {
+    Vec3* albedo = nullptr;
+    Vec3* emission = nullptr;
+    Vec3* normal = nullptr;
+    Vec3* world_position = nullptr;
+    float* depth = nullptr;
+    uint32_t* object_id = nullptr;
+};
+
+enum GpuWavefrontQueue : int {
+    GpuWavefrontQueueActive = 0,
+    GpuWavefrontQueueDirectLight = 1,
+    GpuWavefrontQueueGi = 2,
+    GpuWavefrontQueueShadow = 3,
+    GpuWavefrontQueueBsdf = 4,
+    GpuWavefrontQueueNextRay = 5,
+    GpuWavefrontQueueCount = 6,
+};
+
+struct GpuWavefrontQueueCounters {
+    int num_queued[GpuWavefrontQueueCount];
+};
+
+static constexpr uint32_t kWavefrontBounceMask = 0xffu;
+static constexpr uint32_t kWavefrontTransmissionShift = 8u;
+static constexpr uint32_t kWavefrontTransparentShift = 16u;
+static constexpr uint32_t kWavefrontPreviousDeltaBit = 1u << 24u;
+
+__device__ bool wavefront_svgf_aov_enabled(GpuWavefrontSvgfAov aov) {
+    return aov.albedo != nullptr && aov.emission != nullptr && aov.normal != nullptr &&
+        aov.world_position != nullptr && aov.depth != nullptr && aov.object_id != nullptr;
 }
 
 __device__ Vec3 svgf_max_gpu(Vec3 v, float lo = 0.0f) {
     return {fmaxf(v.x, lo), fmaxf(v.y, lo), fmaxf(v.z, lo)};
+}
+
+__device__ uint32_t primary_object_id_gpu(const GpuHit& hit) {
+    if (hit.mesh >= 0) return static_cast<uint32_t>(hit.mesh + 1);
+    if (hit.sphere >= 0) return 0x20000000u | static_cast<uint32_t>(hit.sphere + 1);
+    if (hit.triangle >= 0) return 0x40000000u | static_cast<uint32_t>(hit.triangle + 1);
+    if (hit.material >= 0) return 0x80000000u | static_cast<uint32_t>(hit.material + 1);
+    return 0u;
+}
+
+__device__ Vec3 material_base_color_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
+    return mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
+}
+
+__device__ float svgf_albedo_triangle_uv_density_gpu(const GpuScene& scene, const GpuHit& hit) {
+    if (hit.triangle < 0 || hit.triangle >= scene.triangle_count) {
+        return 0.0f;
+    }
+    const GpuTriangle tri = scene.triangles[hit.triangle];
+    const Vec3 e1 = sub(tri.v1, tri.v0);
+    const Vec3 e2 = sub(tri.v2, tri.v0);
+    const Vec3 world_cross = dcross(e1, e2);
+    const float world_area2 = sqrtf(ddot(world_cross, world_cross));
+    const float du1 = tri.uv1.x - tri.uv0.x;
+    const float dv1 = tri.uv1.y - tri.uv0.y;
+    const float du2 = tri.uv2.x - tri.uv0.x;
+    const float dv2 = tri.uv2.y - tri.uv0.y;
+    const float uv_area2 = fabsf(du1 * dv2 - dv1 * du2);
+    if (world_area2 <= 1.0e-8f || uv_area2 <= 1.0e-10f) {
+        return 0.0f;
+    }
+    return sqrtf(uv_area2 / world_area2);
+}
+
+__device__ float svgf_albedo_sphere_uv_density_gpu(const GpuScene& scene, const GpuHit& hit) {
+    if (hit.sphere < 0 || hit.sphere >= scene.sphere_count) {
+        return 0.0f;
+    }
+    const float radius = fmaxf(scene.spheres[hit.sphere].radius, 1.0e-5f);
+    return 1.0f / (kPi * radius);
+}
+
+__device__ float svgf_albedo_lod_gpu(
+    const GpuScene& scene,
+    RenderSettings settings,
+    const GpuMaterial& material,
+    const GpuHit& hit,
+    const Ray& ray) {
+    if (material.texture_index < 0 || material.texture_index >= scene.texture_count) {
+        return 0.0f;
+    }
+    const GpuTexture texture = scene.textures[material.texture_index];
+    if (texture.width <= 0 || texture.height <= 0 || texture.mip_levels <= 1 || texture.object == 0) {
+        return 0.0f;
+    }
+
+    float uv_per_world = svgf_albedo_triangle_uv_density_gpu(scene, hit);
+    if (uv_per_world <= 0.0f) {
+        uv_per_world = svgf_albedo_sphere_uv_density_gpu(scene, hit);
+    }
+    if (uv_per_world <= 0.0f) {
+        return 0.0f;
+    }
+
+    const Vec3 forward = dnormalize(sub(scene.camera.target, scene.camera.position));
+    const float depth = fmaxf(1.0e-4f, ddot(sub(hit.position, scene.camera.position), forward));
+    const float image_height = fmaxf(1.0f, static_cast<float>(settings.height));
+    const float pixel_world = 2.0f * tanf(scene.camera.fov_degrees * kPi / 360.0f) * depth / image_height;
+    const float ndotv = fabsf(ddot(hit.normal, mul(ray.direction, -1.0f)));
+    const float grazing_scale = 1.0f / fmaxf(0.25f, ndotv);
+    const float uv_scale = fmaxf(fabsf(material.texture_scale.x), fabsf(material.texture_scale.y));
+    const float texture_extent = static_cast<float>(texture.width > texture.height ? texture.width : texture.height);
+    const float footprint_texels = pixel_world * uv_per_world * fmaxf(uv_scale, 1.0e-4f) *
+        grazing_scale * texture_extent;
+    const float lod = log2f(fmaxf(1.0f, footprint_texels)) + 0.75f;
+    return dclamp(lod, 0.0f, static_cast<float>(texture.mip_levels - 1));
+}
+
+__device__ Vec3 material_base_color_svgf_gpu(
+    const GpuScene& scene,
+    RenderSettings settings,
+    const GpuMaterial& material,
+    const GpuHit& hit,
+    const Ray& ray) {
+    const Vec2 uv = material_base_uv_gpu(material, hit.uv);
+    return mul(material.albedo, sample_texture_lod_gpu(scene, material.texture_index, uv,
+        svgf_albedo_lod_gpu(scene, settings, material, hit, ray)));
+}
+
+__device__ void write_wavefront_svgf_default_aov(GpuWavefrontSvgfAov aov, int pixel) {
+    if (!wavefront_svgf_aov_enabled(aov)) return;
+    aov.albedo[pixel] = {1.0f, 1.0f, 1.0f};
+    aov.emission[pixel] = {};
+    aov.normal[pixel] = {};
+    aov.world_position[pixel] = {};
+    aov.depth[pixel] = kInfinity;
+    aov.object_id[pixel] = 0u;
+}
+
+__device__ void write_wavefront_svgf_surface_aov(
+    const GpuScene& scene,
+    RenderSettings settings,
+    GpuWavefrontSvgfAov aov,
+    int pixel,
+    const Ray& ray,
+    const GpuHit& hit,
+    const GpuMaterial& material,
+    Vec3 material_emission) {
+    if (!wavefront_svgf_aov_enabled(aov)) return;
+    Vec3 hit_emission = add(hit.emission, material_emission);
+    if (hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
+        const GpuTriangle light = scene.triangles[hit.triangle];
+        hit_emission = emitted_radiance_gpu(light, material, light.emission,
+            material_emission, light.light_double_sided != 0, ray.direction);
+    }
+    const Vec3 forward = dnormalize(sub(scene.camera.target, scene.camera.position));
+    aov.albedo[pixel] = svgf_max_gpu(material_base_color_svgf_gpu(scene, settings, material, hit, ray), 0.001f);
+    aov.emission[pixel] = svgf_max_gpu(hit_emission);
+    aov.normal[pixel] = hit.normal;
+    aov.world_position[pixel] = hit.position;
+    aov.depth[pixel] = fmaxf(0.0f, ddot(sub(hit.position, scene.camera.position), forward));
+    aov.object_id[pixel] = primary_object_id_gpu(hit);
+}
+
+__device__ GpuWavefrontPathRef wavefront_path_ref(GpuWavefrontPaths paths, int index) {
+    return {
+        paths.rays[index],
+        paths.throughputs[index],
+        paths.radiance[index],
+        paths.previous_positions[index],
+        paths.previous_bsdf_pdfs[index],
+        paths.rngs[index],
+        paths.pixels[index],
+        paths.states[index],
+    };
+}
+
+__device__ GpuWavefrontIntersectPathRef wavefront_intersect_path_ref(GpuWavefrontIntersectPaths paths, int index) {
+    return {
+        paths.rays[index],
+        paths.throughputs[index],
+        paths.radiance[index],
+        paths.rngs[index],
+        paths.pixels[index],
+        paths.states[index],
+    };
+}
+
+template <typename PathT>
+__device__ int wavefront_bounce(const PathT& path) {
+    return static_cast<int>(path.state & kWavefrontBounceMask);
+}
+
+template <typename PathT>
+__device__ int wavefront_transmission_bounces(const PathT& path) {
+    return static_cast<int>((path.state >> kWavefrontTransmissionShift) & 0xffu);
+}
+
+template <typename PathT>
+__device__ int wavefront_transparent_steps(const PathT& path) {
+    return static_cast<int>((path.state >> kWavefrontTransparentShift) & 0xffu);
+}
+
+template <typename PathT>
+__device__ bool wavefront_previous_delta(const PathT& path) {
+    return (path.state & kWavefrontPreviousDeltaBit) != 0u;
+}
+
+template <typename PathT>
+__device__ void wavefront_set_previous_delta(PathT& path, bool value) {
+    path.state = value ? (path.state | kWavefrontPreviousDeltaBit) : (path.state & ~kWavefrontPreviousDeltaBit);
+}
+
+template <typename PathT>
+__device__ void wavefront_set_transparent_steps(PathT& path, int steps) {
+    path.state = (path.state & ~(0xffu << kWavefrontTransparentShift)) |
+        ((static_cast<uint32_t>(steps) & 0xffu) << kWavefrontTransparentShift);
+}
+
+template <typename PathT>
+__device__ void wavefront_increment_bounce(PathT& path) {
+    const uint32_t bounce = (path.state & kWavefrontBounceMask) + 1u;
+    path.state = (path.state & ~kWavefrontBounceMask) | (bounce & kWavefrontBounceMask);
+}
+
+template <typename PathT>
+__device__ void wavefront_increment_transmission_bounce(PathT& path) {
+    const uint32_t transmission = ((path.state >> kWavefrontTransmissionShift) & 0xffu) + 1u;
+    path.state = (path.state & ~(0xffu << kWavefrontTransmissionShift)) |
+        ((transmission & 0xffu) << kWavefrontTransmissionShift);
+}
+
+__device__ void wavefront_append_queue(int* indices, int* count, int path_index) {
+    const unsigned mask = __activemask();
+    const int lane = static_cast<int>(threadIdx.x & 31);
+    const int leader = __ffs(mask) - 1;
+    const int rank = __popc(mask & ((1u << lane) - 1u));
+    const int warp_count = __popc(mask);
+    int base = 0;
+    if (lane == leader) {
+        base = atomicAdd(count, warp_count);
+    }
+    base = __shfl_sync(mask, base, leader);
+    indices[base + rank] = path_index;
+}
+
+template <typename PathT>
+__device__ void finish_wavefront_path(PathT& path, Vec3* samples) {
+    samples[path.pixel] = path.radiance;
+}
+
+__global__ void wavefront_initialize_kernel(
+    const GpuScene* scene_ptr,
+    RenderSettings settings,
+    GpuWavefrontPaths paths,
+    int* active_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    Vec3* samples,
+    GpuWavefrontSvgfAov svgf_aov,
+    int pixel_count,
+    int sample_index,
+    bool use_camera_jitter) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pixel_count) return;
+    if (idx == 0) {
+        for (int i = 0; i < GpuWavefrontQueueCount; ++i) {
+            queue_counters->num_queued[i] = 0;
+        }
+        queue_counters->num_queued[GpuWavefrontQueueActive] = pixel_count;
+    }
+    const int x = idx % settings.width;
+    const int y = idx / settings.width;
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, idx);
+    path.rng = make_pixel_seed(static_cast<uint32_t>(x), static_cast<uint32_t>(y),
+        settings.frame_index ^ (0x9e3779b9u * static_cast<uint32_t>(sample_index + 1)));
+    path.ray = use_camera_jitter
+        ? camera_ray_with_sample(
+            scene_ptr->camera,
+            x,
+            y,
+            settings.width,
+            settings.height,
+            0.5f + settings.camera_jitter_x,
+            0.5f + settings.camera_jitter_y)
+        : camera_ray(scene_ptr->camera, x, y, settings.width, settings.height, path.rng);
+    path.throughput = {1.0f, 1.0f, 1.0f};
+    path.radiance = {};
+    path.previous_position = {};
+    path.previous_bsdf_pdf = 0.0f;
+    path.pixel = idx;
+    path.state = 0u;
+    active_indices[idx] = idx;
+    samples[idx] = {};
+    write_wavefront_svgf_default_aov(svgf_aov, idx);
+}
+
+__global__ void wavefront_prepare_step_kernel(GpuWavefrontQueueCounters* queue_counters) {
+    queue_counters->num_queued[GpuWavefrontQueueDirectLight] = 0;
+    queue_counters->num_queued[GpuWavefrontQueueGi] = 0;
+    queue_counters->num_queued[GpuWavefrontQueueShadow] = 0;
+    queue_counters->num_queued[GpuWavefrontQueueBsdf] = 0;
+    queue_counters->num_queued[GpuWavefrontQueueNextRay] = 0;
+}
+
+__global__ void wavefront_promote_next_kernel(GpuWavefrontQueueCounters* queue_counters) {
+    queue_counters->num_queued[GpuWavefrontQueueActive] =
+        queue_counters->num_queued[GpuWavefrontQueueNextRay];
+}
+
+template <bool AlphaVisibility, bool TwoLevel, bool Primary>
+__global__ void wavefront_intersect_kernel(
+    const GpuScene* scene_ptr,
+    RenderSettings settings,
+    GpuWavefrontIntersectPaths paths,
+    GpuCompactHit* compact_hits,
+    const int* active_indices,
+    int* shade_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    Vec3* samples) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int active_count = queue_counters->num_queued[GpuWavefrontQueueActive];
+    if (queue_index >= active_count) return;
+
+    const GpuScene& scene = *scene_ptr;
+    const int path_index = active_indices[queue_index];
+    GpuWavefrontIntersectPathRef path = wavefront_intersect_path_ref(paths, path_index);
+    const int shading_bounce = Primary ? 0 : wavefront_bounce(path) - wavefront_transmission_bounces(path);
+    if (shading_bounce >= settings.max_bounces) {
+        finish_wavefront_path(path, samples);
+        return;
+    }
+
+    const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
+    Ray ray = path.ray;
+    int transparent_steps = wavefront_transparent_steps(path);
+    for (;;) {
+        GpuCompactHit hit;
+        if (!intersect_compact_gpu<TwoLevel>(scene, ray, hit)) {
+            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
+                mul(path.throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
+            finish_wavefront_path(path, samples);
+            return;
+        }
+        const bool triangle_has_alpha = hit.triangle >= 0 && traversal_material_has_alpha(hit.material);
+        const int material_index = hit.triangle >= 0 ? traversal_material_index(hit.material) : hit.material;
+        if (material_index < 0 || material_index >= scene.material_count) {
+            finish_wavefront_path(path, samples);
+            return;
+        }
+
+        if constexpr (AlphaVisibility) {
+            const bool test_visibility = hit.triangle < 0 || triangle_has_alpha;
+            if (test_visibility) {
+                const GpuMaterial material = scene.materials[material_index];
+                const Vec2 uv = compact_hit_uv_gpu(scene, ray, hit);
+                if (!material_visible_gpu(scene, material, uv, path.rng)) {
+                    if (transparent_steps < 8) {
+                        const Vec3 position = compact_hit_position_gpu(ray, hit);
+                        ray = {add(position, mul(ray.direction, 0.002f)), ray.direction};
+                        ++transparent_steps;
+                        continue;
+                    }
+                    finish_wavefront_path(path, samples);
+                    return;
+                }
+            }
+        }
+
+        path.ray = ray;
+        wavefront_set_transparent_steps(path, 0);
+        hit.material = material_index;
+        compact_hits[path_index] = hit;
+        wavefront_append_queue(shade_indices,
+            &queue_counters->num_queued[GpuWavefrontQueueDirectLight], path_index);
+        return;
+    }
+}
+
+__global__ void wavefront_direct_light_kernel(
+    const GpuScene* scene_ptr,
+    RenderSettings settings,
+    GpuWavefrontPaths paths,
+    const GpuCompactHit* compact_hits,
+    GpuHit* hits,
+    const int* direct_indices,
+    int* gi_indices,
+    int* shadow_indices,
+    int* bsdf_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    GpuWavefrontSvgfAov svgf_aov,
+    Vec3* samples) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int direct_count = queue_counters->num_queued[GpuWavefrontQueueDirectLight];
+    if (queue_index >= direct_count) return;
+
+    const GpuScene& scene = *scene_ptr;
+    const int path_index = direct_indices[queue_index];
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, path_index);
+    GpuHit hit;
+    if (!fill_compact_hit_gpu(scene, path.ray, compact_hits[path_index], hit)) {
+        finish_wavefront_path(path, samples);
+        return;
+    }
+    const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
+    const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
+    const GpuMaterial material = scene.materials[hit.material];
+
+    hit.normal = apply_normal_map_gpu(scene, material, hit, path.ray.direction);
+    const Vec3 material_emission = material_emission_gpu(scene, material, hit.uv);
+    hit.emission = add(hit.emission, material_emission);
+    if (shading_bounce == 0) {
+        write_wavefront_svgf_surface_aov(scene, settings, svgf_aov, path.pixel, path.ray, hit, material, material_emission);
+    }
+    if (has_light_emission_gpu(hit.emission)) {
+        const GpuTriangle light = hit.triangle >= 0 && hit.triangle < scene.triangle_count ? scene.triangles[hit.triangle] : GpuTriangle{};
+        const GpuMaterial light_material = scene.materials[hit.material];
+        const Vec3 emission = emitted_radiance_gpu(light, light_material, light.emission,
+            material_emission, light.light_double_sided != 0, path.ray.direction);
+        if (shading_bounce == 0 || wavefront_previous_delta(path)) {
+            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(path.throughput, emission), sample_clamp));
+        } else if (settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling &&
+                   hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
+            const float light_pmf = scene.light_count > 0 ? 1.0f / static_cast<float>(scene.light_count) : 0.0f;
+            const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, path.previous_position, hit.position, light_pmf);
+            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(mul(path.throughput, emission),
+                mis_weight_gpu(path.previous_bsdf_pdf, light_pdf, static_cast<int>(settings.mis_heuristic))), sample_clamp));
+        } else if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(path.throughput, emission), sample_clamp));
+        }
+        finish_wavefront_path(path, samples);
+        return;
+    }
+
+    if (settings.use_lightmap && hit.has_lightmap && material_uses_lightmap_gi_gpu(settings, material)) {
+        hits[path_index] = hit;
+        wavefront_append_queue(gi_indices,
+            &queue_counters->num_queued[GpuWavefrontQueueGi], path_index);
+        return;
+    }
+    if (settings.use_irradiance_volume && material_uses_irradiance_volume_gi_gpu(settings, material)) {
+        hits[path_index] = hit;
+        wavefront_append_queue(gi_indices,
+            &queue_counters->num_queued[GpuWavefrontQueueGi], path_index);
+        return;
+    }
+    hits[path_index] = hit;
+    if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+        wavefront_append_queue(bsdf_indices,
+            &queue_counters->num_queued[GpuWavefrontQueueBsdf], path_index);
+        return;
+    }
+    wavefront_append_queue(shadow_indices,
+        &queue_counters->num_queued[GpuWavefrontQueueShadow], path_index);
+    wavefront_append_queue(bsdf_indices,
+        &queue_counters->num_queued[GpuWavefrontQueueBsdf], path_index);
+}
+
+__global__ void wavefront_finalize_active_kernel(
+    GpuWavefrontPaths paths,
+    const int* active_indices,
+    const GpuWavefrontQueueCounters* queue_counters,
+    Vec3* samples) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int active_count = queue_counters->num_queued[GpuWavefrontQueueActive];
+    if (queue_index >= active_count) return;
+    const int path_index = active_indices[queue_index];
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, path_index);
+    finish_wavefront_path(path, samples);
+}
+
+__global__ void wavefront_gi_kernel(
+    const GpuScene* scene_ptr,
+    RenderSettings settings,
+    GpuWavefrontPaths paths,
+    const GpuHit* hits,
+    const int* gi_indices,
+    int* bsdf_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    Vec3* samples) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gi_count = queue_counters->num_queued[GpuWavefrontQueueGi];
+    if (queue_index >= gi_count) return;
+
+    const GpuScene& scene = *scene_ptr;
+    const int path_index = gi_indices[queue_index];
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, path_index);
+    const GpuHit hit = hits[path_index];
+    const GpuMaterial material = scene.materials[hit.material];
+    const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
+    const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
+    const Vec3 wo = mul(path.ray.direction, -1.0f);
+    if (settings.use_lightmap && hit.has_lightmap && material_uses_lightmap_gi_gpu(settings, material)) {
+        path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
+            mul(path.throughput, shade_material_from_lightmap_gpu(scene, settings, material, hit, wo, path.rng)), sample_clamp));
+        finish_wavefront_path(path, samples);
+        return;
+    }
+    if (settings.use_irradiance_volume && material_uses_irradiance_volume_gi_gpu(settings, material)) {
+        path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
+            mul(path.throughput, shade_material_from_irradiance_volume_gpu(scene, settings, material, hit, wo, path.rng)), sample_clamp));
+        finish_wavefront_path(path, samples);
+        return;
+    }
+    wavefront_append_queue(bsdf_indices,
+        &queue_counters->num_queued[GpuWavefrontQueueBsdf], path_index);
+}
+
+template <typename PathT>
+__device__ void wavefront_sample_bsdf_to_next(
+    const GpuScene& scene,
+    RenderSettings settings,
+    PathT& path,
+    const GpuHit& hit,
+    int path_index,
+    int* next_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    Vec3* samples) {
+    const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
+    const GpuMaterial material = scene.materials[hit.material];
+    const Vec3 wo = mul(path.ray.direction, -1.0f);
+    if (shading_bounce >= 3) {
+        const float p = dclamp(fmaxf(path.throughput.x, fmaxf(path.throughput.y, path.throughput.z)), 0.05f, 0.95f);
+        if (rng_float(path.rng) > p) {
+            finish_wavefront_path(path, samples);
+            return;
+        }
+        path.throughput = divv(path.throughput, p);
+    }
+    const GpuMaterialSample sample = sample_material_gpu(scene, material, hit.normal, wo, hit.uv, hit.front_face, path.rng);
+    if (!isfinite(sample.pdf) || sample.pdf <= 0.0f || !finite_vec_gpu(sample.weight) || ddot(sample.weight, sample.weight) <= 0.0f) {
+        finish_wavefront_path(path, samples);
+        return;
+    }
+    path.previous_position = hit.position;
+    path.previous_bsdf_pdf = sample.pdf;
+    wavefront_set_previous_delta(path, sample.delta);
+    if (sample.delta && material_transmission_gpu(scene, material, hit.uv) > 0.5f && wavefront_transmission_bounces(path) < 12) {
+        wavefront_increment_transmission_bounce(path);
+    }
+    const float offset_side = ddot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;
+    path.ray = {add(hit.position, mul(hit.normal, 0.001f * offset_side)), sample.direction};
+    path.throughput = mul(path.throughput, sample.weight);
+    wavefront_increment_bounce(path);
+    wavefront_append_queue(next_indices,
+        &queue_counters->num_queued[GpuWavefrontQueueNextRay], path_index);
+}
+
+__global__ void wavefront_direct_visibility_kernel(
+    const GpuScene* scene_ptr,
+    RenderSettings settings,
+    GpuWavefrontPaths paths,
+    const GpuHit* hits,
+    const int* shadow_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    Vec3* /*samples*/) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int shadow_count = queue_counters->num_queued[GpuWavefrontQueueShadow];
+    if (queue_index >= shadow_count) return;
+
+    const GpuScene& scene = *scene_ptr;
+    const int path_index = shadow_indices[queue_index];
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, path_index);
+    const GpuHit hit = hits[path_index];
+    const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
+    const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
+    const GpuMaterial material = scene.materials[hit.material];
+    const Vec3 wo = mul(path.ray.direction, -1.0f);
+    path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
+        mul(path.throughput, estimate_direct_gpu(scene, hit, material, wo, path.rng, settings)), sample_clamp));
+}
+
+__global__ void wavefront_bsdf_sample_kernel(
+    const GpuScene* scene_ptr,
+    RenderSettings settings,
+    GpuWavefrontPaths paths,
+    const GpuHit* hits,
+    const int* bsdf_indices,
+    int* next_indices,
+    GpuWavefrontQueueCounters* queue_counters,
+    Vec3* samples) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int bsdf_count = queue_counters->num_queued[GpuWavefrontQueueBsdf];
+    if (queue_index >= bsdf_count) return;
+
+    const GpuScene& scene = *scene_ptr;
+    const int path_index = bsdf_indices[queue_index];
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, path_index);
+    const GpuHit hit = hits[path_index];
+    wavefront_sample_bsdf_to_next(scene, settings, path, hit, path_index, next_indices, queue_counters, samples);
+}
+
+__global__ void wavefront_resolve_kernel(
+    RenderSettings settings,
+    const Vec3* sample_sum,
+    Vec3* accumulation,
+    uint32_t* rgba,
+    int pixel_count) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pixel_count) return;
+    const Vec3 sample = divv(sample_sum[idx], static_cast<float>(settings.samples_per_pixel));
+    accumulation[idx] = add(accumulation[idx], sample);
+    rgba[idx] = rgba8_gpu(divv(accumulation[idx], static_cast<float>(settings.frame_index + 1u)));
+}
+
+__global__ void wavefront_svgf_radiance_kernel(
+    RenderSettings settings,
+    const Vec3* sample_sum,
+    Vec3* radiance,
+    int pixel_count) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pixel_count) return;
+    radiance[idx] = divv(sample_sum[idx], static_cast<float>(settings.samples_per_pixel));
+}
+
+__global__ void wavefront_accumulate_sample_kernel(
+    const Vec3* samples,
+    Vec3* sample_sum,
+    int pixel_count) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= pixel_count) return;
+    sample_sum[idx] = add(sample_sum[idx], samples[idx]);
+}
+
+__device__ float svgf_luminance_gpu(Vec3 c) {
+    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
 }
 
 __device__ Ray center_camera_ray_gpu(const Camera& camera, int x, int y, int width, int height) {
@@ -39,18 +693,6 @@ __device__ Ray center_camera_ray_gpu(const Camera& camera, int x, int y, int wid
 
 __device__ Ray jittered_camera_ray_gpu(const Camera& camera, int x, int y, int width, int height, float jitter_x, float jitter_y) {
     return camera_ray_with_sample(camera, x, y, width, height, 0.5f + jitter_x, 0.5f + jitter_y);
-}
-
-__device__ uint32_t primary_object_id_gpu(const GpuHit& hit) {
-    if (hit.mesh >= 0) return static_cast<uint32_t>(hit.mesh + 1);
-    if (hit.sphere >= 0) return 0x20000000u | static_cast<uint32_t>(hit.sphere + 1);
-    if (hit.triangle >= 0) return 0x40000000u | static_cast<uint32_t>(hit.triangle + 1);
-    if (hit.material >= 0) return 0x80000000u | static_cast<uint32_t>(hit.material + 1);
-    return 0u;
-}
-
-__device__ Vec3 material_base_color_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
-    return mul(material.albedo, sample_texture_gpu(scene, material.texture_index, material_base_uv_gpu(material, uv)));
 }
 
 __device__ void write_primary_aov_gpu(
@@ -91,7 +733,7 @@ __device__ void write_primary_aov_gpu(
             hit_emission = emitted_radiance_gpu(light, material, light.emission, hit_emission, light.light_double_sided != 0, ray.direction);
         }
         const Vec3 forward = dnormalize(sub(scene.camera.target, scene.camera.position));
-        albedo[idx] = svgf_max_gpu(material_base_color_gpu(scene, material, hit.uv), 0.001f);
+        albedo[idx] = svgf_max_gpu(material_base_color_svgf_gpu(scene, settings, material, hit, ray), 0.001f);
         emission[idx] = svgf_max_gpu(hit_emission);
         normal[idx] = hit.normal;
         world_position[idx] = hit.position;

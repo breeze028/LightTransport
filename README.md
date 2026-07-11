@@ -64,6 +64,8 @@ Examples:
 .\build\Release\lt_render.exe path\to\model.glb model.png --cpu
 .\build\Release\lt_render.exe https://example.com/model.glb remote.png --cpu
 .\build\Release\lt_render.exe scenes\cornell.lt mis.png --cuda --mis --mis-heuristic balance
+.\build\Release\lt_render.exe scenes\cornell.lt wavefront.png --cuda --cuda-wavefront --spp 1
+.\build\Release\lt_render.exe scenes\cornell.lt megakernel.png --cuda --cuda-megakernel --spp 1
 ```
 
 SVGF:

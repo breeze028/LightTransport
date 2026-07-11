@@ -668,13 +668,14 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                     bool blocked = false;
                     const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
                     Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
+                    float shadow_remaining = dist - 0.01f;
                     for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
                         GpuHit shadow_hit;
+                        shadow_hit.t = shadow_remaining;
                         if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
                             break;
                         }
-                        const float shadow_dist = sqrtf(ddot(sub(shadow_hit.position, hit.position), sub(shadow_hit.position, hit.position)));
-                        if (shadow_dist >= dist - 0.01f || shadow_hit.triangle == light_index) {
+                        if (shadow_hit.triangle == light_index) {
                             break;
                         }
                         const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
@@ -682,6 +683,8 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                             shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
                             material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
                             shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
+                            shadow_remaining -= shadow_hit.t + 0.002f;
+                            if (shadow_remaining <= 0.001f) break;
                             continue;
                         }
                         blocked = true;
@@ -754,18 +757,20 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         bool blocked = false;
         const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
         Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
+        float shadow_remaining = dist - 0.01f;
         for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
             GpuHit shadow_hit;
+            shadow_hit.t = shadow_remaining;
             if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
                 break;
             }
-            const float shadow_dist = sqrtf(ddot(sub(shadow_hit.position, hit.position), sub(shadow_hit.position, hit.position)));
-            if (shadow_dist >= dist - 0.01f) break;
             const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
             if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
                 shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
                 material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
                 shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
+                shadow_remaining -= shadow_hit.t + 0.002f;
+                if (shadow_remaining <= 0.001f) break;
                 continue;
             }
             blocked = true;

@@ -1416,7 +1416,10 @@ void launch_render_task() {
         : g_editor.renderer;
     lt::RasterizedGBufferInterop gbuffer_interop;
     framebuffer.aov.rasterized = false;
-    if (lt::svgf_denoising_enabled(settings) && settings.svgf_rasterized_gbuffer) {
+    const bool wavefront_svgf_cuda =
+        renderer == static_cast<lt::IRenderer*>(&g_editor.cuda) &&
+        settings.cuda_wavefront;
+    if (lt::svgf_denoising_enabled(settings) && settings.svgf_rasterized_gbuffer && !wavefront_svgf_cuda) {
         if (renderer == static_cast<lt::IRenderer*>(&g_editor.cuda)) {
             render_svgf_gbuffer_interop(g_solid_preview, scene, g_editor.viewport_size, settings, gbuffer_interop);
         } else {
@@ -4078,6 +4081,11 @@ void draw_properties() {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
             }
+            ImGui::BeginDisabled(!using_cuda || lt::svgf_denoising_enabled(g_editor.settings));
+            if (ImGui::Checkbox("CUDA Wavefront (experimental)", &g_editor.settings.cuda_wavefront)) {
+                reset_accumulation();
+            }
+            ImGui::EndDisabled();
             const char* denoisers[] = {"Off", "SVGF"};
             int denoiser = static_cast<int>(g_editor.settings.denoiser_mode);
             if (ImGui::Combo("Denoiser", &denoiser, denoisers, IM_ARRAYSIZE(denoisers))) {

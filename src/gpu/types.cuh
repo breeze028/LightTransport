@@ -82,6 +82,18 @@ struct GpuTriangle {
     int has_lightmap = 0;
 };
 
+// Kept separate from GpuTriangle so candidate tests during BVH traversal do
+// not fetch normal, UV, tangent, lightmap, and emission data before a hit.
+struct GpuTraversalTriangle {
+    Vec3 v0;
+    Vec3 edge1;
+    Vec3 edge2;
+    int material_and_flags = 0;
+};
+
+constexpr int kTraversalMaterialAlphaBit = 0x40000000;
+constexpr int kTraversalMaterialIndexMask = kTraversalMaterialAlphaBit - 1;
+
 struct GpuSphere {
     Vec3 center;
     float radius = 0.5f;
@@ -96,6 +108,13 @@ struct GpuBvhNode {
     int right = -1;
     int first = 0;
     int count = 0;
+};
+
+struct GpuTraversalBvhNode {
+    Vec3 bounds_min;
+    Vec3 bounds_max;
+    int left_or_first = -1;
+    int right_or_neg_count = -1;
 };
 
 struct GpuMeshInstance {
@@ -162,15 +181,18 @@ struct GpuScene {
     GpuMaterial* materials = nullptr;
     GpuTexture* textures = nullptr;
     GpuTriangle* triangles = nullptr;
+    GpuTraversalTriangle* traversal_triangles = nullptr;
     GpuSphere* spheres = nullptr;
     int* triangle_indices = nullptr;
     int* light_indices = nullptr;
     GpuDirectionalLight* directional_lights = nullptr;
     GpuPointLight* point_lights = nullptr;
     GpuBvhNode* bvh_nodes = nullptr;
+    GpuTraversalBvhNode* traversal_bvh_nodes = nullptr;
     GpuMeshInstance* mesh_instances = nullptr;
     int* mesh_instance_indices = nullptr;
     GpuBvhNode* tlas_nodes = nullptr;
+    GpuTraversalBvhNode* traversal_tlas_nodes = nullptr;
     GpuIrradianceVolume irradiance_volume;
     GpuLightmap lightmap;
 };
@@ -180,15 +202,18 @@ struct PackedGpuScene {
     std::vector<GpuMaterial> materials;
     std::vector<GpuTexture> textures;
     std::vector<GpuTriangle> triangles;
+    std::vector<GpuTraversalTriangle> traversal_triangles;
     std::vector<GpuSphere> spheres;
     std::vector<int> triangle_indices;
     std::vector<int> light_indices;
     std::vector<GpuDirectionalLight> directional_lights;
     std::vector<GpuPointLight> point_lights;
     std::vector<GpuBvhNode> bvh_nodes;
+    std::vector<GpuTraversalBvhNode> traversal_bvh_nodes;
     std::vector<GpuMeshInstance> mesh_instances;
     std::vector<int> mesh_instance_indices;
     std::vector<GpuBvhNode> tlas_nodes;
+    std::vector<GpuTraversalBvhNode> traversal_tlas_nodes;
 };
 
 struct GpuHit {
@@ -206,6 +231,15 @@ struct GpuHit {
     Vec3 emission;
     bool has_lightmap = false;
     bool front_face = true;
+};
+
+struct GpuCompactHit {
+    float t = kInfinity;
+    float u = 0.0f;
+    float v = 0.0f;
+    int material = -1;
+    int triangle = -1;
+    int sphere = -1;
 };
 
 struct GpuMaterialSample {

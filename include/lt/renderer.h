@@ -170,6 +170,7 @@ struct RenderSettings {
     char lightmap_cache_key[1024] = {};
     LightmapBakeProgress* lightmap_bake_progress = nullptr;
     DenoiserMode denoiser_mode = DenoiserMode::Off;
+    bool cuda_wavefront = false;
     int svgf_iterations = 5;
     float svgf_alpha = 0.05f;
     float svgf_moments_alpha = 0.20f;
@@ -474,7 +475,6 @@ public:
         const RenderSettings& settings,
         Framebuffer& framebuffer,
         const RasterizedGBufferInterop& interop);
-
 private:
     void release_svgf_gbuffer_interop_cache();
     bool upload_rasterized_gbuffer_interop_to_cuda(
@@ -536,21 +536,43 @@ private:
     void* device_materials_ = nullptr;
     void* device_textures_ = nullptr;
     void* device_triangles_ = nullptr;
+    void* device_traversal_triangles_ = nullptr;
     void* device_spheres_ = nullptr;
     void* device_triangle_indices_ = nullptr;
     void* device_light_indices_ = nullptr;
     void* device_directional_lights_ = nullptr;
     void* device_point_lights_ = nullptr;
     void* device_bvh_nodes_ = nullptr;
+    void* device_traversal_bvh_nodes_ = nullptr;
     void* device_mesh_instances_ = nullptr;
     void* device_mesh_instance_indices_ = nullptr;
     void* device_tlas_nodes_ = nullptr;
+    void* device_traversal_tlas_nodes_ = nullptr;
     void* device_irradiance_volume_directions_ = nullptr;
     void* device_irradiance_volume_irradiance_ = nullptr;
     void* device_irradiance_volume_grids_ = nullptr;
     void* device_irradiance_volume_cells_ = nullptr;
     void* device_irradiance_volume_debug_probes_ = nullptr;
     void* device_lightmap_texels_ = nullptr;
+    void* device_wavefront_rays_ = nullptr;
+    void* device_wavefront_throughputs_ = nullptr;
+    void* device_wavefront_radiance_ = nullptr;
+    void* device_wavefront_previous_positions_ = nullptr;
+    void* device_wavefront_previous_bsdf_pdfs_ = nullptr;
+    void* device_wavefront_rngs_ = nullptr;
+    void* device_wavefront_pixels_ = nullptr;
+    void* device_wavefront_states_ = nullptr;
+    void* device_wavefront_compact_hits_ = nullptr;
+    void* device_wavefront_hits_ = nullptr;
+    void* device_wavefront_active_indices_ = nullptr;
+    void* device_wavefront_next_indices_ = nullptr;
+    void* device_wavefront_shade_indices_ = nullptr;
+    void* device_wavefront_shadow_indices_ = nullptr;
+    void* device_wavefront_gi_indices_ = nullptr;
+    void* device_wavefront_bsdf_indices_ = nullptr;
+    void* device_wavefront_queue_counters_ = nullptr;
+    void* device_wavefront_samples_ = nullptr;
+    void* device_wavefront_sample_sum_ = nullptr;
     std::vector<void*> texture_arrays_;
     std::vector<uint64_t> texture_objects_;
     RenderScene cached_render_scene_;
@@ -560,15 +582,18 @@ private:
     int cached_materials_ = 0;
     int cached_textures_ = 0;
     int cached_triangles_ = 0;
+    int cached_traversal_triangles_ = 0;
     int cached_spheres_ = 0;
     int cached_triangle_indices_ = 0;
     int cached_lights_ = 0;
     int cached_directional_lights_ = 0;
     int cached_point_lights_ = 0;
     int cached_bvh_nodes_ = 0;
+    int cached_traversal_bvh_nodes_ = 0;
     int cached_mesh_instances_ = 0;
     int cached_mesh_instance_indices_ = 0;
     int cached_tlas_nodes_ = 0;
+    int cached_traversal_tlas_nodes_ = 0;
     int cached_irradiance_volume_directions_ = 0;
     int cached_irradiance_volume_irradiance_ = 0;
     int cached_irradiance_volume_grids_ = 0;
