@@ -3,13 +3,647 @@ bool size_fits_int(size_t size) {
 }
 
 bool use_two_level_accel(const RenderScene& render_scene, AccelerationStructure acceleration_structure) {
-    if (acceleration_structure == AccelerationStructure::TwoLevel) {
-        return true;
-    }
-    if (acceleration_structure == AccelerationStructure::Flat) {
+    (void)render_scene;
+    return acceleration_structure == AccelerationStructure::TwoLevel;
+}
+
+bool use_wavefront_bvh8_layout(const RenderScene& render_scene, const RenderSettings& settings) {
+    if (!settings.cuda_wavefront || !use_two_level_accel(render_scene, settings.acceleration_structure)) {
         return false;
     }
-    return render_scene.mesh_instances.size() > 1;
+    constexpr size_t kMaxEstimatedBvh8Bytes = 64ull * 1024ull * 1024ull;
+    const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
+    const size_t estimated_bytes = estimated_wide_nodes * sizeof(GpuTraversalBvh8Node);
+    return estimated_bytes > 0 && estimated_bytes <= kMaxEstimatedBvh8Bytes;
+}
+
+bool use_wavefront_cwbvh_layout(const RenderScene& render_scene, const RenderSettings& settings) {
+    // CWBVH v1 is kept as an internal experiment, but is not the default
+    // wavefront layout yet. Current Sponza profiling shows it reduces register
+    // count but increases intersect frame time, so keep the production path on
+    // the full-float BVH8 baseline until the remaining CWBVH traversal pieces
+    // are implemented and pass the >=5% median / <=3% P95 acceptance gate.
+    constexpr bool kEnableExperimentalCwBvh = true;
+    if (!kEnableExperimentalCwBvh) {
+        (void)render_scene;
+        (void)settings;
+        return false;
+    }
+    if (!settings.cuda_wavefront || !use_two_level_accel(render_scene, settings.acceleration_structure)) {
+        return false;
+    }
+    constexpr size_t kMaxEstimatedCwBvhBytes = 64ull * 1024ull * 1024ull;
+    const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
+    const size_t estimated_bytes = estimated_wide_nodes * sizeof(GpuCwBvhNode) +
+        render_scene.triangle_indices.size() * 3u * sizeof(float4);
+    return estimated_bytes > 0 && estimated_bytes <= kMaxEstimatedCwBvhBytes;
+}
+
+float pack_bvh_surface_area(const Aabb& bounds) {
+    const Vec3 extent = bounds.max - bounds.min;
+    return std::max(0.0f, 2.0f * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x));
+}
+
+int pack_bvh_child_octant(const Aabb& parent_bounds, const Aabb& child_bounds) {
+    const Vec3 parent_center = (parent_bounds.min + parent_bounds.max) * 0.5f;
+    const Vec3 child_center = (child_bounds.min + child_bounds.max) * 0.5f;
+    int octant = 0;
+    if (child_center.x >= parent_center.x) octant |= 1;
+    if (child_center.y >= parent_center.y) octant |= 2;
+    if (child_center.z >= parent_center.z) octant |= 4;
+    return octant;
+}
+
+int build_traversal_bvh8_node(
+    const std::vector<BvhNode>& nodes,
+    int binary_root,
+    std::vector<int>& binary_to_wide,
+    std::vector<GpuTraversalBvh8Node>& wide_nodes)
+{
+    if (binary_root < 0 || binary_root >= static_cast<int>(nodes.size())) {
+        return -1;
+    }
+    int& cached = binary_to_wide[static_cast<size_t>(binary_root)];
+    if (cached >= 0) {
+        return cached;
+    }
+
+    const int wide_index = static_cast<int>(wide_nodes.size());
+    cached = wide_index;
+    wide_nodes.push_back({});
+
+    std::vector<int> children;
+    const BvhNode& root = nodes[static_cast<size_t>(binary_root)];
+    if (root.count > 0) {
+        children.push_back(binary_root);
+    } else {
+        if (root.left >= 0) children.push_back(root.left);
+        if (root.right >= 0) children.push_back(root.right);
+    }
+
+    while (children.size() < 8) {
+        int expand_slot = -1;
+        float expand_area = -1.0f;
+        for (int i = 0; i < static_cast<int>(children.size()); ++i) {
+            const int child_index = children[static_cast<size_t>(i)];
+            if (child_index < 0 || child_index >= static_cast<int>(nodes.size())) {
+                continue;
+            }
+            const BvhNode& child = nodes[static_cast<size_t>(child_index)];
+            if (child.count > 0 || child.left < 0 || child.right < 0) {
+                continue;
+            }
+            const float area = pack_bvh_surface_area(child.bounds);
+            if (area > expand_area) {
+                expand_area = area;
+                expand_slot = i;
+            }
+        }
+        if (expand_slot < 0) {
+            break;
+        }
+        const BvhNode& child = nodes[static_cast<size_t>(children[static_cast<size_t>(expand_slot)])];
+        children.erase(children.begin() + expand_slot);
+        children.insert(children.begin() + expand_slot, child.right);
+        children.insert(children.begin() + expand_slot, child.left);
+    }
+
+    for (int slot = 0; slot < static_cast<int>(children.size()) && slot < 8; ++slot) {
+        const int child_index = children[static_cast<size_t>(slot)];
+        if (child_index < 0 || child_index >= static_cast<int>(nodes.size())) {
+            continue;
+        }
+        const BvhNode& child = nodes[static_cast<size_t>(child_index)];
+        GpuTraversalBvh8Child gpu_child;
+        const int child_octant = pack_bvh_child_octant(root.bounds, child.bounds);
+        gpu_child.bounds_min = child.bounds.min;
+        gpu_child.bounds_max = child.bounds.max;
+        int leaf_mask = 0;
+        if (child.count > 0) {
+            leaf_mask = 1 << slot;
+            gpu_child.index = child.first;
+            gpu_child.count = child.count;
+        } else {
+            gpu_child.index = build_traversal_bvh8_node(nodes, child_index, binary_to_wide, wide_nodes);
+            gpu_child.count = 0;
+        }
+
+        GpuTraversalBvh8Node& wide = wide_nodes[static_cast<size_t>(wide_index)];
+        wide.valid_mask |= 1 << slot;
+        wide.leaf_mask |= leaf_mask;
+        wide.child_octants |= static_cast<unsigned int>(child_octant & 7) << (slot * 3);
+        wide.children[slot] = gpu_child;
+    }
+    return wide_index;
+}
+
+#if 0
+struct CwBvhBuildChild {
+    Aabb bounds;
+    int binary_node = -1;
+    int first = 0;
+    int count = 0;
+    bool leaf = false;
+};
+
+int cwbvh_effective_child_slots(const BvhNode& node) {
+    if (node.count > 0) {
+        return (node.count + 2) / 3;
+    }
+    return 1;
+}
+
+Aabb cwbvh_triangle_span_bounds(
+    const std::vector<Triangle>& triangles,
+    const std::vector<int>& indices,
+    int first,
+    int count)
+{
+    Aabb bounds;
+    for (int i = 0; i < count; ++i) {
+        const int index_offset = first + i;
+        if (index_offset < 0 || index_offset >= static_cast<int>(indices.size())) {
+            continue;
+        }
+        const int tri_index = indices[static_cast<size_t>(index_offset)];
+        if (tri_index < 0 || tri_index >= static_cast<int>(triangles.size())) {
+            continue;
+        }
+        const Triangle& tri = triangles[static_cast<size_t>(tri_index)];
+        bounds.min = min(bounds.min, min(tri.v0, min(tri.v1, tri.v2)));
+        bounds.max = max(bounds.max, max(tri.v0, max(tri.v1, tri.v2)));
+    }
+    constexpr float kBoundsEpsilon = 1.0e-4f;
+    bounds.min = bounds.min - Vec3{kBoundsEpsilon};
+    bounds.max = bounds.max + Vec3{kBoundsEpsilon};
+    return bounds;
+}
+
+void cwbvh_append_child(
+    const std::vector<Triangle>& triangles,
+    const std::vector<int>& indices,
+    const std::vector<BvhNode>& nodes,
+    int binary_node,
+    std::vector<CwBvhBuildChild>& output)
+{
+    if (binary_node < 0 || binary_node >= static_cast<int>(nodes.size())) {
+        return;
+    }
+    const BvhNode& node = nodes[static_cast<size_t>(binary_node)];
+    if (node.count <= 0) {
+        output.push_back({node.bounds, binary_node, 0, 0, false});
+        return;
+    }
+    for (int offset = 0; offset < node.count; offset += 3) {
+        const int count = std::min(3, node.count - offset);
+        output.push_back({
+            cwbvh_triangle_span_bounds(triangles, indices, node.first + offset, count),
+            binary_node,
+            node.first + offset,
+            count,
+            true,
+        });
+    }
+}
+
+std::vector<CwBvhBuildChild> cwbvh_collect_children(
+    const std::vector<Triangle>& triangles,
+    const std::vector<int>& indices,
+    const std::vector<BvhNode>& nodes,
+    int binary_root)
+{
+    std::vector<int> frontier;
+    if (binary_root < 0 || binary_root >= static_cast<int>(nodes.size())) {
+        return {};
+    }
+    const BvhNode& root = nodes[static_cast<size_t>(binary_root)];
+    if (root.count > 0) {
+        std::vector<CwBvhBuildChild> leaf_children;
+        cwbvh_append_child(triangles, indices, nodes, binary_root, leaf_children);
+        return leaf_children;
+    }
+    if (root.left >= 0) frontier.push_back(root.left);
+    if (root.right >= 0) frontier.push_back(root.right);
+
+    auto slot_count = [&]() {
+        int count = 0;
+        for (int child : frontier) {
+            if (child >= 0 && child < static_cast<int>(nodes.size())) {
+                count += cwbvh_effective_child_slots(nodes[static_cast<size_t>(child)]);
+            }
+        }
+        return count;
+    };
+
+    while (slot_count() < 8) {
+        int expand_slot = -1;
+        float expand_area = -1.0f;
+        const int available_slots = 8 - slot_count();
+        for (int i = 0; i < static_cast<int>(frontier.size()); ++i) {
+            const int child_index = frontier[static_cast<size_t>(i)];
+            if (child_index < 0 || child_index >= static_cast<int>(nodes.size())) {
+                continue;
+            }
+            const BvhNode& child = nodes[static_cast<size_t>(child_index)];
+            if (child.count > 0 || child.left < 0 || child.right < 0) {
+                continue;
+            }
+            int replacement_slots = 0;
+            if (child.left >= 0) replacement_slots += cwbvh_effective_child_slots(nodes[static_cast<size_t>(child.left)]);
+            if (child.right >= 0) replacement_slots += cwbvh_effective_child_slots(nodes[static_cast<size_t>(child.right)]);
+            const int delta = replacement_slots - cwbvh_effective_child_slots(child);
+            if (delta > available_slots) {
+                continue;
+            }
+            const float area = pack_bvh_surface_area(child.bounds);
+            if (area > expand_area) {
+                expand_area = area;
+                expand_slot = i;
+            }
+        }
+        if (expand_slot < 0) {
+            break;
+        }
+        const BvhNode& child = nodes[static_cast<size_t>(frontier[static_cast<size_t>(expand_slot)])];
+        frontier.erase(frontier.begin() + expand_slot);
+        if (child.right >= 0) frontier.insert(frontier.begin() + expand_slot, child.right);
+        if (child.left >= 0) frontier.insert(frontier.begin() + expand_slot, child.left);
+    }
+
+    std::vector<CwBvhBuildChild> children;
+    for (int child : frontier) {
+        cwbvh_append_child(triangles, indices, nodes, child, children);
+    }
+    if (children.size() > 8) {
+        children.resize(8);
+    }
+    return children;
+}
+
+int cwbvh_slot_assignment(const Aabb& parent_bounds, const Aabb& child_bounds, int slot) {
+    const Vec3 parent_centroid = (parent_bounds.min + parent_bounds.max) * 0.5f;
+    const Vec3 child_centroid = (child_bounds.min + child_bounds.max) * 0.5f;
+    const Vec3 delta = child_centroid - parent_centroid;
+    const Vec3 direction = {
+        ((slot >> 2) & 1) ? -1.0f : 1.0f,
+        ((slot >> 1) & 1) ? -1.0f : 1.0f,
+        ((slot >> 0) & 1) ? -1.0f : 1.0f,
+    };
+    return static_cast<int>((delta.x * direction.x + delta.y * direction.y + delta.z * direction.z) * 1024.0f);
+}
+
+std::array<int, 8> cwbvh_assign_slots(const Aabb& parent_bounds, const std::vector<CwBvhBuildChild>& children) {
+    std::array<int, 8> slot_to_child;
+    slot_to_child.fill(-1);
+    std::array<int, 8> child_to_slot;
+    child_to_slot.fill(-1);
+    std::array<bool, 8> slot_empty;
+    slot_empty.fill(true);
+
+    while (true) {
+        int best_slot = -1;
+        int best_child = -1;
+        int best_score = std::numeric_limits<int>::min();
+        for (int slot = 0; slot < 8; ++slot) {
+            if (!slot_empty[static_cast<size_t>(slot)]) {
+                continue;
+            }
+            for (int child = 0; child < static_cast<int>(children.size()) && child < 8; ++child) {
+                if (child_to_slot[static_cast<size_t>(child)] >= 0) {
+                    continue;
+                }
+                const int score = cwbvh_slot_assignment(parent_bounds, children[static_cast<size_t>(child)].bounds, slot);
+                if (score > best_score) {
+                    best_score = score;
+                    best_slot = slot;
+                    best_child = child;
+                }
+            }
+        }
+        if (best_slot < 0 || best_child < 0) {
+            break;
+        }
+        slot_empty[static_cast<size_t>(best_slot)] = false;
+        child_to_slot[static_cast<size_t>(best_child)] = best_slot;
+        slot_to_child[static_cast<size_t>(best_slot)] = best_child;
+    }
+    return slot_to_child;
+}
+
+int cwbvh_quant_exponent(float extent) {
+    const float safe_extent = std::max(extent, 1.0e-20f);
+    const int exponent = static_cast<int>(std::ceil(std::log2(safe_extent / 255.0f)));
+    return std::clamp(exponent, -126, 127);
+}
+
+unsigned int cwbvh_pack_exponents_and_mask(int ex, int ey, int ez, unsigned int imask) {
+    const unsigned int ux = static_cast<unsigned int>(static_cast<unsigned char>(static_cast<signed char>(ex)));
+    const unsigned int uy = static_cast<unsigned int>(static_cast<unsigned char>(static_cast<signed char>(ey)));
+    const unsigned int uz = static_cast<unsigned int>(static_cast<unsigned char>(static_cast<signed char>(ez)));
+    return ux | (uy << 8) | (uz << 16) | ((imask & 0xffu) << 24);
+}
+
+unsigned char cwbvh_meta_at(const GpuCwBvhNode& node, int slot) {
+    return static_cast<unsigned char>((node.meta4[slot >> 2] >> ((slot & 3) * 8)) & 0xffu);
+}
+
+void cwbvh_set_meta(GpuCwBvhNode& node, int slot, unsigned char meta) {
+    const int word = slot >> 2;
+    const int shift = (slot & 3) * 8;
+    node.meta4[word] &= ~(0xffu << shift);
+    node.meta4[word] |= static_cast<unsigned int>(meta) << shift;
+}
+
+bool build_cwbvh_node_at(
+    const std::vector<Triangle>& triangles,
+    const std::vector<int>& indices,
+    const std::vector<BvhNode>& source_nodes,
+    int binary_root,
+    int cwbvh_index,
+    std::vector<int>& binary_to_cwbvh,
+    std::vector<GpuCwBvhNode>& cwbvh_nodes,
+    std::vector<int>& cwbvh_triangle_indices)
+{
+    if (binary_root < 0 || binary_root >= static_cast<int>(source_nodes.size()) ||
+        cwbvh_index < 0 || cwbvh_index >= static_cast<int>(cwbvh_nodes.size())) {
+        return false;
+    }
+
+    binary_to_cwbvh[static_cast<size_t>(binary_root)] = cwbvh_index;
+    const BvhNode& source = source_nodes[static_cast<size_t>(binary_root)];
+    std::vector<CwBvhBuildChild> children = cwbvh_collect_children(triangles, indices, source_nodes, binary_root);
+    if (children.empty() || children.size() > 8) {
+        return false;
+    }
+
+    GpuCwBvhNode node;
+    node.bounds_min = source.bounds.min;
+    const std::array<int, 8> slot_to_child = cwbvh_assign_slots(source.bounds, children);
+
+    int ex = cwbvh_quant_exponent(source.bounds.max.x - source.bounds.min.x);
+    int ey = cwbvh_quant_exponent(source.bounds.max.y - source.bounds.min.y);
+    int ez = cwbvh_quant_exponent(source.bounds.max.z - source.bounds.min.z);
+    std::array<int, 8> qlo_x{};
+    std::array<int, 8> qlo_y{};
+    std::array<int, 8> qlo_z{};
+    std::array<int, 8> qhi_x{};
+    std::array<int, 8> qhi_y{};
+    std::array<int, 8> qhi_z{};
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        bool fits = true;
+        const float sx = std::ldexp(1.0f, ex);
+        const float sy = std::ldexp(1.0f, ey);
+        const float sz = std::ldexp(1.0f, ez);
+        for (int slot = 0; slot < 8; ++slot) {
+            const int child_index = slot_to_child[static_cast<size_t>(slot)];
+            if (child_index < 0) {
+                continue;
+            }
+            const Aabb& bounds = children[static_cast<size_t>(child_index)].bounds;
+            qlo_x[static_cast<size_t>(slot)] = static_cast<int>(std::floor((bounds.min.x - source.bounds.min.x) / sx));
+            qlo_y[static_cast<size_t>(slot)] = static_cast<int>(std::floor((bounds.min.y - source.bounds.min.y) / sy));
+            qlo_z[static_cast<size_t>(slot)] = static_cast<int>(std::floor((bounds.min.z - source.bounds.min.z) / sz));
+            qhi_x[static_cast<size_t>(slot)] = static_cast<int>(std::ceil((bounds.max.x - source.bounds.min.x) / sx));
+            qhi_y[static_cast<size_t>(slot)] = static_cast<int>(std::ceil((bounds.max.y - source.bounds.min.y) / sy));
+            qhi_z[static_cast<size_t>(slot)] = static_cast<int>(std::ceil((bounds.max.z - source.bounds.min.z) / sz));
+            fits = fits &&
+                qlo_x[static_cast<size_t>(slot)] >= 0 && qlo_x[static_cast<size_t>(slot)] <= 255 &&
+                qlo_y[static_cast<size_t>(slot)] >= 0 && qlo_y[static_cast<size_t>(slot)] <= 255 &&
+                qlo_z[static_cast<size_t>(slot)] >= 0 && qlo_z[static_cast<size_t>(slot)] <= 255 &&
+                qhi_x[static_cast<size_t>(slot)] >= 0 && qhi_x[static_cast<size_t>(slot)] <= 255 &&
+                qhi_y[static_cast<size_t>(slot)] >= 0 && qhi_y[static_cast<size_t>(slot)] <= 255 &&
+                qhi_z[static_cast<size_t>(slot)] >= 0 && qhi_z[static_cast<size_t>(slot)] <= 255;
+        }
+        if (fits) {
+            break;
+        }
+        ex = std::min(ex + 1, 127);
+        ey = std::min(ey + 1, 127);
+        ez = std::min(ez + 1, 127);
+        if (attempt == 15) {
+            return false;
+        }
+    }
+
+    unsigned int imask = 0;
+    int internal_count = 0;
+    for (int slot = 0; slot < 8; ++slot) {
+        const int child_index = slot_to_child[static_cast<size_t>(slot)];
+        if (child_index >= 0 && !children[static_cast<size_t>(child_index)].leaf) {
+            if (internal_count == 0) {
+                node.child_base = static_cast<int>(cwbvh_nodes.size());
+            }
+            ++internal_count;
+            imask |= 1u << slot;
+        }
+    }
+    if (internal_count > 0) {
+        cwbvh_nodes.resize(cwbvh_nodes.size() + static_cast<size_t>(internal_count));
+    }
+
+    int leaf_triangle_count = 0;
+    node.triangle_base = static_cast<int>(cwbvh_triangle_indices.size());
+    for (int slot = 0; slot < 8; ++slot) {
+        const int child_index = slot_to_child[static_cast<size_t>(slot)];
+        if (child_index < 0) {
+            continue;
+        }
+        const CwBvhBuildChild& child = children[static_cast<size_t>(child_index)];
+        node.qlo_x[slot] = static_cast<unsigned char>(std::clamp(qlo_x[static_cast<size_t>(slot)], 0, 255));
+        node.qlo_y[slot] = static_cast<unsigned char>(std::clamp(qlo_y[static_cast<size_t>(slot)], 0, 255));
+        node.qlo_z[slot] = static_cast<unsigned char>(std::clamp(qlo_z[static_cast<size_t>(slot)], 0, 255));
+        node.qhi_x[slot] = static_cast<unsigned char>(std::clamp(qhi_x[static_cast<size_t>(slot)], 0, 255));
+        node.qhi_y[slot] = static_cast<unsigned char>(std::clamp(qhi_y[static_cast<size_t>(slot)], 0, 255));
+        node.qhi_z[slot] = static_cast<unsigned char>(std::clamp(qhi_z[static_cast<size_t>(slot)], 0, 255));
+        if (child.leaf) {
+            if (child.count <= 0 || child.count > 3 || leaf_triangle_count + child.count > 31) {
+                return false;
+            }
+            const int unary_count = child.count == 1 ? 0b001 : child.count == 2 ? 0b011 : 0b111;
+            cwbvh_set_meta(node, slot, static_cast<unsigned char>((unary_count << 5) | leaf_triangle_count));
+            for (int tri = 0; tri < child.count; ++tri) {
+                const int source_index = child.first + tri;
+                if (source_index < 0 || source_index >= static_cast<int>(indices.size())) {
+                    return false;
+                }
+                cwbvh_triangle_indices.push_back(indices[static_cast<size_t>(source_index)]);
+            }
+            leaf_triangle_count += child.count;
+        }
+    }
+
+    int relative_internal = 0;
+    for (int slot = 0; slot < 8; ++slot) {
+        const int child_index = slot_to_child[static_cast<size_t>(slot)];
+        if (child_index < 0) {
+            continue;
+        }
+        const CwBvhBuildChild& child = children[static_cast<size_t>(child_index)];
+        if (!child.leaf) {
+            cwbvh_set_meta(node, slot, static_cast<unsigned char>((1u << 5) | (24u + static_cast<unsigned int>(slot))));
+            const int child_cwbvh_index = node.child_base + relative_internal++;
+            if (!build_cwbvh_node_at(triangles, indices, source_nodes, child.binary_node, child_cwbvh_index,
+                    binary_to_cwbvh, cwbvh_nodes, cwbvh_triangle_indices)) {
+                return false;
+            }
+        }
+    }
+    node.exyz_imask = cwbvh_pack_exponents_and_mask(ex, ey, ez, imask);
+    cwbvh_nodes[static_cast<size_t>(cwbvh_index)] = node;
+    return true;
+}
+
+int build_traversal_cwbvh_node(
+    const std::vector<Triangle>& triangles,
+    const std::vector<int>& indices,
+    const std::vector<BvhNode>& source_nodes,
+    int binary_root,
+    std::vector<int>& binary_to_cwbvh,
+    std::vector<GpuCwBvhNode>& cwbvh_nodes,
+    std::vector<int>& cwbvh_triangle_indices)
+{
+    if (binary_root < 0 || binary_root >= static_cast<int>(source_nodes.size())) {
+        return -1;
+    }
+    int& cached = binary_to_cwbvh[static_cast<size_t>(binary_root)];
+    if (cached >= 0) {
+        return cached;
+    }
+    const int cwbvh_index = static_cast<int>(cwbvh_nodes.size());
+    cwbvh_nodes.push_back({});
+    if (!build_cwbvh_node_at(triangles, indices, source_nodes, binary_root, cwbvh_index,
+            binary_to_cwbvh, cwbvh_nodes, cwbvh_triangle_indices)) {
+        return -1;
+    }
+    return cwbvh_index;
+}
+#endif
+
+__host__ __forceinline__ uint32_t cwbvh_float_to_uint(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+__host__ __forceinline__ float cwbvh_uint_to_float(uint32_t value) {
+    float bits = 0.0f;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float4 make_cwbvh_float4_from_tiny(const tinybvh::bvhvec4& v) {
+    return make_float4(v.x, v.y, v.z, v.w);
+}
+
+bool build_tinybvh_cwbvh_node(
+    const std::vector<Triangle>& triangles,
+    const std::vector<int>& indices,
+    const std::vector<BvhNode>& source_nodes,
+    int binary_root,
+    std::vector<int>& binary_to_cwbvh,
+    std::vector<GpuCwBvhNode>& cwbvh_nodes,
+    std::vector<float4>& cwbvh_triangles)
+{
+    if (binary_root < 0 || binary_root >= static_cast<int>(source_nodes.size())) {
+        return false;
+    }
+    int& cached = binary_to_cwbvh[static_cast<size_t>(binary_root)];
+    if (cached >= 0) {
+        return true;
+    }
+
+    std::vector<int> subtree_triangle_indices;
+    std::vector<int> stack;
+    stack.push_back(binary_root);
+    while (!stack.empty()) {
+        const int node_index = stack.back();
+        stack.pop_back();
+        if (node_index < 0 || node_index >= static_cast<int>(source_nodes.size())) {
+            return false;
+        }
+        const BvhNode& node = source_nodes[static_cast<size_t>(node_index)];
+        if (node.count > 0) {
+            if (node.first < 0 || node.first + node.count > static_cast<int>(indices.size())) {
+                return false;
+            }
+            for (int i = 0; i < node.count; ++i) {
+                subtree_triangle_indices.push_back(indices[static_cast<size_t>(node.first + i)]);
+            }
+        } else {
+            if (node.right >= 0) stack.push_back(node.right);
+            if (node.left >= 0) stack.push_back(node.left);
+        }
+    }
+
+    std::vector<tinybvh::bvhvec4> vertices;
+    vertices.reserve(subtree_triangle_indices.size() * 3u);
+    std::vector<int> local_to_global;
+    local_to_global.reserve(subtree_triangle_indices.size());
+    for (int tri_index : subtree_triangle_indices) {
+        if (tri_index < 0 || tri_index >= static_cast<int>(triangles.size())) {
+            return false;
+        }
+        const Triangle& tri = triangles[static_cast<size_t>(tri_index)];
+        vertices.emplace_back(tri.v0.x, tri.v0.y, tri.v0.z, 0.0f);
+        vertices.emplace_back(tri.v1.x, tri.v1.y, tri.v1.z, 0.0f);
+        vertices.emplace_back(tri.v2.x, tri.v2.y, tri.v2.z, 0.0f);
+        local_to_global.push_back(tri_index);
+    }
+    if (local_to_global.empty()) {
+        return false;
+    }
+
+    tinybvh::BVH8_CWBVH tiny_cwbvh;
+    tiny_cwbvh.Build(vertices.data(), static_cast<uint32_t>(local_to_global.size()));
+    if (tiny_cwbvh.bvh8Data == nullptr || tiny_cwbvh.bvh8Tris == nullptr || tiny_cwbvh.usedBlocks == 0 ||
+        (tiny_cwbvh.usedBlocks % 5u) != 0u) {
+        return false;
+    }
+
+    const int node_offset = static_cast<int>(cwbvh_nodes.size());
+    const uint32_t node_float4_count = tiny_cwbvh.usedBlocks;
+    const uint32_t node_count = node_float4_count / 5u;
+    if (!size_fits_int(cwbvh_nodes.size() + static_cast<size_t>(node_count))) {
+        return false;
+    }
+    cwbvh_nodes.resize(cwbvh_nodes.size() + static_cast<size_t>(node_count));
+    for (uint32_t node = 0; node < node_count; ++node) {
+        GpuCwBvhNode& dst = cwbvh_nodes[static_cast<size_t>(node_offset) + node];
+        for (int block = 0; block < 5; ++block) {
+            dst.block[block] = make_cwbvh_float4_from_tiny(tiny_cwbvh.bvh8Data[node * 5u + static_cast<uint32_t>(block)]);
+        }
+        uint32_t child_base = cwbvh_float_to_uint(dst.block[1].x);
+        if (child_base != 0u) {
+            child_base += static_cast<uint32_t>(node_offset);
+            dst.block[1].x = cwbvh_uint_to_float(child_base);
+        }
+    }
+
+    const uint32_t tri_float4_count = tiny_cwbvh.bvh8.idxCount * 3u;
+    const uint32_t tri_float4_offset = static_cast<uint32_t>(cwbvh_triangles.size());
+    if (!size_fits_int(cwbvh_triangles.size() + static_cast<size_t>(tri_float4_count))) {
+        return false;
+    }
+    for (uint32_t i = 0; i < tri_float4_count; ++i) {
+        cwbvh_triangles.push_back(make_cwbvh_float4_from_tiny(tiny_cwbvh.bvh8Tris[i]));
+    }
+    for (uint32_t tri = 0; tri + 2u < tri_float4_count; tri += 3u) {
+        float4& v0 = cwbvh_triangles[static_cast<size_t>(tri_float4_offset + tri + 2u)];
+        const uint32_t local_index = cwbvh_float_to_uint(v0.w);
+        if (local_index >= local_to_global.size()) {
+            return false;
+        }
+        v0.w = cwbvh_uint_to_float(static_cast<uint32_t>(local_to_global[static_cast<size_t>(local_index)]));
+    }
+    for (uint32_t node = 0; node < node_count; ++node) {
+        GpuCwBvhNode& dst = cwbvh_nodes[static_cast<size_t>(node_offset) + node];
+        uint32_t triangle_base = cwbvh_float_to_uint(dst.block[1].y);
+        triangle_base += tri_float4_offset;
+        dst.block[1].y = cwbvh_uint_to_float(triangle_base);
+    }
+
+    cached = node_offset;
+    return true;
 }
 
 bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& settings, const RenderScene& render_scene, PackedGpuScene& packed) {
@@ -251,6 +885,8 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
         return false;
     }
     gpu.use_two_level = use_two_level_accel(render_scene, settings.acceleration_structure) ? 1 : 0;
+    const bool pack_wide_bvh = use_wavefront_bvh8_layout(render_scene, settings);
+    const bool pack_cwbvh = use_wavefront_cwbvh_layout(render_scene, settings);
     gpu.triangle_count = static_cast<int>(render_scene.triangles.size());
     gpu.sphere_count = static_cast<int>(render_scene.spheres.size());
     gpu.bvh_node_count = gpu.use_two_level ? static_cast<int>(render_scene.bvh_nodes.size()) : static_cast<int>(render_scene.flat_bvh_nodes.size());
@@ -263,6 +899,38 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
     const std::vector<BvhNode>& source_bvh_nodes = gpu.use_two_level ? render_scene.bvh_nodes : render_scene.flat_bvh_nodes;
     packed.bvh_nodes.resize(source_bvh_nodes.size());
     packed.traversal_bvh_nodes.resize(source_bvh_nodes.size());
+    std::vector<int> bvh8_root_map(source_bvh_nodes.size(), -1);
+    if (pack_wide_bvh && !source_bvh_nodes.empty()) {
+        for (const RenderScene::MeshInstance& instance : render_scene.mesh_instances) {
+            if (instance.bvh_root >= 0 && instance.bvh_root < static_cast<int>(source_bvh_nodes.size())) {
+                build_traversal_bvh8_node(source_bvh_nodes, instance.bvh_root, bvh8_root_map, packed.traversal_bvh8_nodes);
+            }
+        }
+    }
+    std::vector<int> cwbvh_root_map(source_bvh_nodes.size(), -1);
+    if (pack_cwbvh && gpu.use_two_level && !source_bvh_nodes.empty()) {
+        const size_t saved_node_count = packed.traversal_cwbvh_nodes.size();
+        const size_t saved_triangle_count = packed.cwbvh_triangles.size();
+        bool cwbvh_ok = true;
+        for (const RenderScene::MeshInstance& instance : render_scene.mesh_instances) {
+            if (instance.bvh_root >= 0 && instance.bvh_root < static_cast<int>(source_bvh_nodes.size()) &&
+                !build_tinybvh_cwbvh_node(render_scene.triangles, packed.triangle_indices, source_bvh_nodes,
+                    instance.bvh_root, cwbvh_root_map, packed.traversal_cwbvh_nodes,
+                    packed.cwbvh_triangles)) {
+                cwbvh_ok = false;
+                break;
+            }
+        }
+        if (!cwbvh_ok) {
+            packed.traversal_cwbvh_nodes.resize(saved_node_count);
+            packed.cwbvh_triangles.resize(saved_triangle_count);
+            std::fill(cwbvh_root_map.begin(), cwbvh_root_map.end(), -1);
+        }
+    }
+    gpu.bvh8_node_count = static_cast<int>(packed.traversal_bvh8_nodes.size());
+    gpu.cwbvh_node_count = static_cast<int>(packed.traversal_cwbvh_nodes.size());
+    gpu.cwbvh_triangle_index_count = static_cast<int>(packed.cwbvh_triangle_indices.size());
+    gpu.cwbvh_triangle_count = static_cast<int>(packed.cwbvh_triangles.size());
     packed.mesh_instances.resize(render_scene.mesh_instances.size());
     packed.mesh_instance_indices = render_scene.mesh_instance_indices;
     packed.tlas_nodes.resize(render_scene.tlas_nodes.size());
@@ -287,7 +955,13 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
     }
     for (size_t i = 0; i < render_scene.mesh_instances.size(); ++i) {
         const RenderScene::MeshInstance& instance = render_scene.mesh_instances[i];
-        packed.mesh_instances[i] = {instance.bounds.min, instance.bounds.max, instance.bvh_root, instance.mesh};
+        const int bvh8_root = instance.bvh_root >= 0 && instance.bvh_root < static_cast<int>(bvh8_root_map.size())
+            ? bvh8_root_map[static_cast<size_t>(instance.bvh_root)]
+            : -1;
+        const int cwbvh_root = instance.bvh_root >= 0 && instance.bvh_root < static_cast<int>(cwbvh_root_map.size())
+            ? cwbvh_root_map[static_cast<size_t>(instance.bvh_root)]
+            : -1;
+        packed.mesh_instances[i] = {instance.bounds.min, instance.bounds.max, instance.bvh_root, bvh8_root, cwbvh_root, instance.mesh};
     }
     for (size_t i = 0; i < render_scene.tlas_nodes.size(); ++i) {
         const BvhNode& node = render_scene.tlas_nodes[i];
@@ -323,6 +997,16 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
                     ? kTraversalMaterialAlphaBit
                     : 0),
         };
+    }
+    for (int tri_addr = 0; tri_addr + 2 < static_cast<int>(packed.cwbvh_triangles.size()); tri_addr += 3) {
+        float4& edge2 = packed.cwbvh_triangles[static_cast<size_t>(tri_addr)];
+        const float4& v0 = packed.cwbvh_triangles[static_cast<size_t>(tri_addr + 2)];
+        const int tri_index = static_cast<int>(cwbvh_float_to_uint(v0.w));
+        if (tri_index < 0 || tri_index >= gpu.triangle_count) {
+            return false;
+        }
+        edge2.w = cwbvh_uint_to_float(static_cast<uint32_t>(
+            packed.traversal_triangles[static_cast<size_t>(tri_index)].material_and_flags));
     }
     for (int i = 0; i < gpu.sphere_count; ++i) {
         const RenderSphere& sphere = render_scene.spheres[static_cast<size_t>(i)];

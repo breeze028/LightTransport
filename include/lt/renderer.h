@@ -23,9 +23,8 @@ enum class PathSamplingMode {
 };
 
 enum class AccelerationStructure {
-    Auto = 0,
-    Flat = 1,
-    TwoLevel = 2,
+    Flat = 0,
+    TwoLevel = 1,
 };
 
 enum class IrradianceVolumeBakePhase : int {
@@ -132,7 +131,7 @@ struct RenderSettings {
     int max_bounces = 6;
     PathSamplingMode sampling_mode = PathSamplingMode::NextEventEstimation;
     MisHeuristic mis_heuristic = MisHeuristic::Power;
-    AccelerationStructure acceleration_structure = AccelerationStructure::Auto;
+    AccelerationStructure acceleration_structure = AccelerationStructure::TwoLevel;
     int stylized_samples = 8;
     int stylized_max_depth = 1;
     bool use_irradiance_volume = false;
@@ -544,6 +543,10 @@ private:
     void* device_point_lights_ = nullptr;
     void* device_bvh_nodes_ = nullptr;
     void* device_traversal_bvh_nodes_ = nullptr;
+    void* device_traversal_bvh8_nodes_ = nullptr;
+    void* device_traversal_cwbvh_nodes_ = nullptr;
+    void* device_cwbvh_triangle_indices_ = nullptr;
+    void* device_cwbvh_triangles_ = nullptr;
     void* device_mesh_instances_ = nullptr;
     void* device_mesh_instance_indices_ = nullptr;
     void* device_tlas_nodes_ = nullptr;
@@ -590,6 +593,10 @@ private:
     int cached_point_lights_ = 0;
     int cached_bvh_nodes_ = 0;
     int cached_traversal_bvh_nodes_ = 0;
+    int cached_traversal_bvh8_nodes_ = 0;
+    int cached_traversal_cwbvh_nodes_ = 0;
+    int cached_cwbvh_triangle_indices_ = 0;
+    int cached_cwbvh_triangles_ = 0;
     int cached_mesh_instances_ = 0;
     int cached_mesh_instance_indices_ = 0;
     int cached_tlas_nodes_ = 0;

@@ -117,10 +117,41 @@ struct GpuTraversalBvhNode {
     int right_or_neg_count = -1;
 };
 
+struct GpuTraversalBvh8Child {
+    Vec3 bounds_min;
+    int index = -1;
+    Vec3 bounds_max;
+    int count = 0;
+};
+
+struct GpuTraversalBvh8Node {
+    GpuTraversalBvh8Child children[8];
+    unsigned int child_octants = 0;
+    int valid_mask = 0;
+    int leaf_mask = 0;
+};
+
+enum class GpuTraversalLayout : int {
+    Binary = 0,
+    Bvh8 = 1,
+    CwBvh = 2,
+};
+
+// 80-byte compressed wide BVH node in tinybvh BVH8_CWBVH layout.
+// Stored as five float4 blocks so host conversion can copy tinybvh's output
+// directly and CUDA traversal can follow the reference encoding.
+struct GpuCwBvhNode {
+    float4 block[5];
+};
+
+static_assert(sizeof(GpuCwBvhNode) == 80, "GpuCwBvhNode must stay 80 bytes");
+
 struct GpuMeshInstance {
     Vec3 bounds_min;
     Vec3 bounds_max;
     int bvh_root = -1;
+    int bvh8_root = -1;
+    int cwbvh_root = -1;
     int mesh = -1;
 };
 
@@ -163,6 +194,10 @@ struct GpuScene {
     int triangle_count = 0;
     int sphere_count = 0;
     int bvh_node_count = 0;
+    int bvh8_node_count = 0;
+    int cwbvh_node_count = 0;
+    int cwbvh_triangle_index_count = 0;
+    int cwbvh_triangle_count = 0;
     int tlas_node_count = 0;
     int mesh_instance_count = 0;
     int use_two_level = 0;
@@ -189,6 +224,10 @@ struct GpuScene {
     GpuPointLight* point_lights = nullptr;
     GpuBvhNode* bvh_nodes = nullptr;
     GpuTraversalBvhNode* traversal_bvh_nodes = nullptr;
+    GpuTraversalBvh8Node* traversal_bvh8_nodes = nullptr;
+    GpuCwBvhNode* traversal_cwbvh_nodes = nullptr;
+    int* cwbvh_triangle_indices = nullptr;
+    float4* cwbvh_triangles = nullptr;
     GpuMeshInstance* mesh_instances = nullptr;
     int* mesh_instance_indices = nullptr;
     GpuBvhNode* tlas_nodes = nullptr;
@@ -210,6 +249,10 @@ struct PackedGpuScene {
     std::vector<GpuPointLight> point_lights;
     std::vector<GpuBvhNode> bvh_nodes;
     std::vector<GpuTraversalBvhNode> traversal_bvh_nodes;
+    std::vector<GpuTraversalBvh8Node> traversal_bvh8_nodes;
+    std::vector<GpuCwBvhNode> traversal_cwbvh_nodes;
+    std::vector<int> cwbvh_triangle_indices;
+    std::vector<float4> cwbvh_triangles;
     std::vector<GpuMeshInstance> mesh_instances;
     std::vector<int> mesh_instance_indices;
     std::vector<GpuBvhNode> tlas_nodes;

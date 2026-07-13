@@ -48,8 +48,10 @@ using namespace lt::editor;
 
 void upload_preview_texture();
 void apply_scene_render_settings(const lt::Scene& scene);
-void discard_pending_render_task();
 void reset_renderer_caches();
+
+std::shared_ptr<const lt::Scene> g_render_scene_snapshot;
+uint64_t g_render_scene_snapshot_generation = 0;
 
 void clear_modal_input_state() {
     if (!ImGui::GetCurrentContext()) {
@@ -276,19 +278,91 @@ struct EditorLoggingScope {
     }
 };
 
-void set_renderer(bool use_cuda) {
-    const bool can_use_cuda = use_cuda &&
+enum class EditorRendererVariant {
+    Cpu,
+    CudaMegakernel,
+    CudaWavefront,
+};
+
+bool cuda_renderer_available_for_scene() {
+    return g_editor.cuda.available() &&
+        !lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
+}
+
+EditorRendererVariant current_renderer_variant() {
+    if (g_editor.renderer == static_cast<lt::IRenderer*>(&g_editor.cuda)) {
+        return g_editor.settings.cuda_wavefront
+            ? EditorRendererVariant::CudaWavefront
+            : EditorRendererVariant::CudaMegakernel;
+    }
+    return EditorRendererVariant::Cpu;
+}
+
+const char* renderer_variant_name(EditorRendererVariant variant) {
+    switch (variant) {
+    case EditorRendererVariant::Cpu:
+        return "CPU Path Tracer";
+    case EditorRendererVariant::CudaMegakernel:
+        return "CUDA Megakernel Path Tracer";
+    case EditorRendererVariant::CudaWavefront:
+        return "CUDA Wavefront Path Tracer";
+    }
+    return "CPU Path Tracer";
+}
+
+bool wavefront_renderer_selected() {
+    return current_renderer_variant() == EditorRendererVariant::CudaWavefront;
+}
+
+const char* effective_renderer_variant_name() {
+    if (lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)) {
+        return renderer_variant_name(EditorRendererVariant::Cpu);
+    }
+    return renderer_variant_name(current_renderer_variant());
+}
+
+void set_renderer_variant(EditorRendererVariant requested_variant) {
+    const EditorRendererVariant previous_variant = current_renderer_variant();
+    EditorRendererVariant next_variant = requested_variant;
+    const bool requested_cuda = requested_variant != EditorRendererVariant::Cpu;
+    const bool can_use_cuda = requested_cuda &&
         g_editor.cuda.available() &&
         !lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
-    lt::IRenderer* next = can_use_cuda ? static_cast<lt::IRenderer*>(&g_editor.cuda) : static_cast<lt::IRenderer*>(&g_editor.cpu);
-    if (use_cuda && !can_use_cuda) {
+    if (requested_cuda && !can_use_cuda) {
         LT_LOG_WARN("CUDA renderer request fell back to CPU");
+        next_variant = EditorRendererVariant::Cpu;
     }
-    if (g_editor.renderer != next) {
-        g_editor.renderer = next;
-        LT_LOG_INFO("Editor renderer changed to {}", g_editor.renderer->name());
-        reset_accumulation(lt::RenderDirty::All);
+    lt::IRenderer* next_renderer = next_variant == EditorRendererVariant::Cpu
+        ? static_cast<lt::IRenderer*>(&g_editor.cpu)
+        : static_cast<lt::IRenderer*>(&g_editor.cuda);
+    const bool next_wavefront = next_variant == EditorRendererVariant::CudaWavefront;
+    lt::RenderDirty dirty = lt::RenderDirty::Render;
+    if ((previous_variant == EditorRendererVariant::CudaWavefront) != next_wavefront) {
+        dirty = dirty | lt::RenderDirty::Geometry;
     }
+    bool acceleration_changed = false;
+    if (next_wavefront && g_editor.settings.acceleration_structure != lt::AccelerationStructure::TwoLevel) {
+        g_editor.settings.acceleration_structure = lt::AccelerationStructure::TwoLevel;
+        dirty = dirty | lt::RenderDirty::Geometry;
+        acceleration_changed = true;
+    }
+
+    const bool changed =
+        g_editor.renderer != next_renderer ||
+        g_editor.settings.cuda_wavefront != next_wavefront ||
+        acceleration_changed;
+    g_editor.renderer = next_renderer;
+    g_editor.settings.cuda_wavefront = next_wavefront;
+    if (changed) {
+        LT_LOG_INFO("Editor renderer changed to {}", renderer_variant_name(next_variant));
+        reset_accumulation(dirty);
+    }
+}
+
+void set_renderer(bool use_cuda) {
+    set_renderer_variant(use_cuda
+        ? EditorRendererVariant::CudaMegakernel
+        : EditorRendererVariant::Cpu);
 }
 
 void select_mesh(int index) {
@@ -403,18 +477,22 @@ void invalidate_mesh_bounds_cache() {
     g_pick_cache.render_scene = {};
 }
 
-void discard_pending_render_task() {
-    if (!g_render_future.valid()) {
-        return;
-    }
-    g_render_future.wait();
-    (void)g_render_future.get();
+void reset_renderer_caches() {
+    g_render_scene_snapshot.reset();
+    g_render_scene_snapshot_generation = 0;
+    release_rendered_preview_resources(/*release_renderer_cache=*/true,
+                                       /*release_framebuffer=*/true);
+    g_editor.cpu.reset();
+    release_realtime_preview_resources(/*release_shaders=*/true);
 }
 
-void reset_renderer_caches() {
-    discard_pending_render_task();
-    g_editor.cpu.reset();
-    g_editor.cuda.reset();
+std::shared_ptr<const lt::Scene> render_scene_snapshot() {
+    if (!g_render_scene_snapshot ||
+        g_render_scene_snapshot_generation != g_editor.render_generation) {
+        g_render_scene_snapshot = std::make_shared<lt::Scene>(g_editor.scene);
+        g_render_scene_snapshot_generation = g_editor.render_generation;
+    }
+    return g_render_scene_snapshot;
 }
 
 void set_scene(lt::Scene scene, const std::string& path) {
@@ -1398,7 +1476,8 @@ void poll_render_result() {
 void launch_render_task() {
     if (g_editor.paused || scene_load_in_progress() || g_render_future.valid()) return;
     if (g_editor.viewport_preview_mode != ViewportPreviewMode::Rendered) return;
-    lt::Scene scene = g_editor.scene;
+    std::shared_ptr<const lt::Scene> scene_snapshot = render_scene_snapshot();
+    const lt::Scene& scene = *scene_snapshot;
     lt::RenderSettings settings = g_editor.settings;
     settings.frame_index = g_editor.frame_index;
     settings.dirty = g_editor.dirty;
@@ -1410,15 +1489,15 @@ void launch_render_task() {
         settings.camera_jitter_x = 0.0f;
         settings.camera_jitter_y = 0.0f;
     }
-    lt::Framebuffer framebuffer = g_editor.framebuffer;
     lt::IRenderer* renderer = lt::stylized_rendering_enabled(settings, scene)
         ? static_cast<lt::IRenderer*>(&g_editor.cpu)
         : g_editor.renderer;
+    const bool using_cuda_renderer = renderer == static_cast<lt::IRenderer*>(&g_editor.cuda);
+    lt::Framebuffer framebuffer = g_editor.framebuffer;
     lt::RasterizedGBufferInterop gbuffer_interop;
     framebuffer.aov.rasterized = false;
     const bool wavefront_svgf_cuda =
-        renderer == static_cast<lt::IRenderer*>(&g_editor.cuda) &&
-        settings.cuda_wavefront;
+        using_cuda_renderer && settings.cuda_wavefront;
     if (lt::svgf_denoising_enabled(settings) && settings.svgf_rasterized_gbuffer && !wavefront_svgf_cuda) {
         if (renderer == static_cast<lt::IRenderer*>(&g_editor.cuda)) {
             render_svgf_gbuffer_interop(g_solid_preview, scene, g_editor.viewport_size, settings, gbuffer_interop);
@@ -1438,7 +1517,7 @@ void launch_render_task() {
     const bool consume_lightmap_force_rebake = settings.lightmap_force_rebake;
     g_editor.dirty = lt::RenderDirty::None;
     g_render_future = std::async(std::launch::async, [
-        scene = std::move(scene),
+        scene_snapshot = std::move(scene_snapshot),
         settings,
         framebuffer = std::move(framebuffer),
         generation,
@@ -1449,9 +1528,9 @@ void launch_render_task() {
     ]() mutable {
         const auto begin = std::chrono::steady_clock::now();
         if (gbuffer_interop.valid && renderer == static_cast<lt::IRenderer*>(cuda_renderer)) {
-            cuda_renderer->render_with_rasterized_gbuffer_interop(scene, settings, framebuffer, gbuffer_interop);
+            cuda_renderer->render_with_rasterized_gbuffer_interop(*scene_snapshot, settings, framebuffer, gbuffer_interop);
         } else {
-            renderer->render(scene, settings, framebuffer);
+            renderer->render(*scene_snapshot, settings, framebuffer);
         }
         release_svgf_gbuffer_interop(gbuffer_interop);
         const auto end = std::chrono::steady_clock::now();
@@ -3495,13 +3574,9 @@ float draw_top_bar() {
         ImGui::EndMenu();
     }
     ImGui::Separator();
-    const lt::IRenderer* effective_renderer =
-        lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene)
-            ? static_cast<const lt::IRenderer*>(&g_editor.cpu)
-            : g_editor.renderer;
     ImGui::Text("%s | %s | samples %u | %.2f ms | %s",
                 tool_mode_name(g_editor.tool_mode),
-                effective_renderer->name(),
+                effective_renderer_variant_name(),
                 g_editor.frame_index,
                 g_editor.last_sample_ms,
                 g_editor.scene_path.c_str());
@@ -4043,18 +4118,20 @@ void draw_properties() {
             }
     }
     if (active_panel == PropertiesPanel::Render) {
-            const bool using_cuda = g_editor.renderer == &g_editor.cuda;
-            const char* renderer_name = using_cuda ? "CUDA Path Tracer" : "CPU Path Tracer";
+            const EditorRendererVariant renderer_variant = current_renderer_variant();
+            const bool using_wavefront = renderer_variant == EditorRendererVariant::CudaWavefront;
+            const char* renderer_name = renderer_variant_name(renderer_variant);
             if (ImGui::BeginCombo("Renderer", renderer_name)) {
-                if (icon_selectable(EditorIcon::Cpu, "CPU Path Tracer", !using_cuda)) {
-                    set_renderer(false);
+                if (icon_selectable(EditorIcon::Cpu, "CPU Path Tracer", renderer_variant == EditorRendererVariant::Cpu)) {
+                    set_renderer_variant(EditorRendererVariant::Cpu);
                 }
-                const bool cuda_available = g_editor.cuda.available();
-                const bool cuda_disabled = !cuda_available ||
-                    lt::stylized_rendering_enabled(g_editor.settings, g_editor.scene);
+                const bool cuda_disabled = !cuda_renderer_available_for_scene();
                 ImGui::BeginDisabled(cuda_disabled);
-                if (icon_selectable(EditorIcon::Gpu, "CUDA Path Tracer", using_cuda)) {
-                    set_renderer(true);
+                if (icon_selectable(EditorIcon::Gpu, "CUDA Megakernel Path Tracer", renderer_variant == EditorRendererVariant::CudaMegakernel)) {
+                    set_renderer_variant(EditorRendererVariant::CudaMegakernel);
+                }
+                if (icon_selectable(EditorIcon::Gpu, "CUDA Wavefront Path Tracer", renderer_variant == EditorRendererVariant::CudaWavefront)) {
+                    set_renderer_variant(EditorRendererVariant::CudaWavefront);
                 }
                 ImGui::EndDisabled();
                 ImGui::EndCombo();
@@ -4081,11 +4158,6 @@ void draw_properties() {
                 g_editor.settings.max_bounces = std::clamp(g_editor.settings.max_bounces, 1, 32);
                 reset_accumulation();
             }
-            ImGui::BeginDisabled(!using_cuda || lt::svgf_denoising_enabled(g_editor.settings));
-            if (ImGui::Checkbox("CUDA Wavefront (experimental)", &g_editor.settings.cuda_wavefront)) {
-                reset_accumulation();
-            }
-            ImGui::EndDisabled();
             const char* denoisers[] = {"Off", "SVGF"};
             int denoiser = static_cast<int>(g_editor.settings.denoiser_mode);
             if (ImGui::Combo("Denoiser", &denoiser, denoisers, IM_ARRAYSIZE(denoisers))) {
@@ -4138,11 +4210,23 @@ void draw_properties() {
                 }
             }
             ImGui::Checkbox("Hide Wireframes", &g_editor.hide_dirty_wireframes);
-            const char* accel_modes[] = {"Auto", "Flat BVH", "Two-level BVH"};
-            int accel_mode = static_cast<int>(g_editor.settings.acceleration_structure);
-            if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
-                g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
+            if (using_wavefront && g_editor.settings.acceleration_structure != lt::AccelerationStructure::TwoLevel) {
+                g_editor.settings.acceleration_structure = lt::AccelerationStructure::TwoLevel;
                 reset_accumulation(lt::RenderDirty::Geometry);
+            }
+            if (using_wavefront) {
+                const char* wavefront_accel_modes[] = {"Two-level BVH (Wavefront internal)"};
+                int wavefront_accel_mode = 0;
+                ImGui::BeginDisabled(true);
+                ImGui::Combo("Acceleration", &wavefront_accel_mode, wavefront_accel_modes, IM_ARRAYSIZE(wavefront_accel_modes));
+                ImGui::EndDisabled();
+            } else {
+                const char* accel_modes[] = {"Flat BVH", "Two-level BVH"};
+                int accel_mode = static_cast<int>(g_editor.settings.acceleration_structure);
+                if (ImGui::Combo("Acceleration", &accel_mode, accel_modes, IM_ARRAYSIZE(accel_modes))) {
+                    g_editor.settings.acceleration_structure = static_cast<lt::AccelerationStructure>(accel_mode);
+                    reset_accumulation(lt::RenderDirty::Geometry);
+                }
             }
             if (icon_collapsing_header(EditorIcon::Volume, "Irradiance Volume")) {
                 if (ImGui::Checkbox("Enable Irradiance Volume", &g_editor.settings.use_irradiance_volume)) {
@@ -4960,7 +5044,7 @@ void draw_statistics_panel() {
     // --- Resolution / Renderer ---
     section("Renderer");
     begin_stats_table();
-    stat_row("Renderer", "%s", g_editor.renderer->name());
+    stat_row("Renderer", "%s", effective_renderer_variant_name());
     stat_row("Samples", "%u", g_editor.frame_index);
     stat_row("Viewport", "%dx%d",
         static_cast<int>(g_editor.viewport_size.x),
@@ -4975,7 +5059,7 @@ void draw_statistics_panel() {
         stat_row("SVGF G-Buffer", "%s", g_editor.settings.svgf_rasterized_gbuffer ? "Rasterized" : "Manual Trace");
     }
     stat_row("Acceleration", "%s",
-        g_editor.settings.acceleration_structure == lt::AccelerationStructure::Auto ? "Auto" :
+        wavefront_renderer_selected() ? "Two-level BVH (Wavefront internal)" :
         g_editor.settings.acceleration_structure == lt::AccelerationStructure::Flat ? "Flat BVH" :
         "Two-level BVH");
     end_stats_table();
@@ -5477,7 +5561,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
         g_context->OMSetRenderTargets(1, &g_main_rtv, nullptr);
         g_context->ClearRenderTargetView(g_main_rtv, clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_swap_chain->Present(1, 0);
+
+        // Rendered preview frames are produced by an asynchronous renderer task.
+        // If the UI thread blocks in a vsynced Present while that task finishes,
+        // the completed frame is not observed until the next UI tick and the GPU
+        // sits idle before the next path-tracing frame is submitted.  Present the
+        // editor UI without vsync in rendered mode and let the render task itself
+        // pace the preview; wait briefly on the future so the UI wakes as soon as
+        // a render result is ready instead of sleeping through short frames.
+        const bool rendered_preview = g_editor.viewport_preview_mode == ViewportPreviewMode::Rendered;
+        g_swap_chain->Present(rendered_preview ? 0u : 1u, 0);
+        if (rendered_preview && g_render_future.valid()) {
+            g_render_future.wait_for(std::chrono::milliseconds(1));
+            poll_render_result();
+            launch_render_task();
+        }
     }
 
     release_editor_memory();

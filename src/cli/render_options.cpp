@@ -99,7 +99,8 @@ RenderOptions parse_render_options(int argc, char** argv) {
             } else if (acceleration == "flat") {
                 options.settings.acceleration_structure = AccelerationStructure::Flat;
             } else {
-                options.settings.acceleration_structure = AccelerationStructure::Auto;
+                std::cerr << "Unknown acceleration structure '" << acceleration
+                          << "'; expected 'flat' or 'two-level'. Keeping default.\n";
             }
         } else if (argument == "--spp" && i + 1 < argc) {
             options.settings.samples_per_pixel = std::max(1, std::atoi(argv[++i]));

@@ -26,7 +26,7 @@ lt_render [scene_path] [output_path] [options...]
 | `--cpu` / `--cuda` | 后端偏好 |
 | `--mis` / `--no-mis` | MIS |
 | `--mis-heuristic balance|power` | MIS 启发式 |
-| `--accel auto|flat|two-level` | 加速结构 |
+| `--accel flat|two-level` | 加速结构 |
 | `--spp N` | 每帧每像素样本 |
 | `--frames N` | 累积帧数 |
 | `--size W H` | 输出尺寸 |
@@ -222,11 +222,16 @@ if (ImGui::DragFloat("Aperture", &g_editor.scene.camera.aperture,
 
 ## 后端选择与能力限制
 
-`set_renderer(true)` 只有在以下条件满足时才会使用 CUDA：
+编辑器 Render 面板的 `Renderer` 下拉框提供 `CPU Path Tracer`、`CUDA Megakernel Path Tracer`
+和 `CUDA Wavefront Path Tracer` 三个互斥选项。CUDA 选项只有在以下条件满足时才可用：
 
 - `cuda.available()`。
 - 当前 Scene 未启用 NPR。
 - 辐照度体积烘焙未在进行中（运行时查找 CUDA 支持）。
+
+SVGF 是 denoiser 选择，不会反向禁用 CUDA Wavefront。CUDA Wavefront 使用内部 custom/wide BVH
+layout，编辑器会固定 `Acceleration` 为 `Two-level BVH (Wavefront internal)`；切回 CPU 或 CUDA
+Megakernel 后用户可重新选择 `Flat BVH` 或 `Two-level BVH`。
 
 状态栏显示的是实际有效后端。新增 CPU-only 功能时应建立统一能力检查，而不是只在一个 UI 控件里禁用 CUDA，否则 CLI 和编辑器可能行为不一致。
 

@@ -64,9 +64,10 @@ CUDA 只拷回显示用 `rgba`，设备上的 HDR accumulation 继续保留。CP
 
 - `Flat`：遍历覆盖所有三角形的单层 BVH。
 - `TwoLevel`：先 TLAS，再进入每个 Mesh 的 BLAS。
-- `Auto`：当 mesh instance 数量大于 1 时使用 TwoLevel。
 
 CPU 选择发生在 `src/cpu/intersection.inl` 的 `use_two_level()`；GPU 选择发生在 `src/gpu/scene_upload.cuh` 的 `use_two_level_accel()`。修改策略时要保持两处一致。
+CUDA Wavefront 在编辑器中固定使用 TwoLevel，并在 CUDA backend 内部选择 custom/wide BLAS layout；
+这不是用户可见的 `AccelerationStructure` 枚举值。
 
 BVH 构建使用：
 

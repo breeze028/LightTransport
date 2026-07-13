@@ -27,6 +27,9 @@
 
 #include <xatlas.h>
 
+#define TINYBVH_IMPLEMENTATION
+#include <tiny_bvh.h>
+
 namespace lt {
 namespace {
 
@@ -897,6 +900,10 @@ void CudaPathTracer::reset() {
     cudaFree(device_point_lights_);
     cudaFree(device_bvh_nodes_);
     cudaFree(device_traversal_bvh_nodes_);
+    cudaFree(device_traversal_bvh8_nodes_);
+    cudaFree(device_traversal_cwbvh_nodes_);
+    cudaFree(device_cwbvh_triangle_indices_);
+    cudaFree(device_cwbvh_triangles_);
     cudaFree(device_mesh_instances_);
     cudaFree(device_mesh_instance_indices_);
     cudaFree(device_tlas_nodes_);
@@ -971,6 +978,10 @@ void CudaPathTracer::reset() {
     device_point_lights_ = nullptr;
     device_bvh_nodes_ = nullptr;
     device_traversal_bvh_nodes_ = nullptr;
+    device_traversal_bvh8_nodes_ = nullptr;
+    device_traversal_cwbvh_nodes_ = nullptr;
+    device_cwbvh_triangle_indices_ = nullptr;
+    device_cwbvh_triangles_ = nullptr;
     device_mesh_instances_ = nullptr;
     device_mesh_instance_indices_ = nullptr;
     device_tlas_nodes_ = nullptr;
@@ -1015,6 +1026,10 @@ void CudaPathTracer::reset() {
     cached_point_lights_ = 0;
     cached_bvh_nodes_ = 0;
     cached_traversal_bvh_nodes_ = 0;
+    cached_traversal_bvh8_nodes_ = 0;
+    cached_traversal_cwbvh_nodes_ = 0;
+    cached_cwbvh_triangle_indices_ = 0;
+    cached_cwbvh_triangles_ = 0;
     cached_mesh_instances_ = 0;
     cached_mesh_instance_indices_ = 0;
     cached_tlas_nodes_ = 0;
@@ -1570,6 +1585,10 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !upload_buffer(device_point_lights_, cached_point_lights_, packed.point_lights) ||
             !upload_buffer(device_bvh_nodes_, cached_bvh_nodes_, packed.bvh_nodes) ||
             !upload_buffer(device_traversal_bvh_nodes_, cached_traversal_bvh_nodes_, packed.traversal_bvh_nodes) ||
+            !upload_buffer(device_traversal_bvh8_nodes_, cached_traversal_bvh8_nodes_, packed.traversal_bvh8_nodes) ||
+            !upload_buffer(device_traversal_cwbvh_nodes_, cached_traversal_cwbvh_nodes_, packed.traversal_cwbvh_nodes) ||
+            !upload_buffer(device_cwbvh_triangle_indices_, cached_cwbvh_triangle_indices_, packed.cwbvh_triangle_indices) ||
+            !upload_buffer(device_cwbvh_triangles_, cached_cwbvh_triangles_, packed.cwbvh_triangles) ||
             !upload_buffer(device_mesh_instances_, cached_mesh_instances_, packed.mesh_instances) ||
             !upload_buffer(device_mesh_instance_indices_, cached_mesh_instance_indices_, packed.mesh_instance_indices) ||
             !upload_buffer(device_tlas_nodes_, cached_tlas_nodes_, packed.tlas_nodes) ||
@@ -1589,6 +1608,10 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         packed.scene.point_lights = static_cast<GpuPointLight*>(device_point_lights_);
         packed.scene.bvh_nodes = static_cast<GpuBvhNode*>(device_bvh_nodes_);
         packed.scene.traversal_bvh_nodes = static_cast<GpuTraversalBvhNode*>(device_traversal_bvh_nodes_);
+        packed.scene.traversal_bvh8_nodes = static_cast<GpuTraversalBvh8Node*>(device_traversal_bvh8_nodes_);
+        packed.scene.traversal_cwbvh_nodes = static_cast<GpuCwBvhNode*>(device_traversal_cwbvh_nodes_);
+        packed.scene.cwbvh_triangle_indices = static_cast<int*>(device_cwbvh_triangle_indices_);
+        packed.scene.cwbvh_triangles = static_cast<float4*>(device_cwbvh_triangles_);
         packed.scene.mesh_instances = static_cast<GpuMeshInstance*>(device_mesh_instances_);
         packed.scene.mesh_instance_indices = static_cast<int*>(device_mesh_instance_indices_);
         packed.scene.tlas_nodes = static_cast<GpuBvhNode*>(device_tlas_nodes_);
@@ -1694,8 +1717,12 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         GpuWavefrontSvgfAov svgf_aov) -> cudaError_t {
         const int pixel_count = static_cast<int>(pixels);
         const int queue_block_size = 256;
+        const int intersect_block_size = 128;
         const auto queue_grid_size = [queue_block_size](int count) {
             return (count + queue_block_size - 1) / queue_block_size;
+        };
+        const auto intersect_grid_size = [intersect_block_size](int count) {
+            return (count + intersect_block_size - 1) / intersect_block_size;
         };
         GpuWavefrontPaths paths{
             static_cast<Ray*>(device_wavefront_rays_),
@@ -1752,6 +1779,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !scene.directional_lights.empty() ||
             !scene.point_lights.empty();
         const bool use_two_level = use_two_level_accel(cached_render_scene_, settings.acceleration_structure);
+        const bool use_wide_bvh = use_wavefront_bvh8_layout(cached_render_scene_, settings);
+        const bool use_cwbvh = use_wavefront_cwbvh_layout(cached_render_scene_, settings);
 
         for (int sample_index = 0;
              render_error == cudaSuccess && sample_index < settings.samples_per_pixel;
@@ -1759,6 +1788,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             int* sample_active_indices = active_indices;
             int* sample_next_indices = next_indices;
             const int full_queue_grid = queue_grid_size(pixel_count);
+            const int full_intersect_grid = intersect_grid_size(pixel_count);
             {
                 const ScopedNvtxRange range("wavefront initialize");
                 wavefront_initialize_kernel<<<queue_grid_size(pixel_count), queue_block_size>>>(
@@ -1779,39 +1809,45 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
 
                 {
                     const ScopedNvtxRange range("wavefront intersect");
-                    if (has_alpha_visibility && use_two_level && step == 0) {
-                        wavefront_intersect_kernel<true, true, true><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                    #define LT_LAUNCH_WAVEFRONT_INTERSECT(ALPHA, TWO_LEVEL, PRIMARY, LAYOUT) \
+                        wavefront_intersect_kernel<ALPHA, TWO_LEVEL, PRIMARY, LAYOUT><<<full_intersect_grid, intersect_block_size>>>( \
+                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices, \
+                            shade_indices, queue_counters, samples)
+
+                    if (has_alpha_visibility && use_two_level && use_cwbvh && step == 0) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, true, GpuTraversalLayout::CwBvh);
+                    } else if (has_alpha_visibility && use_two_level && use_cwbvh) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, false, GpuTraversalLayout::CwBvh);
+                    } else if (has_alpha_visibility && use_two_level && use_wide_bvh && step == 0) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, true, GpuTraversalLayout::Bvh8);
+                    } else if (has_alpha_visibility && use_two_level && use_wide_bvh) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, false, GpuTraversalLayout::Bvh8);
+                    } else if (has_alpha_visibility && use_two_level && step == 0) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, true, GpuTraversalLayout::Binary);
                     } else if (has_alpha_visibility && use_two_level) {
-                        wavefront_intersect_kernel<true, true, false><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, false, GpuTraversalLayout::Binary);
                     } else if (has_alpha_visibility && step == 0) {
-                        wavefront_intersect_kernel<true, false, true><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, false, true, GpuTraversalLayout::Binary);
                     } else if (has_alpha_visibility) {
-                        wavefront_intersect_kernel<true, false, false><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(true, false, false, GpuTraversalLayout::Binary);
+                    } else if (use_two_level && use_cwbvh && step == 0) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, true, true, GpuTraversalLayout::CwBvh);
+                    } else if (use_two_level && use_cwbvh) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, true, false, GpuTraversalLayout::CwBvh);
+                    } else if (use_two_level && use_wide_bvh && step == 0) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, true, true, GpuTraversalLayout::Bvh8);
+                    } else if (use_two_level && use_wide_bvh) {
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, true, false, GpuTraversalLayout::Bvh8);
                     } else if (use_two_level && step == 0) {
-                        wavefront_intersect_kernel<false, true, true><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, true, true, GpuTraversalLayout::Binary);
                     } else if (use_two_level) {
-                        wavefront_intersect_kernel<false, true, false><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, true, false, GpuTraversalLayout::Binary);
                     } else if (step == 0) {
-                        wavefront_intersect_kernel<false, false, true><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, false, true, GpuTraversalLayout::Binary);
                     } else {
-                        wavefront_intersect_kernel<false, false, false><<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, intersect_paths, compact_hits, sample_active_indices,
-                            shade_indices, queue_counters, samples);
+                        LT_LAUNCH_WAVEFRONT_INTERSECT(false, false, false, GpuTraversalLayout::Binary);
                     }
+                    #undef LT_LAUNCH_WAVEFRONT_INTERSECT
                 }
 
                 {

@@ -106,6 +106,7 @@ add_library(lt_core
 target_include_directories(lt_core PUBLIC include)
 target_include_directories(lt_core PRIVATE ${STB_INCLUDE_DIR})
 target_include_directories(lt_core PRIVATE external/ufbx)
+target_include_directories(lt_core PRIVATE external/tinybvh)
 target_include_directories(lt_core PRIVATE ${XATLAS_INCLUDE_DIR})
 target_link_libraries(lt_core PUBLIC ${LT_SPDLOG_TARGET})
 if(XATLAS_LIBRARY)

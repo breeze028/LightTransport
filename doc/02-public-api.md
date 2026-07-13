@@ -294,7 +294,7 @@ struct MaterialInput {
 | `samples_per_pixel` | 当前帧每像素样本数 |
 | `max_bounces` | 最大路径顶点数 |
 | `use_mis`、`mis_heuristic` | 直接光与 BSDF 的 MIS |
-| `acceleration_structure` | Auto、Flat 或 TwoLevel |
+| `acceleration_structure` | Flat 或 TwoLevel |
 | `stylized_samples` | 每个 NPR 顶点的内部估计样本数 |
 | `stylized_max_depth` | 一条路径最多风格化多少个表面 |
 | `use_irradiance_volume` | 是否在路径追踪中查询辐照度体积间接光 |

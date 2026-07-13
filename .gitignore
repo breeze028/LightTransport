@@ -67,7 +67,9 @@ MinSizeRel/
 *.ivol
 
 # Local large assets and generated scene data
-external/
+external/*
+!external/tinybvh/
+!external/tinybvh/tiny_bvh.h
 logs/
 papers/
 tmp/

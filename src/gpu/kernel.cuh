@@ -360,7 +360,7 @@ __global__ void wavefront_promote_next_kernel(GpuWavefrontQueueCounters* queue_c
         queue_counters->num_queued[GpuWavefrontQueueNextRay];
 }
 
-template <bool AlphaVisibility, bool TwoLevel, bool Primary>
+template <bool AlphaVisibility, bool TwoLevel, bool Primary, GpuTraversalLayout Layout>
 __global__ void wavefront_intersect_kernel(
     const GpuScene* scene_ptr,
     RenderSettings settings,
@@ -388,7 +388,7 @@ __global__ void wavefront_intersect_kernel(
     int transparent_steps = wavefront_transparent_steps(path);
     for (;;) {
         GpuCompactHit hit;
-        if (!intersect_compact_gpu<TwoLevel>(scene, ray, hit)) {
+        if (!intersect_compact_gpu<TwoLevel, Layout>(scene, ray, hit)) {
             path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
                 mul(path.throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
             finish_wavefront_path(path, samples);

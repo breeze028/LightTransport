@@ -167,13 +167,8 @@ bool intersect_blas(const RenderScene& render_scene, const Ray& ray, int root, H
 }
 
 bool use_two_level(const RenderScene& render_scene, AccelerationStructure acceleration_structure) {
-    if (acceleration_structure == AccelerationStructure::TwoLevel) {
-        return true;
-    }
-    if (acceleration_structure == AccelerationStructure::Flat) {
-        return false;
-    }
-    return render_scene.mesh_instances.size() > 1;
+    (void)render_scene;
+    return acceleration_structure == AccelerationStructure::TwoLevel;
 }
 
 bool intersect_scene(const RenderScene& render_scene, const Ray& ray, Hit& hit, AccelerationStructure acceleration_structure) {
