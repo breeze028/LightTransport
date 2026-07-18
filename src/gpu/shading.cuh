@@ -2,6 +2,10 @@ __host__ __device__ bool has_light_emission_gpu(Vec3 emission) {
     return emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f;
 }
 
+__host__ __device__ float emissive_intensity_scale_gpu(const RenderSettings& settings) {
+    return fmaxf(0.0f, settings.emissive_intensity_scale);
+}
+
 __host__ __device__ bool finite_vec_gpu(Vec3 v) {
     return isfinite(v.x) && isfinite(v.y) && isfinite(v.z);
 }
@@ -161,8 +165,9 @@ __device__ Vec2 material_emission_uv_gpu(const GpuMaterial& material, Vec2 uv) {
     return transform_uv_gpu(uv, material.emission_texture_offset, material.emission_texture_scale, material.emission_texture_rotation);
 }
 
-__device__ Vec3 material_emission_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
-    return mul(material.emission, sample_texture_gpu(scene, material.emission_texture_index, material_emission_uv_gpu(material, uv)));
+__device__ Vec3 material_emission_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv, const RenderSettings& settings) {
+    return mul(mul(material.emission, sample_texture_gpu(scene, material.emission_texture_index, material_emission_uv_gpu(material, uv))),
+        emissive_intensity_scale_gpu(settings));
 }
 
 __device__ float material_opacity_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv) {
@@ -662,7 +667,7 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                 const GpuMaterial light_material = scene.materials[light.material];
                 const float ldot_raw = ddot(mul(light.normal, -1.0f), light_dir);
                 const bool mesh_light_double_sided = light.light_double_sided != 0;
-                const bool material_emissive_double_sided = !has_light_emission_gpu(light.emission) && light_material.double_sided && has_light_emission_gpu(material_emission_gpu(scene, light_material, light_uv));
+                const bool material_emissive_double_sided = !has_light_emission_gpu(light.emission) && light_material.double_sided && has_light_emission_gpu(material_emission_gpu(scene, light_material, light_uv, settings));
                 const float ldot = mesh_light_double_sided || material_emissive_double_sided ? fabsf(ldot_raw) : fmaxf(0.0f, ldot_raw);
                 if (ndotl > 0.0f && ldot > 0.0f) {
                     bool blocked = false;
@@ -692,7 +697,7 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                     }
                     const float light_pmf = 1.0f / static_cast<float>(scene.light_count);
                     const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, hit.position, light_point, light_pmf);
-                    const Vec3 light_emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, light_uv), light.light_double_sided != 0, light_dir);
+                    const Vec3 light_emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, light_uv, settings), light.light_double_sided != 0, light_dir);
                     if (!blocked && isfinite(light_pdf) && light_pdf > 0.0f && has_light_emission_gpu(light_emission)) {
                         const float bsdf_pdf = material_pdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv);
                         if (isfinite(bsdf_pdf) && bsdf_pdf >= 0.0f) {
@@ -1085,11 +1090,11 @@ __device__ Vec3 trace_gpu(const GpuScene& scene, Ray ray, uint32_t& rng, const R
             continue;
         }
         hit.normal = apply_normal_map_gpu(scene, material, hit, ray.direction);
-        hit.emission = add(hit.emission, material_emission_gpu(scene, material, hit.uv));
+        hit.emission = add(hit.emission, material_emission_gpu(scene, material, hit.uv, settings));
         if (has_light_emission_gpu(hit.emission)) {
             const GpuTriangle light = hit.triangle >= 0 && hit.triangle < scene.triangle_count ? scene.triangles[hit.triangle] : GpuTriangle{};
             const GpuMaterial light_material = scene.materials[hit.material];
-            const Vec3 emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, hit.uv), light.light_double_sided != 0, ray.direction);
+            const Vec3 emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, hit.uv, settings), light.light_double_sided != 0, ray.direction);
             if (shading_bounce == 0) {
                 radiance = add(radiance, clamp_sample_radiance_gpu(mul(throughput, emission), sample_clamp));
             } else if (previous_delta) {

@@ -58,6 +58,7 @@ uint64_t lightmap_fingerprint(const RenderScene& render_scene, const Scene& scen
     hash_value(hash, std::max(1, settings.lightmap_bake_samples));
     hash_value(hash, std::max(1, settings.lightmap_bake_bounces));
     hash_value(hash, settings.lightmap_principled_gi);
+    hash_value(hash, std::max(0.0f, settings.emissive_intensity_scale));
 
     const uint64_t triangle_count = static_cast<uint64_t>(render_scene.triangles.size());
     hash_value(hash, triangle_count);
@@ -475,7 +476,7 @@ Vec3 trace_lightmap_radiance(
         }
         Vec3 emission;
         if (first_hit.triangle >= 0 && first_hit.triangle < static_cast<int>(render_scene.triangles.size())) {
-            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(first_hit.triangle)], first_hit.uv, direction);
+            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(first_hit.triangle)], first_hit.uv, direction, bake_settings);
         }
         if (has_light_emission(emission)) {
             return {};

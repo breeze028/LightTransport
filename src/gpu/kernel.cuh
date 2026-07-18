@@ -459,7 +459,7 @@ __global__ void wavefront_direct_light_kernel(
     const GpuMaterial material = scene.materials[hit.material];
 
     hit.normal = apply_normal_map_gpu(scene, material, hit, path.ray.direction);
-    const Vec3 material_emission = material_emission_gpu(scene, material, hit.uv);
+    const Vec3 material_emission = material_emission_gpu(scene, material, hit.uv, settings);
     hit.emission = add(hit.emission, material_emission);
     if (shading_bounce == 0) {
         write_wavefront_svgf_surface_aov(scene, settings, svgf_aov, path.pixel, path.ray, hit, material, material_emission);
@@ -727,7 +727,7 @@ __device__ void write_primary_aov_gpu(
         }
 
         hit.normal = apply_normal_map_gpu(scene, material, hit, ray.direction);
-        Vec3 hit_emission = material_emission_gpu(scene, material, hit.uv);
+        Vec3 hit_emission = material_emission_gpu(scene, material, hit.uv, settings);
         if (hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
             const GpuTriangle light = scene.triangles[hit.triangle];
             hit_emission = emitted_radiance_gpu(light, material, light.emission, hit_emission, light.light_double_sided != 0, ray.direction);

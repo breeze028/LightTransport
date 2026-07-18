@@ -77,6 +77,7 @@ struct Environment {
 struct SceneRenderSettings {
     int sampling_mode = 1; // PathSamplingMode::NextEventEstimation
     int mis_heuristic = 1; // MisHeuristic::Power
+    float emissive_intensity_scale = 1.0f;
     int stylized_samples = 8;
     int stylized_max_depth = 1;
     bool use_irradiance_volume = false;

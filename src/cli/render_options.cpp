@@ -92,6 +92,8 @@ RenderOptions parse_render_options(int argc, char** argv) {
         } else if (argument == "--mis-heuristic" && i + 1 < argc) {
             const std::string heuristic = argv[++i];
             options.settings.mis_heuristic = heuristic == "balance" ? MisHeuristic::Balance : MisHeuristic::Power;
+        } else if ((argument == "--emissive-intensity-scale" || argument == "--emissive-scale") && i + 1 < argc) {
+            options.settings.emissive_intensity_scale = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
         } else if (argument == "--accel" && i + 1 < argc) {
             const std::string acceleration = argv[++i];
             if (acceleration == "two-level" || acceleration == "twolevel" || acceleration == "tlas") {

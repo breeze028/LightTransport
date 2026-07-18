@@ -887,6 +887,7 @@ lt::SceneRenderSettings capture_scene_render_settings() {
     lt::SceneRenderSettings settings;
     settings.sampling_mode = static_cast<int>(g_editor.settings.sampling_mode);
     settings.mis_heuristic = static_cast<int>(g_editor.settings.mis_heuristic);
+    settings.emissive_intensity_scale = g_editor.settings.emissive_intensity_scale;
     settings.stylized_samples = g_editor.settings.stylized_samples;
     settings.stylized_max_depth = g_editor.settings.stylized_max_depth;
     settings.use_irradiance_volume = g_editor.settings.use_irradiance_volume;
@@ -930,6 +931,7 @@ void apply_scene_render_settings(const lt::Scene& scene) {
     const lt::SceneRenderSettings& settings = scene.render_settings;
     g_editor.settings.sampling_mode = static_cast<lt::PathSamplingMode>(settings.sampling_mode);
     g_editor.settings.mis_heuristic = static_cast<lt::MisHeuristic>(settings.mis_heuristic);
+    g_editor.settings.emissive_intensity_scale = std::max(0.0f, settings.emissive_intensity_scale);
     g_editor.settings.stylized_samples = settings.stylized_samples;
     g_editor.settings.stylized_max_depth = settings.stylized_max_depth;
     g_editor.settings.use_irradiance_volume = settings.use_irradiance_volume;
@@ -4150,6 +4152,10 @@ void draw_properties() {
                 reset_accumulation();
             }
             ImGui::EndDisabled();
+            if (ImGui::DragFloat("Emissive scale", &g_editor.settings.emissive_intensity_scale, 0.05f, 0.0f, 1000.0f, "%.2f")) {
+                g_editor.settings.emissive_intensity_scale = std::max(0.0f, g_editor.settings.emissive_intensity_scale);
+                reset_accumulation(lt::RenderDirty::Material | lt::RenderDirty::Lightmap | lt::RenderDirty::IrradianceVolume);
+            }
             if (ImGui::DragInt("Samples / frame", &g_editor.settings.samples_per_pixel, 1.0f, 1, 64)) {
                 g_editor.settings.samples_per_pixel = std::clamp(g_editor.settings.samples_per_pixel, 1, 64);
                 reset_accumulation();

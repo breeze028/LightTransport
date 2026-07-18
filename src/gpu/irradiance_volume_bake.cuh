@@ -13,6 +13,7 @@ __global__ void bake_radiance_kernel(
     int sampling_mode,
     int mis_heuristic,
     int acceleration_structure,
+    float emissive_intensity_scale,
     Vec3* probe_radiance)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -35,6 +36,7 @@ __global__ void bake_radiance_kernel(
     bake_settings.sampling_mode = static_cast<PathSamplingMode>(sampling_mode);
     bake_settings.mis_heuristic = static_cast<MisHeuristic>(mis_heuristic);
     bake_settings.acceleration_structure = static_cast<AccelerationStructure>(acceleration_structure);
+    bake_settings.emissive_intensity_scale = emissive_intensity_scale;
 
     // Probe forward through transparent surfaces (matching CPU trace_volume_radiance).
     Ray probe_ray{add(origin, mul(direction, 0.002f)), direction};
@@ -65,7 +67,7 @@ __global__ void bake_radiance_kernel(
                 light,
                 material,
                 light.emission,
-                material_emission_gpu(*scene_ptr, material, first_hit.uv),
+                material_emission_gpu(*scene_ptr, material, first_hit.uv, bake_settings),
                 light.light_double_sided != 0,
                 direction);
         }

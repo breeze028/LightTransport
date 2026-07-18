@@ -638,6 +638,12 @@ SceneLoadResult load_scene(const std::string& path) {
             scene.render_settings.sampling_mode = std::clamp(mode, 0, 2);
             scene.render_settings.mis_heuristic = std::clamp(heuristic, 0, 1);
             scene.has_render_settings = true;
+        } else if (tag == "emissive_intensity_scale" || tag == "emissive_scale") {
+            input >> scene.render_settings.emissive_intensity_scale;
+            if (!input || scene.render_settings.emissive_intensity_scale < 0.0f) {
+                return fail("Invalid emissive_intensity_scale at line " + std::to_string(line_number));
+            }
+            scene.has_render_settings = true;
         } else if (tag == "irradiance_volume") {
             int enabled = scene.render_settings.use_irradiance_volume ? 1 : 0;
             int principled_gi = scene.render_settings.irradiance_volume_principled_gi ? 1 : 0;
@@ -1255,6 +1261,8 @@ bool save_scene(const Scene& scene, const std::string& path, std::string& error)
         output << "sampling "
             << settings.sampling_mode << ' '
             << settings.mis_heuristic << '\n';
+        output << "emissive_intensity_scale "
+            << std::max(0.0f, settings.emissive_intensity_scale) << '\n';
         output << "irradiance_volume "
             << (settings.use_irradiance_volume ? 1 : 0) << ' '
             << settings.irradiance_volume_grid_resolution << ' '

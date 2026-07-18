@@ -281,6 +281,7 @@ uint64_t irradiance_volume_fingerprint(const RenderScene& render_scene, const Sc
     hash_value(hash, std::max(1, settings.irradiance_volume_bake_samples));
     hash_value(hash, std::max(1, settings.irradiance_volume_bake_bounces));
     hash_value(hash, std::clamp(settings.irradiance_volume_bounds_inset, 0.0f, 0.45f));
+    hash_value(hash, std::max(0.0f, settings.emissive_intensity_scale));
     hash_value(hash, settings.irradiance_volume_manual_bounds);
     hash_vec3(hash, settings.irradiance_volume_bounds_min);
     hash_vec3(hash, settings.irradiance_volume_bounds_max);
@@ -708,7 +709,7 @@ Vec3 trace_volume_radiance(
         }
         Vec3 emission;
         if (first_hit.triangle >= 0 && first_hit.triangle < static_cast<int>(render_scene.triangles.size())) {
-            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(first_hit.triangle)], first_hit.uv, direction);
+            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(first_hit.triangle)], first_hit.uv, direction, bake_settings);
         }
         if (has_light_emission(emission)) {
             return {};

@@ -17,6 +17,14 @@ bool has_light_emission(Vec3 emission) {
     return emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f;
 }
 
+float emissive_intensity_scale(const RenderSettings& settings) {
+    return std::max(0.0f, settings.emissive_intensity_scale);
+}
+
+Vec3 material_emission(const Scene& scene, int material_index, Vec2 uv, const RenderSettings& settings) {
+    return material_emission(scene, material_index, uv) * emissive_intensity_scale(settings);
+}
+
 bool is_finite(Vec3 v) {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
@@ -43,9 +51,9 @@ bool mesh_light_is_double_sided(const Scene& scene, int mesh_index) {
     return mesh_light_is_enabled(scene, mesh_index) && scene.meshes[static_cast<size_t>(mesh_index)].light.double_sided;
 }
 
-Vec3 emitted_radiance(const Scene& scene, const Triangle& light, Vec2 uv, Vec3 ray_direction_to_light) {
+Vec3 emitted_radiance(const Scene& scene, const Triangle& light, Vec2 uv, Vec3 ray_direction_to_light, const RenderSettings& settings) {
     const Vec3 mesh_emission = light_emission(scene, light.mesh);
-    const Vec3 mat_emission = material_emission(scene, light.material, uv);
+    const Vec3 mat_emission = material_emission(scene, light.material, uv, settings);
     const bool front_facing = dot(light.normal, -ray_direction_to_light) > 0.0f;
     Vec3 emission;
     if (has_light_emission(mesh_emission) && (mesh_light_is_double_sided(scene, light.mesh) || front_facing)) {
@@ -248,7 +256,7 @@ Vec3 estimate_direct_lighting(const RenderScene& render_scene, const Scene& scen
 
                     const float light_pmf = 1.0f / static_cast<float>(light_count);
                     const float light_pdf = light_pdf_solid_angle(scene, light, hit.position, light_point, light_pmf);
-                    const Vec3 emission = emitted_radiance(scene, light, light_uv, light_dir);
+                    const Vec3 emission = emitted_radiance(scene, light, light_uv, light_dir, settings);
                     if (!blocked && std::isfinite(light_pdf) && light_pdf > 0.0f && has_light_emission(emission)) {
                         const float bsdf_pdf = material.pdf(hit.normal, wo, light_dir, hit.uv);
                         if (std::isfinite(bsdf_pdf) && bsdf_pdf >= 0.0f) {
@@ -609,7 +617,7 @@ Vec3 trace_stylized_radiance(
     hit.normal = apply_normal_map(*material, hit, ray.direction);
     Vec3 emission;
     if (hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
-        emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction);
+        emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction, settings);
     }
     if (has_light_emission(emission)) {
         if (bounce == 0 || previous_delta) {
@@ -805,7 +813,7 @@ Vec3 trace_path(
         hit.normal = apply_normal_map(*material, hit, ray.direction);
         Vec3 emission;
         if (hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
-            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction);
+            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction, settings);
         }
         if (has_light_emission(emission)) {
             if (shading_bounce == 0) {

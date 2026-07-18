@@ -132,6 +132,7 @@ struct RenderSettings {
     PathSamplingMode sampling_mode = PathSamplingMode::NextEventEstimation;
     MisHeuristic mis_heuristic = MisHeuristic::Power;
     AccelerationStructure acceleration_structure = AccelerationStructure::TwoLevel;
+    float emissive_intensity_scale = 1.0f;
     int stylized_samples = 8;
     int stylized_max_depth = 1;
     bool use_irradiance_volume = false;

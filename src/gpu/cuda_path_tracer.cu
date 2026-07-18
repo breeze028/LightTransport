@@ -426,6 +426,7 @@ std::shared_ptr<void> build_irradiance_volume_gpu(
         static_cast<int>(settings.sampling_mode),
         static_cast<int>(settings.mis_heuristic),
         static_cast<int>(settings.acceleration_structure),
+        std::max(0.0f, settings.emissive_intensity_scale),
         static_cast<Vec3*>(dev_probe_radiance));
 
     cuda_error = cudaDeviceSynchronize();
@@ -708,6 +709,7 @@ std::shared_ptr<void> build_lightmap_gpu(
         static_cast<int>(settings.sampling_mode),
         static_cast<int>(settings.mis_heuristic),
         static_cast<int>(settings.acceleration_structure),
+        std::max(0.0f, settings.emissive_intensity_scale),
         static_cast<Vec3*>(dev_lightmap_texels),
         static_cast<uint8_t*>(dev_lightmap_valid));
 

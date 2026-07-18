@@ -70,7 +70,7 @@ void write_primary_aov(const RenderScene& render_scene,
         hit.normal = apply_normal_map(*material, hit, ray.direction);
         Vec3 emission = material->emitted(hit.uv);
         if (hit.triangle >= 0 && hit.triangle < static_cast<int>(render_scene.triangles.size())) {
-            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction);
+            emission = emitted_radiance(scene, render_scene.triangles[static_cast<size_t>(hit.triangle)], hit.uv, ray.direction, settings);
         }
         const Vec3 forward = normalize(scene.camera.target - scene.camera.position);
         aov.albedo[idx] = max(material->base_color(hit.uv), Vec3{0.001f, 0.001f, 0.001f});
