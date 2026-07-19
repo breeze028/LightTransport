@@ -155,4 +155,3 @@ inline void populate_irradiance_results(
         }
     }
 }
-

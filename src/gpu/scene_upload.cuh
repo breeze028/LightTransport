@@ -1163,7 +1163,8 @@ bool upload_environment(GpuScene* device_scene, const GpuScene& scene) {
            upload_scene_field(device_scene, offsetof(GpuScene, environment_mapping), scene.environment_mapping) &&
            upload_scene_field(device_scene, offsetof(GpuScene, environment_light_from_world_x), scene.environment_light_from_world_x) &&
            upload_scene_field(device_scene, offsetof(GpuScene, environment_light_from_world_y), scene.environment_light_from_world_y) &&
-           upload_scene_field(device_scene, offsetof(GpuScene, environment_light_from_world_z), scene.environment_light_from_world_z);
+           upload_scene_field(device_scene, offsetof(GpuScene, environment_light_from_world_z), scene.environment_light_from_world_z) &&
+           upload_scene_field(device_scene, offsetof(GpuScene, environment_sampler), scene.environment_sampler);
 }
 
 bool make_environment_gpu(const Scene& scene, GpuScene& gpu) {

@@ -22,6 +22,28 @@ enum class PathSamplingMode {
     MultipleImportanceSampling = 2,
 };
 
+enum class RestirBiasCorrection {
+    Basic = 0,
+    RayTraced = 1,
+};
+
+enum class RestirGiResamplingMode {
+    None = 0,
+    Temporal = 1,
+    TemporalSpatial = 2,
+};
+
+enum class RestirPtResamplingMode {
+    None = 0,
+    Temporal = 1,
+    TemporalSpatial = 2,
+};
+
+enum class RestirPtReconnectionMode {
+    FixedThreshold = 0,
+    Footprint = 1,
+};
+
 enum class AccelerationStructure {
     Flat = 0,
     TwoLevel = 1,
@@ -171,6 +193,19 @@ struct RenderSettings {
     LightmapBakeProgress* lightmap_bake_progress = nullptr;
     DenoiserMode denoiser_mode = DenoiserMode::Off;
     bool cuda_wavefront = false;
+    bool cuda_restir_di = false;
+    RestirBiasCorrection cuda_restir_bias_correction = RestirBiasCorrection::Basic;
+    bool cuda_restir_final_visibility_reuse = false;
+    bool cuda_restir_gi = false;
+    RestirBiasCorrection cuda_restir_gi_bias_correction = RestirBiasCorrection::Basic;
+    RestirGiResamplingMode cuda_restir_gi_resampling = RestirGiResamplingMode::TemporalSpatial;
+    bool cuda_restir_gi_final_mis = true;
+    bool cuda_restir_gi_boiling_filter = true;
+    float cuda_restir_gi_secondary_roughness = 0.5f;
+    bool cuda_restir_pt = false;
+    RestirPtResamplingMode cuda_restir_pt_resampling = RestirPtResamplingMode::TemporalSpatial;
+    int cuda_restir_pt_max_bounces = 3;
+    RestirPtReconnectionMode cuda_restir_pt_reconnection = RestirPtReconnectionMode::Footprint;
     int svgf_iterations = 5;
     float svgf_alpha = 0.05f;
     float svgf_moments_alpha = 0.20f;
@@ -577,6 +612,60 @@ private:
     void* device_wavefront_queue_counters_ = nullptr;
     void* device_wavefront_samples_ = nullptr;
     void* device_wavefront_sample_sum_ = nullptr;
+    void* device_restir_initial_ = nullptr;
+    void* device_restir_temporal_ = nullptr;
+    void* device_restir_history_ = nullptr;
+    void* device_restir_scratch_ = nullptr;
+    void* device_restir_history_surfaces_ = nullptr;
+    void* device_restir_current_surfaces_ = nullptr;
+    void* device_restir_temporal_states_ = nullptr;
+    void* device_restir_spatial_states_ = nullptr;
+    void* device_restir_visibility_rays_ = nullptr;
+    void* device_restir_visibility_results_ = nullptr;
+    void* device_restir_visibility_indices_ = nullptr;
+    void* device_restir_visibility_count_ = nullptr;
+    void* device_restir_neighbor_offsets_ = nullptr;
+    void* device_restir_environment_pmf_ = nullptr;
+    void* device_restir_environment_alias_probability_ = nullptr;
+    void* device_restir_environment_alias_index_ = nullptr;
+    void* device_restir_light_pmf_ = nullptr;
+    void* device_restir_light_alias_probability_ = nullptr;
+    void* device_restir_light_alias_index_ = nullptr;
+    void* device_restir_gi_initial_samples_ = nullptr;
+    void* device_restir_gi_secondary_compact_hits_ = nullptr;
+    void* device_restir_gi_secondary_hits_ = nullptr;
+    void* device_restir_gi_secondary_results_ = nullptr;
+    void* device_restir_gi_secondary_direct_ = nullptr;
+    void* device_restir_gi_initial_ = nullptr;
+    void* device_restir_gi_temporal_ = nullptr;
+    void* device_restir_gi_history_ = nullptr;
+    void* device_restir_gi_scratch_ = nullptr;
+    void* device_restir_gi_current_surfaces_ = nullptr;
+    void* device_restir_gi_history_surfaces_ = nullptr;
+    void* device_restir_gi_temporal_states_ = nullptr;
+    void* device_restir_gi_spatial_states_ = nullptr;
+    void* device_restir_gi_visibility_rays_ = nullptr;
+    void* device_restir_gi_visibility_results_ = nullptr;
+    void* device_restir_pt_path_states_ = nullptr;
+    void* device_restir_pt_compact_hits_ = nullptr;
+    void* device_restir_pt_hits_ = nullptr;
+    void* device_restir_pt_trace_results_ = nullptr;
+    void* device_restir_pt_active_indices_ = nullptr;
+    void* device_restir_pt_next_indices_ = nullptr;
+    void* device_restir_pt_queue_counters_ = nullptr;
+    void* device_restir_pt_nee_reservoirs_ = nullptr;
+    void* device_restir_pt_initial_ = nullptr;
+    void* device_restir_pt_temporal_ = nullptr;
+    void* device_restir_pt_history_ = nullptr;
+    void* device_restir_pt_scratch_ = nullptr;
+    void* device_restir_pt_current_surfaces_ = nullptr;
+    void* device_restir_pt_history_surfaces_ = nullptr;
+    void* device_restir_pt_temporal_states_ = nullptr;
+    void* device_restir_pt_spatial_states_ = nullptr;
+    void* device_restir_pt_visibility_rays_ = nullptr;
+    void* device_restir_pt_visibility_results_ = nullptr;
+    void* device_restir_pt_sample_ids_ = nullptr;
+    void* device_restir_pt_duplication_counts_ = nullptr;
     std::vector<void*> texture_arrays_;
     std::vector<uint64_t> texture_objects_;
     RenderScene cached_render_scene_;
@@ -620,6 +709,27 @@ private:
     Camera taa_history_camera_;
     float taa_history_jitter_x_ = 0.0f;
     float taa_history_jitter_y_ = 0.0f;
+    bool restir_history_valid_ = false;
+    bool restir_was_enabled_ = false;
+    Camera restir_history_camera_;
+    int cached_restir_environment_texels_ = 0;
+    int cached_restir_light_count_ = 0;
+    RestirBiasCorrection restir_history_bias_correction_ = RestirBiasCorrection::Basic;
+    bool restir_history_visibility_reuse_ = false;
+    bool restir_gi_history_valid_ = false;
+    bool restir_gi_was_enabled_ = false;
+    Camera restir_gi_history_camera_;
+    RestirBiasCorrection restir_gi_history_bias_correction_ = RestirBiasCorrection::Basic;
+    RestirGiResamplingMode restir_gi_history_resampling_ = RestirGiResamplingMode::TemporalSpatial;
+    bool restir_gi_history_final_mis_ = true;
+    bool restir_gi_history_boiling_filter_ = true;
+    float restir_gi_history_secondary_roughness_ = 0.5f;
+    bool restir_pt_history_valid_ = false;
+    bool restir_pt_was_enabled_ = false;
+    Camera restir_pt_history_camera_;
+    RestirPtResamplingMode restir_pt_history_resampling_ = RestirPtResamplingMode::TemporalSpatial;
+    RestirPtReconnectionMode restir_pt_history_reconnection_ = RestirPtReconnectionMode::Footprint;
+    int restir_pt_history_max_bounces_ = 3;
     RasterizedGBufferInterop svgf_gbuffer_interop_;
     void* svgf_gbuffer_cuda_resources_[5] = {};
     void* svgf_gbuffer_d3d_resources_[5] = {};

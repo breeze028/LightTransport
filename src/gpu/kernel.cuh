@@ -83,6 +83,7 @@ static constexpr uint32_t kWavefrontBounceMask = 0xffu;
 static constexpr uint32_t kWavefrontTransmissionShift = 8u;
 static constexpr uint32_t kWavefrontTransparentShift = 16u;
 static constexpr uint32_t kWavefrontPreviousDeltaBit = 1u << 24u;
+static constexpr uint32_t kWavefrontRestirDirectBit = 1u << 25u;
 
 __device__ bool wavefront_svgf_aov_enabled(GpuWavefrontSvgfAov aov) {
     return aov.albedo != nullptr && aov.emission != nullptr && aov.normal != nullptr &&
@@ -265,6 +266,16 @@ __device__ void wavefront_set_previous_delta(PathT& path, bool value) {
 }
 
 template <typename PathT>
+__device__ bool wavefront_restir_direct(const PathT& path) {
+    return (path.state & kWavefrontRestirDirectBit) != 0u;
+}
+
+template <typename PathT>
+__device__ void wavefront_set_restir_direct(PathT& path, bool value) {
+    path.state = value ? (path.state | kWavefrontRestirDirectBit) : (path.state & ~kWavefrontRestirDirectBit);
+}
+
+template <typename PathT>
 __device__ void wavefront_set_transparent_steps(PathT& path, int steps) {
     path.state = (path.state & ~(0xffu << kWavefrontTransparentShift)) |
         ((static_cast<uint32_t>(steps) & 0xffu) << kWavefrontTransparentShift);
@@ -301,6 +312,8 @@ template <typename PathT>
 __device__ void finish_wavefront_path(PathT& path, Vec3* samples) {
     samples[path.pixel] = path.radiance;
 }
+
+#include "restir_di.cuh"
 
 __global__ void wavefront_initialize_kernel(
     const GpuScene* scene_ptr,
@@ -389,8 +402,10 @@ __global__ void wavefront_intersect_kernel(
     for (;;) {
         GpuCompactHit hit;
         if (!intersect_compact_gpu<TwoLevel, Layout>(scene, ray, hit)) {
-            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
-                mul(path.throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
+            if (!(wavefront_restir_direct(path) && !wavefront_previous_delta(path))) {
+                path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
+                    mul(path.throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
+            }
             finish_wavefront_path(path, samples);
             return;
         }
@@ -469,19 +484,26 @@ __global__ void wavefront_direct_light_kernel(
         const GpuMaterial light_material = scene.materials[hit.material];
         const Vec3 emission = emitted_radiance_gpu(light, light_material, light.emission,
             material_emission, light.light_double_sided != 0, path.ray.direction);
-        if (shading_bounce == 0 || wavefront_previous_delta(path)) {
-            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(path.throughput, emission), sample_clamp));
-        } else if (settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling &&
-                   hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
-            const float light_pmf = scene.light_count > 0 ? 1.0f / static_cast<float>(scene.light_count) : 0.0f;
-            const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, path.previous_position, hit.position, light_pmf);
-            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(mul(path.throughput, emission),
-                mis_weight_gpu(path.previous_bsdf_pdf, light_pdf, static_cast<int>(settings.mis_heuristic))), sample_clamp));
-        } else if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
-            path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(path.throughput, emission), sample_clamp));
+        const bool suppress_restir_direct = wavefront_restir_direct(path) && !wavefront_previous_delta(path);
+        if (!suppress_restir_direct) {
+            if (shading_bounce == 0 || wavefront_previous_delta(path)) {
+                path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(path.throughput, emission), sample_clamp));
+            } else if (settings.sampling_mode == PathSamplingMode::MultipleImportanceSampling &&
+                       hit.triangle >= 0 && hit.triangle < scene.triangle_count) {
+                const float light_pmf = scene.light_count > 0 ? 1.0f / static_cast<float>(scene.light_count) : 0.0f;
+                const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, path.previous_position, hit.position, light_pmf);
+                path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(mul(path.throughput, emission),
+                    mis_weight_gpu(path.previous_bsdf_pdf, light_pdf, static_cast<int>(settings.mis_heuristic))), sample_clamp));
+            } else if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
+                path.radiance = add(path.radiance, clamp_sample_radiance_gpu(mul(path.throughput, emission), sample_clamp));
+            }
         }
         finish_wavefront_path(path, samples);
         return;
+    }
+
+    if (shading_bounce > 0) {
+        wavefront_set_restir_direct(path, false);
     }
 
     if (settings.use_lightmap && hit.has_lightmap && material_uses_lightmap_gi_gpu(settings, material)) {
@@ -597,6 +619,9 @@ __device__ void wavefront_sample_bsdf_to_next(
     wavefront_append_queue(next_indices,
         &queue_counters->num_queued[GpuWavefrontQueueNextRay], path_index);
 }
+
+#include "restir_gi.cuh"
+#include "restir_pt.cuh"
 
 __global__ void wavefront_direct_visibility_kernel(
     const GpuScene* scene_ptr,

@@ -61,6 +61,61 @@ RenderOptions parse_render_options(int argc, char** argv) {
             options.settings.cuda_wavefront = true;
         } else if (argument == "--cuda-megakernel") {
             options.settings.cuda_wavefront = false;
+        } else if (argument == "--restir-di") {
+            options.settings.cuda_restir_di = true;
+        } else if (argument == "--no-restir-di") {
+            options.settings.cuda_restir_di = false;
+        } else if (argument == "--restir-bias" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            options.settings.cuda_restir_bias_correction = mode == "ray-traced"
+                ? RestirBiasCorrection::RayTraced : RestirBiasCorrection::Basic;
+        } else if (argument == "--restir-final-visibility-reuse") {
+            options.settings.cuda_restir_final_visibility_reuse = true;
+        } else if (argument == "--no-restir-final-visibility-reuse") {
+            options.settings.cuda_restir_final_visibility_reuse = false;
+        } else if (argument == "--restir-gi") {
+            options.settings.cuda_restir_gi = true;
+            options.settings.cuda_restir_pt = false;
+        } else if (argument == "--no-restir-gi") {
+            options.settings.cuda_restir_gi = false;
+        } else if (argument == "--restir-gi-bias" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            options.settings.cuda_restir_gi_bias_correction = mode == "ray-traced"
+                ? RestirBiasCorrection::RayTraced : RestirBiasCorrection::Basic;
+        } else if (argument == "--restir-gi-resampling" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            options.settings.cuda_restir_gi_resampling = mode == "none"
+                ? RestirGiResamplingMode::None
+                : (mode == "temporal" ? RestirGiResamplingMode::Temporal
+                                       : RestirGiResamplingMode::TemporalSpatial);
+        } else if (argument == "--restir-gi-final-mis") {
+            options.settings.cuda_restir_gi_final_mis = true;
+        } else if (argument == "--no-restir-gi-final-mis") {
+            options.settings.cuda_restir_gi_final_mis = false;
+        } else if (argument == "--restir-gi-boiling-filter") {
+            options.settings.cuda_restir_gi_boiling_filter = true;
+        } else if (argument == "--no-restir-gi-boiling-filter") {
+            options.settings.cuda_restir_gi_boiling_filter = false;
+        } else if (argument == "--restir-gi-secondary-roughness" && i + 1 < argc) {
+            options.settings.cuda_restir_gi_secondary_roughness = std::clamp(
+                std::strtof(argv[++i], nullptr), 0.0f, 1.0f);
+        } else if (argument == "--restir-pt") {
+            options.settings.cuda_restir_pt = true;
+            options.settings.cuda_restir_gi = false;
+        } else if (argument == "--no-restir-pt") {
+            options.settings.cuda_restir_pt = false;
+        } else if (argument == "--restir-pt-resampling" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            options.settings.cuda_restir_pt_resampling = mode == "none"
+                ? RestirPtResamplingMode::None
+                : (mode == "temporal" ? RestirPtResamplingMode::Temporal
+                                        : RestirPtResamplingMode::TemporalSpatial);
+        } else if (argument == "--restir-pt-max-bounces" && i + 1 < argc) {
+            options.settings.cuda_restir_pt_max_bounces = std::clamp(std::atoi(argv[++i]), 2, 8);
+        } else if (argument == "--restir-pt-reconnection" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            options.settings.cuda_restir_pt_reconnection = mode == "fixed" || mode == "fixed-threshold"
+                ? RestirPtReconnectionMode::FixedThreshold : RestirPtReconnectionMode::Footprint;
         } else if (argument == "--verbose") {
             options.log_console_level = LogLevel::Debug;
             options.log_file_level = LogLevel::Debug;

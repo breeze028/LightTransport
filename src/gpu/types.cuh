@@ -188,6 +188,22 @@ struct GpuLightmap {
     Vec3* texels = nullptr;
 };
 
+struct GpuEnvironmentSampler {
+    int width = 0;
+    int height = 0;
+    int texel_count = 0;
+    float* pmf = nullptr;
+    float* alias_probability = nullptr;
+    int* alias_index = nullptr;
+};
+
+struct GpuLightSampler {
+    int light_count = 0;
+    float* pmf = nullptr;
+    float* alias_probability = nullptr;
+    int* alias_index = nullptr;
+};
+
 struct GpuScene {
     Camera camera;
     int material_count = 0;
@@ -234,6 +250,8 @@ struct GpuScene {
     GpuTraversalBvhNode* traversal_tlas_nodes = nullptr;
     GpuIrradianceVolume irradiance_volume;
     GpuLightmap lightmap;
+    GpuEnvironmentSampler environment_sampler;
+    GpuLightSampler restir_light_sampler;
 };
 
 struct PackedGpuScene {

@@ -1,0 +1,23 @@
+camera 0 1.4 -4   0 0.65 0   45
+
+environment 0.8 0.9 1 1
+
+sampling 1 1
+
+material white 0.72 0.72 0.72 lambertian 0.5 0
+material blue 0.18 0.3 0.8 lambertian 0.5 0
+
+sphere Ball blue 0 0.65 0 0.65 0
+
+mesh Floor white 0 0 0 0 0 0 1 1 1 4 2 0
+-3 0 -3
+3 0 -3
+3 0 3
+-3 0 3
+texcoords 4
+0 0
+1 0
+1 1
+0 1
+0 1 2
+0 2 3

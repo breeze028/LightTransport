@@ -4156,6 +4156,93 @@ void draw_properties() {
                 g_editor.settings.emissive_intensity_scale = std::max(0.0f, g_editor.settings.emissive_intensity_scale);
                 reset_accumulation(lt::RenderDirty::Material | lt::RenderDirty::Lightmap | lt::RenderDirty::IrradianceVolume);
             }
+            const bool restir_available = g_editor.settings.cuda_wavefront &&
+                g_editor.settings.sampling_mode != lt::PathSamplingMode::Unidirectional;
+            ImGui::BeginDisabled(!restir_available);
+            if (ImGui::Checkbox("RTXDI / ReSTIR DI", &g_editor.settings.cuda_restir_di)) {
+                reset_accumulation();
+            }
+            ImGui::BeginDisabled(!g_editor.settings.cuda_restir_di);
+            const char* restir_bias_modes[] = {"Basic", "Ray Traced"};
+            int restir_bias_mode = static_cast<int>(g_editor.settings.cuda_restir_bias_correction);
+            if (ImGui::Combo("ReSTIR bias correction", &restir_bias_mode, restir_bias_modes, IM_ARRAYSIZE(restir_bias_modes))) {
+                g_editor.settings.cuda_restir_bias_correction = static_cast<lt::RestirBiasCorrection>(restir_bias_mode);
+                reset_accumulation();
+            }
+            if (ImGui::Checkbox("ReSTIR final visibility reuse", &g_editor.settings.cuda_restir_final_visibility_reuse)) {
+                reset_accumulation();
+            }
+            ImGui::EndDisabled();
+            const bool restir_gi_available = restir_available && g_editor.settings.max_bounces >= 2;
+            ImGui::BeginDisabled(!restir_gi_available);
+            if (ImGui::Checkbox("RTXDI / ReSTIR GI", &g_editor.settings.cuda_restir_gi)) {
+                if (g_editor.settings.cuda_restir_gi) {
+                    g_editor.settings.cuda_restir_pt = false;
+                }
+                reset_accumulation();
+            }
+            ImGui::BeginDisabled(!g_editor.settings.cuda_restir_gi);
+            int restir_gi_bias = static_cast<int>(g_editor.settings.cuda_restir_gi_bias_correction);
+            if (ImGui::Combo("ReSTIR GI bias correction", &restir_gi_bias,
+                    restir_bias_modes, IM_ARRAYSIZE(restir_bias_modes))) {
+                g_editor.settings.cuda_restir_gi_bias_correction =
+                    static_cast<lt::RestirBiasCorrection>(restir_gi_bias);
+                reset_accumulation();
+            }
+            const char* restir_gi_modes[] = {"None", "Temporal", "Temporal + Spatial"};
+            int restir_gi_mode = static_cast<int>(g_editor.settings.cuda_restir_gi_resampling);
+            if (ImGui::Combo("ReSTIR GI resampling", &restir_gi_mode,
+                    restir_gi_modes, IM_ARRAYSIZE(restir_gi_modes))) {
+                g_editor.settings.cuda_restir_gi_resampling =
+                    static_cast<lt::RestirGiResamplingMode>(restir_gi_mode);
+                reset_accumulation();
+            }
+            const bool restir_gi_final_mis_changed =
+                ImGui::Checkbox("ReSTIR GI final MIS", &g_editor.settings.cuda_restir_gi_final_mis);
+            const bool restir_gi_boiling_changed =
+                ImGui::Checkbox("ReSTIR GI boiling filter", &g_editor.settings.cuda_restir_gi_boiling_filter);
+            if (restir_gi_final_mis_changed || restir_gi_boiling_changed) {
+                reset_accumulation();
+            }
+            if (ImGui::SliderFloat("ReSTIR GI secondary roughness",
+                    &g_editor.settings.cuda_restir_gi_secondary_roughness, 0.0f, 1.0f)) {
+                reset_accumulation();
+            }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(!restir_gi_available);
+            if (ImGui::Checkbox("RTXDI / ReSTIR PT", &g_editor.settings.cuda_restir_pt)) {
+                if (g_editor.settings.cuda_restir_pt) {
+                    g_editor.settings.cuda_restir_gi = false;
+                }
+                reset_accumulation();
+            }
+            ImGui::BeginDisabled(!g_editor.settings.cuda_restir_pt);
+            const char* restir_pt_modes[] = {"None", "Temporal", "Temporal + Spatial"};
+            int restir_pt_mode = static_cast<int>(g_editor.settings.cuda_restir_pt_resampling);
+            if (ImGui::Combo("ReSTIR PT resampling", &restir_pt_mode,
+                    restir_pt_modes, IM_ARRAYSIZE(restir_pt_modes))) {
+                g_editor.settings.cuda_restir_pt_resampling =
+                    static_cast<lt::RestirPtResamplingMode>(restir_pt_mode);
+                reset_accumulation();
+            }
+            if (ImGui::DragInt("ReSTIR PT max bounces",
+                    &g_editor.settings.cuda_restir_pt_max_bounces, 1.0f, 2, 8)) {
+                g_editor.settings.cuda_restir_pt_max_bounces =
+                    std::clamp(g_editor.settings.cuda_restir_pt_max_bounces, 2, 8);
+                reset_accumulation();
+            }
+            const char* restir_pt_reconnection_modes[] = {"Fixed threshold", "Footprint"};
+            int restir_pt_reconnection = static_cast<int>(g_editor.settings.cuda_restir_pt_reconnection);
+            if (ImGui::Combo("ReSTIR PT reconnection", &restir_pt_reconnection,
+                    restir_pt_reconnection_modes, IM_ARRAYSIZE(restir_pt_reconnection_modes))) {
+                g_editor.settings.cuda_restir_pt_reconnection =
+                    static_cast<lt::RestirPtReconnectionMode>(restir_pt_reconnection);
+                reset_accumulation();
+            }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
             if (ImGui::DragInt("Samples / frame", &g_editor.settings.samples_per_pixel, 1.0f, 1, 64)) {
                 g_editor.settings.samples_per_pixel = std::clamp(g_editor.settings.samples_per_pixel, 1, 64);
                 reset_accumulation();

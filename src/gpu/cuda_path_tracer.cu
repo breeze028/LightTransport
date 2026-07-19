@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -65,6 +66,72 @@ public:
 #include "../cpu/irradiance_volume_bake.inl"
 #include "../cpu/lightmap_bake.inl"
 
+template <bool TransparentVisibility>
+void launch_restir_visibility_trace(const GpuScene* scene, GpuWavefrontPaths paths,
+    const int* visibility_indices, const int* visibility_count,
+    const GpuRestirVisibilityRay* visibility_rays, int* visibility_results,
+    bool two_level, bool wide_bvh, bool cwbvh, int grid_size, int block_size) {
+    #define LT_LAUNCH_RESTIR_VISIBILITY_TRACE(TWO_LEVEL, LAYOUT) \
+        restir_trace_visibility_kernel<TransparentVisibility, TWO_LEVEL, LAYOUT><<<grid_size, block_size>>>( \
+            scene, paths, visibility_indices, visibility_count, visibility_rays, visibility_results)
+    if (two_level && cwbvh) {
+        LT_LAUNCH_RESTIR_VISIBILITY_TRACE(true, GpuTraversalLayout::CwBvh);
+    } else if (two_level && wide_bvh) {
+        LT_LAUNCH_RESTIR_VISIBILITY_TRACE(true, GpuTraversalLayout::Bvh8);
+    } else if (two_level) {
+        LT_LAUNCH_RESTIR_VISIBILITY_TRACE(true, GpuTraversalLayout::Binary);
+    } else if (wide_bvh) {
+        LT_LAUNCH_RESTIR_VISIBILITY_TRACE(false, GpuTraversalLayout::Bvh8);
+    } else {
+        LT_LAUNCH_RESTIR_VISIBILITY_TRACE(false, GpuTraversalLayout::Binary);
+    }
+    #undef LT_LAUNCH_RESTIR_VISIBILITY_TRACE
+}
+
+template <bool AlphaVisibility>
+void launch_restir_gi_secondary_trace(const GpuScene* scene, RenderSettings settings,
+    GpuWavefrontPaths paths, const int* bsdf_indices, const GpuWavefrontQueueCounters* queue_counters,
+    const GpuRestirGiInitialSample* initial_samples, GpuCompactHit* secondary_hits, int* results,
+    bool two_level, bool wide_bvh, bool cwbvh, int grid_size, int block_size) {
+    #define LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE(TWO_LEVEL, LAYOUT) \
+        restir_gi_trace_secondary_kernel<AlphaVisibility, TWO_LEVEL, LAYOUT><<<grid_size, block_size>>>( \
+            scene, settings, paths, bsdf_indices, queue_counters, initial_samples, secondary_hits, results)
+    if (two_level && cwbvh) {
+        LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE(true, GpuTraversalLayout::CwBvh);
+    } else if (two_level && wide_bvh) {
+        LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE(true, GpuTraversalLayout::Bvh8);
+    } else if (two_level) {
+        LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE(true, GpuTraversalLayout::Binary);
+    } else if (wide_bvh) {
+        LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE(false, GpuTraversalLayout::Bvh8);
+    } else {
+        LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE(false, GpuTraversalLayout::Binary);
+    }
+    #undef LT_LAUNCH_RESTIR_GI_SECONDARY_TRACE
+}
+
+template <bool AlphaVisibility>
+void launch_restir_pt_trace(const GpuScene* scene, GpuRestirPtPathState* states,
+    GpuCompactHit* compact_hits, int* results, const int* active_indices,
+    const GpuRestirPtQueueCounters* counters, bool two_level, bool wide_bvh,
+    bool cwbvh, int grid_size, int block_size) {
+    #define LT_LAUNCH_RESTIR_PT_TRACE(TWO_LEVEL, LAYOUT) \
+        restir_pt_trace_kernel<AlphaVisibility, TWO_LEVEL, LAYOUT><<<grid_size, block_size>>>( \
+            scene, states, compact_hits, results, active_indices, counters)
+    if (two_level && cwbvh) {
+        LT_LAUNCH_RESTIR_PT_TRACE(true, GpuTraversalLayout::CwBvh);
+    } else if (two_level && wide_bvh) {
+        LT_LAUNCH_RESTIR_PT_TRACE(true, GpuTraversalLayout::Bvh8);
+    } else if (two_level) {
+        LT_LAUNCH_RESTIR_PT_TRACE(true, GpuTraversalLayout::Binary);
+    } else if (wide_bvh) {
+        LT_LAUNCH_RESTIR_PT_TRACE(false, GpuTraversalLayout::Bvh8);
+    } else {
+        LT_LAUNCH_RESTIR_PT_TRACE(false, GpuTraversalLayout::Binary);
+    }
+    #undef LT_LAUNCH_RESTIR_PT_TRACE
+}
+
 struct GBufferFloat4 {
     float x, y, z, w;
 };
@@ -106,6 +173,176 @@ struct PackedGpuLightmap {
     GpuLightmap lightmap;
     std::vector<Vec3> texels;
 };
+
+struct PackedGpuEnvironmentSampler {
+    GpuEnvironmentSampler sampler;
+    std::vector<float> pmf;
+    std::vector<float> alias_probability;
+    std::vector<int> alias_index;
+};
+
+struct PackedGpuLightSampler {
+    GpuLightSampler sampler;
+    std::vector<float> pmf;
+    std::vector<float> alias_probability;
+    std::vector<int> alias_index;
+};
+
+std::vector<Vec2> build_restir_neighbor_offsets() {
+    std::vector<Vec2> offsets(static_cast<size_t>(kRestirNeighborOffsetCount));
+    uint32_t state = 0x6d2b79f5u;
+    const auto next_random = [&state]() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return (static_cast<float>(state) + 0.5f) * (1.0f / 4294967296.0f);
+    };
+    for (Vec2& offset : offsets) {
+        const float radius = std::sqrt(next_random());
+        const float angle = 2.0f * kPi * next_random();
+        offset = {radius * std::cos(angle), radius * std::sin(angle)};
+    }
+    return offsets;
+}
+
+float environment_sampler_luminance(Vec3 color) {
+    return std::max(0.0f, color.x * 0.2126f + color.y * 0.7152f + color.z * 0.0722f);
+}
+
+bool build_alias_distribution(const std::vector<float>& weights, std::vector<float>& pmf,
+    std::vector<float>& alias_probability, std::vector<int>& alias_index) {
+    pmf.clear();
+    alias_probability.clear();
+    alias_index.clear();
+    if (weights.empty()) {
+        return true;
+    }
+    float total = 0.0f;
+    for (float weight : weights) {
+        total += std::max(0.0f, weight);
+    }
+    if (!(total > 0.0f) || !std::isfinite(total)) {
+        return false;
+    }
+    const int count = static_cast<int>(weights.size());
+    pmf.resize(weights.size());
+    alias_probability.assign(weights.size(), 1.0f);
+    alias_index.resize(weights.size());
+    std::vector<float> scaled(weights.size());
+    std::vector<int> underfull;
+    std::vector<int> large;
+    underfull.reserve(weights.size());
+    large.reserve(weights.size());
+    for (int i = 0; i < count; ++i) {
+        pmf[static_cast<size_t>(i)] = std::max(0.0f, weights[static_cast<size_t>(i)]) / total;
+        scaled[static_cast<size_t>(i)] = pmf[static_cast<size_t>(i)] * static_cast<float>(count);
+        alias_index[static_cast<size_t>(i)] = i;
+        (scaled[static_cast<size_t>(i)] < 1.0f ? underfull : large).push_back(i);
+    }
+    while (!underfull.empty() && !large.empty()) {
+        const int lesser = underfull.back();
+        underfull.pop_back();
+        const int greater = large.back();
+        large.pop_back();
+        alias_probability[static_cast<size_t>(lesser)] = scaled[static_cast<size_t>(lesser)];
+        alias_index[static_cast<size_t>(lesser)] = greater;
+        scaled[static_cast<size_t>(greater)] = (scaled[static_cast<size_t>(greater)] +
+            scaled[static_cast<size_t>(lesser)]) - 1.0f;
+        (scaled[static_cast<size_t>(greater)] < 1.0f ? underfull : large).push_back(greater);
+    }
+    return true;
+}
+
+bool build_restir_light_sampler(const Scene& scene, const RenderScene& render_scene,
+    PackedGpuLightSampler& packed) {
+    packed = {};
+    std::vector<float> weights;
+    weights.reserve(render_scene.light_triangle_indices.size());
+    for (int triangle_index : render_scene.light_triangle_indices) {
+        if (triangle_index < 0 || triangle_index >= static_cast<int>(render_scene.triangles.size())) {
+            return false;
+        }
+        const Triangle& triangle = render_scene.triangles[static_cast<size_t>(triangle_index)];
+        if (triangle.material < 0 || triangle.material >= static_cast<int>(scene.materials.size())) {
+            return false;
+        }
+        Vec3 emission = scene.materials[static_cast<size_t>(triangle.material)]->emitted(
+            (triangle.uv0 + triangle.uv1 + triangle.uv2) * (1.0f / 3.0f));
+        bool double_sided = scene.materials[static_cast<size_t>(triangle.material)]->double_sided;
+        if (triangle.mesh >= 0 && triangle.mesh < static_cast<int>(scene.meshes.size())) {
+            const LightComponent& light = scene.meshes[static_cast<size_t>(triangle.mesh)].light;
+            if (light.enabled && light.intensity > 0.0f) {
+                emission = light.color * light.intensity;
+                double_sided = light.double_sided;
+            }
+        }
+        const float area = 0.5f * length(cross(triangle.v1 - triangle.v0, triangle.v2 - triangle.v0));
+        const float sidedness = double_sided ? 2.0f : 1.0f;
+        weights.push_back(std::max(1.0e-8f, environment_sampler_luminance(emission) * area * sidedness));
+    }
+    if (!build_alias_distribution(weights, packed.pmf, packed.alias_probability, packed.alias_index)) {
+        return false;
+    }
+    packed.sampler.light_count = static_cast<int>(weights.size());
+    return true;
+}
+
+bool build_environment_sampler(const Scene& scene, PackedGpuEnvironmentSampler& packed) {
+    packed = {};
+    const std::shared_ptr<Texture>& texture = scene.environment.texture;
+    if (!texture || texture->width <= 0 || texture->height <= 0 ||
+        texture->pixels.size() != static_cast<size_t>(texture->width) * static_cast<size_t>(texture->height)) {
+        return true;
+    }
+    const int width = texture->width;
+    const int height = texture->height;
+    const int count = width * height;
+    packed.pmf.resize(static_cast<size_t>(count));
+    std::vector<float> scaled(static_cast<size_t>(count));
+    float total = 0.0f;
+    for (int y = 0; y < height; ++y) {
+        const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+        const float solid_angle_weight = scene.environment.mapping == Environment::Mapping::Equirectangular
+            ? std::sin((1.0f - v) * kPi) : 1.0f;
+        for (int x = 0; x < width; ++x) {
+            const size_t index = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+            const Vec3 radiance = texture->pixels[index] * scene.environment.color * scene.environment.strength;
+            const float weight = std::max(1.0e-8f, environment_sampler_luminance(radiance) * solid_angle_weight);
+            packed.pmf[index] = weight;
+            total += weight;
+        }
+    }
+    if (!(total > 0.0f) || !std::isfinite(total)) {
+        return false;
+    }
+    packed.alias_probability.assign(static_cast<size_t>(count), 1.0f);
+    packed.alias_index.resize(static_cast<size_t>(count));
+    std::vector<int> underfull;
+    std::vector<int> large;
+    underfull.reserve(static_cast<size_t>(count));
+    large.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        packed.pmf[static_cast<size_t>(i)] /= total;
+        scaled[static_cast<size_t>(i)] = packed.pmf[static_cast<size_t>(i)] * static_cast<float>(count);
+        packed.alias_index[static_cast<size_t>(i)] = i;
+        (scaled[static_cast<size_t>(i)] < 1.0f ? underfull : large).push_back(i);
+    }
+    while (!underfull.empty() && !large.empty()) {
+        const int lesser = underfull.back();
+        underfull.pop_back();
+        const int greater = large.back();
+        large.pop_back();
+        packed.alias_probability[static_cast<size_t>(lesser)] = scaled[static_cast<size_t>(lesser)];
+        packed.alias_index[static_cast<size_t>(lesser)] = greater;
+        scaled[static_cast<size_t>(greater)] = (scaled[static_cast<size_t>(greater)] +
+            scaled[static_cast<size_t>(lesser)]) - 1.0f;
+        (scaled[static_cast<size_t>(greater)] < 1.0f ? underfull : large).push_back(greater);
+    }
+    packed.sampler.width = width;
+    packed.sampler.height = height;
+    packed.sampler.texel_count = count;
+    return true;
+}
 
 int flatten_irradiance_grid(const IrradianceVolumeGrid& grid, int direction_count, PackedGpuIrradianceVolume& packed) {
     if (!size_fits_int(packed.grids.size()) || !size_fits_int(packed.irradiance.size() / static_cast<size_t>(std::max(1, direction_count))) ||
@@ -935,6 +1172,60 @@ void CudaPathTracer::reset() {
     cudaFree(device_wavefront_queue_counters_);
     cudaFree(device_wavefront_samples_);
     cudaFree(device_wavefront_sample_sum_);
+    cudaFree(device_restir_initial_);
+    cudaFree(device_restir_temporal_);
+    cudaFree(device_restir_history_);
+    cudaFree(device_restir_scratch_);
+    cudaFree(device_restir_history_surfaces_);
+    cudaFree(device_restir_current_surfaces_);
+    cudaFree(device_restir_temporal_states_);
+    cudaFree(device_restir_spatial_states_);
+    cudaFree(device_restir_visibility_rays_);
+    cudaFree(device_restir_visibility_results_);
+    cudaFree(device_restir_visibility_indices_);
+    cudaFree(device_restir_visibility_count_);
+    cudaFree(device_restir_neighbor_offsets_);
+    cudaFree(device_restir_environment_pmf_);
+    cudaFree(device_restir_environment_alias_probability_);
+    cudaFree(device_restir_environment_alias_index_);
+    cudaFree(device_restir_light_pmf_);
+    cudaFree(device_restir_light_alias_probability_);
+    cudaFree(device_restir_light_alias_index_);
+    cudaFree(device_restir_gi_initial_samples_);
+    cudaFree(device_restir_gi_secondary_compact_hits_);
+    cudaFree(device_restir_gi_secondary_hits_);
+    cudaFree(device_restir_gi_secondary_results_);
+    cudaFree(device_restir_gi_secondary_direct_);
+    cudaFree(device_restir_gi_initial_);
+    cudaFree(device_restir_gi_temporal_);
+    cudaFree(device_restir_gi_history_);
+    cudaFree(device_restir_gi_scratch_);
+    cudaFree(device_restir_gi_current_surfaces_);
+    cudaFree(device_restir_gi_history_surfaces_);
+    cudaFree(device_restir_gi_temporal_states_);
+    cudaFree(device_restir_gi_spatial_states_);
+    cudaFree(device_restir_gi_visibility_rays_);
+    cudaFree(device_restir_gi_visibility_results_);
+    cudaFree(device_restir_pt_path_states_);
+    cudaFree(device_restir_pt_compact_hits_);
+    cudaFree(device_restir_pt_hits_);
+    cudaFree(device_restir_pt_trace_results_);
+    cudaFree(device_restir_pt_active_indices_);
+    cudaFree(device_restir_pt_next_indices_);
+    cudaFree(device_restir_pt_queue_counters_);
+    cudaFree(device_restir_pt_nee_reservoirs_);
+    cudaFree(device_restir_pt_initial_);
+    cudaFree(device_restir_pt_temporal_);
+    cudaFree(device_restir_pt_history_);
+    cudaFree(device_restir_pt_scratch_);
+    cudaFree(device_restir_pt_current_surfaces_);
+    cudaFree(device_restir_pt_history_surfaces_);
+    cudaFree(device_restir_pt_temporal_states_);
+    cudaFree(device_restir_pt_spatial_states_);
+    cudaFree(device_restir_pt_visibility_rays_);
+    cudaFree(device_restir_pt_visibility_results_);
+    cudaFree(device_restir_pt_sample_ids_);
+    cudaFree(device_restir_pt_duplication_counts_);
     device_accumulation_ = nullptr;
     device_rgba_ = nullptr;
     device_svgf_radiance_ = nullptr;
@@ -1013,6 +1304,60 @@ void CudaPathTracer::reset() {
     device_wavefront_queue_counters_ = nullptr;
     device_wavefront_samples_ = nullptr;
     device_wavefront_sample_sum_ = nullptr;
+    device_restir_initial_ = nullptr;
+    device_restir_temporal_ = nullptr;
+    device_restir_history_ = nullptr;
+    device_restir_scratch_ = nullptr;
+    device_restir_history_surfaces_ = nullptr;
+    device_restir_current_surfaces_ = nullptr;
+    device_restir_temporal_states_ = nullptr;
+    device_restir_spatial_states_ = nullptr;
+    device_restir_visibility_rays_ = nullptr;
+    device_restir_visibility_results_ = nullptr;
+    device_restir_visibility_indices_ = nullptr;
+    device_restir_visibility_count_ = nullptr;
+    device_restir_neighbor_offsets_ = nullptr;
+    device_restir_environment_pmf_ = nullptr;
+    device_restir_environment_alias_probability_ = nullptr;
+    device_restir_environment_alias_index_ = nullptr;
+    device_restir_light_pmf_ = nullptr;
+    device_restir_light_alias_probability_ = nullptr;
+    device_restir_light_alias_index_ = nullptr;
+    device_restir_gi_initial_samples_ = nullptr;
+    device_restir_gi_secondary_compact_hits_ = nullptr;
+    device_restir_gi_secondary_hits_ = nullptr;
+    device_restir_gi_secondary_results_ = nullptr;
+    device_restir_gi_secondary_direct_ = nullptr;
+    device_restir_gi_initial_ = nullptr;
+    device_restir_gi_temporal_ = nullptr;
+    device_restir_gi_history_ = nullptr;
+    device_restir_gi_scratch_ = nullptr;
+    device_restir_gi_current_surfaces_ = nullptr;
+    device_restir_gi_history_surfaces_ = nullptr;
+    device_restir_gi_temporal_states_ = nullptr;
+    device_restir_gi_spatial_states_ = nullptr;
+    device_restir_gi_visibility_rays_ = nullptr;
+    device_restir_gi_visibility_results_ = nullptr;
+    device_restir_pt_path_states_ = nullptr;
+    device_restir_pt_compact_hits_ = nullptr;
+    device_restir_pt_hits_ = nullptr;
+    device_restir_pt_trace_results_ = nullptr;
+    device_restir_pt_active_indices_ = nullptr;
+    device_restir_pt_next_indices_ = nullptr;
+    device_restir_pt_queue_counters_ = nullptr;
+    device_restir_pt_nee_reservoirs_ = nullptr;
+    device_restir_pt_initial_ = nullptr;
+    device_restir_pt_temporal_ = nullptr;
+    device_restir_pt_history_ = nullptr;
+    device_restir_pt_scratch_ = nullptr;
+    device_restir_pt_current_surfaces_ = nullptr;
+    device_restir_pt_history_surfaces_ = nullptr;
+    device_restir_pt_temporal_states_ = nullptr;
+    device_restir_pt_spatial_states_ = nullptr;
+    device_restir_pt_visibility_rays_ = nullptr;
+    device_restir_pt_visibility_results_ = nullptr;
+    device_restir_pt_sample_ids_ = nullptr;
+    device_restir_pt_duplication_counts_ = nullptr;
     cached_render_scene_ = {};
     cached_irradiance_volume_.reset();
     cached_lightmap_.reset();
@@ -1054,6 +1399,27 @@ void CudaPathTracer::reset() {
     taa_history_camera_ = {};
     taa_history_jitter_x_ = 0.0f;
     taa_history_jitter_y_ = 0.0f;
+    restir_history_valid_ = false;
+    restir_was_enabled_ = false;
+    restir_history_camera_ = {};
+    cached_restir_environment_texels_ = 0;
+    cached_restir_light_count_ = 0;
+    restir_history_bias_correction_ = RestirBiasCorrection::Basic;
+    restir_history_visibility_reuse_ = false;
+    restir_gi_history_valid_ = false;
+    restir_gi_was_enabled_ = false;
+    restir_gi_history_camera_ = {};
+    restir_gi_history_bias_correction_ = RestirBiasCorrection::Basic;
+    restir_gi_history_resampling_ = RestirGiResamplingMode::TemporalSpatial;
+    restir_gi_history_final_mis_ = true;
+    restir_gi_history_boiling_filter_ = true;
+    restir_gi_history_secondary_roughness_ = 0.5f;
+    restir_pt_history_valid_ = false;
+    restir_pt_was_enabled_ = false;
+    restir_pt_history_camera_ = {};
+    restir_pt_history_resampling_ = RestirPtResamplingMode::TemporalSpatial;
+    restir_pt_history_reconnection_ = RestirPtReconnectionMode::Footprint;
+    restir_pt_history_max_bounces_ = 3;
     release_texture_objects(texture_arrays_, texture_objects_);
 }
 
@@ -1305,6 +1671,60 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         cudaFree(device_wavefront_queue_counters_);
         cudaFree(device_wavefront_samples_);
         cudaFree(device_wavefront_sample_sum_);
+        cudaFree(device_restir_initial_);
+        cudaFree(device_restir_temporal_);
+        cudaFree(device_restir_history_);
+        cudaFree(device_restir_scratch_);
+        cudaFree(device_restir_history_surfaces_);
+        cudaFree(device_restir_current_surfaces_);
+        cudaFree(device_restir_temporal_states_);
+        cudaFree(device_restir_spatial_states_);
+        cudaFree(device_restir_visibility_rays_);
+        cudaFree(device_restir_visibility_results_);
+        cudaFree(device_restir_visibility_indices_);
+        cudaFree(device_restir_visibility_count_);
+        cudaFree(device_restir_neighbor_offsets_);
+        cudaFree(device_restir_environment_pmf_);
+        cudaFree(device_restir_environment_alias_probability_);
+        cudaFree(device_restir_environment_alias_index_);
+        cudaFree(device_restir_light_pmf_);
+        cudaFree(device_restir_light_alias_probability_);
+        cudaFree(device_restir_light_alias_index_);
+        cudaFree(device_restir_gi_initial_samples_);
+        cudaFree(device_restir_gi_secondary_compact_hits_);
+        cudaFree(device_restir_gi_secondary_hits_);
+        cudaFree(device_restir_gi_secondary_results_);
+        cudaFree(device_restir_gi_secondary_direct_);
+        cudaFree(device_restir_gi_initial_);
+        cudaFree(device_restir_gi_temporal_);
+        cudaFree(device_restir_gi_history_);
+        cudaFree(device_restir_gi_scratch_);
+        cudaFree(device_restir_gi_current_surfaces_);
+        cudaFree(device_restir_gi_history_surfaces_);
+        cudaFree(device_restir_gi_temporal_states_);
+        cudaFree(device_restir_gi_spatial_states_);
+        cudaFree(device_restir_gi_visibility_rays_);
+        cudaFree(device_restir_gi_visibility_results_);
+        cudaFree(device_restir_pt_path_states_);
+        cudaFree(device_restir_pt_compact_hits_);
+        cudaFree(device_restir_pt_hits_);
+        cudaFree(device_restir_pt_trace_results_);
+        cudaFree(device_restir_pt_active_indices_);
+        cudaFree(device_restir_pt_next_indices_);
+        cudaFree(device_restir_pt_queue_counters_);
+        cudaFree(device_restir_pt_nee_reservoirs_);
+        cudaFree(device_restir_pt_initial_);
+        cudaFree(device_restir_pt_temporal_);
+        cudaFree(device_restir_pt_history_);
+        cudaFree(device_restir_pt_scratch_);
+        cudaFree(device_restir_pt_current_surfaces_);
+        cudaFree(device_restir_pt_history_surfaces_);
+        cudaFree(device_restir_pt_temporal_states_);
+        cudaFree(device_restir_pt_spatial_states_);
+        cudaFree(device_restir_pt_visibility_rays_);
+        cudaFree(device_restir_pt_visibility_results_);
+        cudaFree(device_restir_pt_sample_ids_);
+        cudaFree(device_restir_pt_duplication_counts_);
 
         device_accumulation_ = nullptr;
         device_rgba_ = nullptr;
@@ -1362,9 +1782,66 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         device_wavefront_queue_counters_ = nullptr;
         device_wavefront_samples_ = nullptr;
         device_wavefront_sample_sum_ = nullptr;
+        device_restir_initial_ = nullptr;
+        device_restir_temporal_ = nullptr;
+        device_restir_history_ = nullptr;
+        device_restir_scratch_ = nullptr;
+        device_restir_history_surfaces_ = nullptr;
+        device_restir_current_surfaces_ = nullptr;
+        device_restir_temporal_states_ = nullptr;
+        device_restir_spatial_states_ = nullptr;
+        device_restir_visibility_rays_ = nullptr;
+        device_restir_visibility_results_ = nullptr;
+        device_restir_visibility_indices_ = nullptr;
+        device_restir_visibility_count_ = nullptr;
+        device_restir_neighbor_offsets_ = nullptr;
+        device_restir_environment_pmf_ = nullptr;
+        device_restir_environment_alias_probability_ = nullptr;
+        device_restir_environment_alias_index_ = nullptr;
+        device_restir_light_pmf_ = nullptr;
+        device_restir_light_alias_probability_ = nullptr;
+        device_restir_light_alias_index_ = nullptr;
+        device_restir_gi_initial_samples_ = nullptr;
+        device_restir_gi_secondary_compact_hits_ = nullptr;
+        device_restir_gi_secondary_hits_ = nullptr;
+        device_restir_gi_secondary_results_ = nullptr;
+        device_restir_gi_secondary_direct_ = nullptr;
+        device_restir_gi_initial_ = nullptr;
+        device_restir_gi_temporal_ = nullptr;
+        device_restir_gi_history_ = nullptr;
+        device_restir_gi_scratch_ = nullptr;
+        device_restir_gi_current_surfaces_ = nullptr;
+        device_restir_gi_history_surfaces_ = nullptr;
+        device_restir_gi_temporal_states_ = nullptr;
+        device_restir_gi_spatial_states_ = nullptr;
+        device_restir_gi_visibility_rays_ = nullptr;
+        device_restir_gi_visibility_results_ = nullptr;
+        device_restir_pt_path_states_ = nullptr;
+        device_restir_pt_compact_hits_ = nullptr;
+        device_restir_pt_hits_ = nullptr;
+        device_restir_pt_trace_results_ = nullptr;
+        device_restir_pt_active_indices_ = nullptr;
+        device_restir_pt_next_indices_ = nullptr;
+        device_restir_pt_queue_counters_ = nullptr;
+        device_restir_pt_nee_reservoirs_ = nullptr;
+        device_restir_pt_initial_ = nullptr;
+        device_restir_pt_temporal_ = nullptr;
+        device_restir_pt_history_ = nullptr;
+        device_restir_pt_scratch_ = nullptr;
+        device_restir_pt_current_surfaces_ = nullptr;
+        device_restir_pt_history_surfaces_ = nullptr;
+        device_restir_pt_temporal_states_ = nullptr;
+        device_restir_pt_spatial_states_ = nullptr;
+        device_restir_pt_visibility_rays_ = nullptr;
+        device_restir_pt_visibility_results_ = nullptr;
+        device_restir_pt_sample_ids_ = nullptr;
+        device_restir_pt_duplication_counts_ = nullptr;
         cached_pixels_ = 0;
         svgf_history_valid_ = false;
         taa_history_valid_ = false;
+        restir_history_valid_ = false;
+        restir_gi_history_valid_ = false;
+        restir_pt_history_valid_ = false;
         release_svgf_gbuffer_interop_cache();
     }
 
@@ -1433,6 +1910,26 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     }
     const bool wavefront_enabled = settings.cuda_wavefront &&
         !(settings.use_irradiance_volume && settings.irradiance_volume_debug_probes);
+    const bool restir_enabled = wavefront_enabled && settings.cuda_restir_di &&
+        settings.sampling_mode != PathSamplingMode::Unidirectional;
+    const bool restir_pt_enabled = wavefront_enabled && settings.cuda_restir_pt &&
+        settings.sampling_mode != PathSamplingMode::Unidirectional &&
+        settings.max_bounces >= 2 &&
+        !settings.use_lightmap && !settings.use_irradiance_volume;
+    const bool restir_gi_enabled = wavefront_enabled && settings.cuda_restir_gi &&
+        settings.sampling_mode != PathSamplingMode::Unidirectional &&
+        settings.max_bounces >= 2 &&
+        !settings.use_lightmap && !settings.use_irradiance_volume && !restir_pt_enabled;
+    const bool restir_any_enabled = restir_enabled || restir_gi_enabled || restir_pt_enabled;
+    if (settings.cuda_restir_gi && settings.cuda_restir_pt) {
+        const std::string key = "ReSTIR GI and PT requested together; PT takes precedence";
+        if (std::find(reported_fallback_reasons_.begin(), reported_fallback_reasons_.end(), key) ==
+            reported_fallback_reasons_.end()) {
+            reported_fallback_reasons_.push_back(key);
+            LT_LOG_WARN("{}", key);
+        }
+    }
+    const bool upload_restir_neighbor_offsets = restir_enabled && !device_restir_neighbor_offsets_;
     if (wavefront_enabled) {
         if (!allocate_svgf_buffer(device_wavefront_rays_, pixels * sizeof(Ray), "could not allocate wavefront ray buffer") ||
             !allocate_svgf_buffer(device_wavefront_throughputs_, pixels * sizeof(Vec3), "could not allocate wavefront throughput buffer") ||
@@ -1454,6 +1951,77 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !allocate_svgf_buffer(device_wavefront_samples_, pixels * sizeof(Vec3), "could not allocate wavefront sample buffer") ||
             !allocate_svgf_buffer(device_wavefront_sample_sum_, pixels * sizeof(Vec3), "could not allocate wavefront sample sum buffer")) {
             return;
+        }
+        if (restir_enabled &&
+            (!allocate_svgf_buffer(device_restir_initial_, pixels * sizeof(GpuRestirReservoir), "could not allocate ReSTIR initial reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_temporal_, pixels * sizeof(GpuRestirReservoir), "could not allocate ReSTIR temporal reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_history_, pixels * sizeof(GpuRestirReservoir), "could not allocate ReSTIR history reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_scratch_, pixels * sizeof(GpuRestirReservoir), "could not allocate ReSTIR spatial reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_history_surfaces_, pixels * sizeof(GpuRestirSurface), "could not allocate ReSTIR history surface buffer") ||
+             !allocate_svgf_buffer(device_restir_current_surfaces_, pixels * sizeof(GpuRestirSurface), "could not allocate ReSTIR current surface buffer") ||
+             !allocate_svgf_buffer(device_restir_temporal_states_, pixels * sizeof(GpuRestirTemporalState), "could not allocate ReSTIR temporal state buffer") ||
+             !allocate_svgf_buffer(device_restir_spatial_states_, pixels * sizeof(GpuRestirSpatialState), "could not allocate ReSTIR spatial state buffer") ||
+             !allocate_svgf_buffer(device_restir_visibility_rays_, pixels * sizeof(GpuRestirVisibilityRay), "could not allocate ReSTIR visibility ray buffer") ||
+             !allocate_svgf_buffer(device_restir_visibility_results_, pixels * sizeof(int), "could not allocate ReSTIR visibility result buffer") ||
+             !allocate_svgf_buffer(device_restir_neighbor_offsets_, kRestirNeighborOffsetCount * sizeof(Vec2), "could not allocate ReSTIR neighbor offset buffer"))) {
+            return;
+        }
+        if (restir_any_enabled &&
+            (!allocate_svgf_buffer(device_restir_visibility_indices_, pixels * sizeof(int), "could not allocate ReSTIR visibility queue") ||
+             !allocate_svgf_buffer(device_restir_visibility_count_, sizeof(int), "could not allocate ReSTIR visibility queue counter"))) {
+            return;
+        }
+        if (restir_gi_enabled &&
+            (!allocate_svgf_buffer(device_restir_gi_initial_samples_, pixels * sizeof(GpuRestirGiInitialSample), "could not allocate ReSTIR GI initial sample buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_secondary_compact_hits_, pixels * sizeof(GpuCompactHit), "could not allocate ReSTIR GI secondary compact hit buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_secondary_hits_, pixels * sizeof(GpuHit), "could not allocate ReSTIR GI secondary hit buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_secondary_results_, pixels * sizeof(int), "could not allocate ReSTIR GI secondary result buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_secondary_direct_, pixels * sizeof(GpuRestirReservoir), "could not allocate ReSTIR GI secondary direct reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_initial_, pixels * sizeof(GpuPackedRestirGiReservoir), "could not allocate ReSTIR GI initial reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_temporal_, pixels * sizeof(GpuPackedRestirGiReservoir), "could not allocate ReSTIR GI temporal reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_history_, pixels * sizeof(GpuPackedRestirGiReservoir), "could not allocate ReSTIR GI history reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_scratch_, pixels * sizeof(GpuPackedRestirGiReservoir), "could not allocate ReSTIR GI scratch reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_current_surfaces_, pixels * sizeof(GpuRestirSurface), "could not allocate ReSTIR GI current surface buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_history_surfaces_, pixels * sizeof(GpuRestirSurface), "could not allocate ReSTIR GI history surface buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_temporal_states_, pixels * sizeof(GpuRestirGiTemporalState), "could not allocate ReSTIR GI temporal state buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_spatial_states_, pixels * sizeof(GpuRestirGiSpatialState), "could not allocate ReSTIR GI spatial state buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_visibility_rays_, pixels * sizeof(GpuRestirVisibilityRay), "could not allocate ReSTIR GI visibility ray buffer") ||
+             !allocate_svgf_buffer(device_restir_gi_visibility_results_, pixels * sizeof(int), "could not allocate ReSTIR GI visibility result buffer"))) {
+            return;
+        }
+        if (restir_pt_enabled &&
+            (!allocate_svgf_buffer(device_restir_pt_path_states_, pixels * sizeof(GpuRestirPtPathState), "could not allocate ReSTIR PT path-state buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_compact_hits_, pixels * sizeof(GpuCompactHit), "could not allocate ReSTIR PT compact-hit buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_hits_, pixels * sizeof(GpuHit), "could not allocate ReSTIR PT hit buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_trace_results_, pixels * sizeof(int), "could not allocate ReSTIR PT trace-result buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_active_indices_, pixels * sizeof(int), "could not allocate ReSTIR PT active queue") ||
+             !allocate_svgf_buffer(device_restir_pt_next_indices_, pixels * sizeof(int), "could not allocate ReSTIR PT next queue") ||
+             !allocate_svgf_buffer(device_restir_pt_queue_counters_, sizeof(GpuRestirPtQueueCounters), "could not allocate ReSTIR PT queue counters") ||
+             !allocate_svgf_buffer(device_restir_pt_nee_reservoirs_, pixels * sizeof(GpuRestirReservoir), "could not allocate ReSTIR PT NEE reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_initial_, pixels * sizeof(GpuPackedRestirPtReservoir), "could not allocate ReSTIR PT initial reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_temporal_, pixels * sizeof(GpuPackedRestirPtReservoir), "could not allocate ReSTIR PT temporal reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_history_, pixels * sizeof(GpuPackedRestirPtReservoir), "could not allocate ReSTIR PT history reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_scratch_, pixels * sizeof(GpuPackedRestirPtReservoir), "could not allocate ReSTIR PT scratch reservoir buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_current_surfaces_, pixels * sizeof(GpuRestirSurface), "could not allocate ReSTIR PT current-surface buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_history_surfaces_, pixels * sizeof(GpuRestirSurface), "could not allocate ReSTIR PT history-surface buffer") ||
+             !allocate_svgf_buffer(device_restir_pt_temporal_states_, pixels * sizeof(GpuRestirPtTemporalState), "could not allocate ReSTIR PT temporal-state buffer") ||
+              !allocate_svgf_buffer(device_restir_pt_spatial_states_, pixels * sizeof(GpuRestirPtSpatialState), "could not allocate ReSTIR PT spatial-state buffer") ||
+              !allocate_svgf_buffer(device_restir_pt_visibility_rays_, pixels * sizeof(GpuRestirVisibilityRay), "could not allocate ReSTIR PT visibility-ray buffer") ||
+              !allocate_svgf_buffer(device_restir_pt_visibility_results_, pixels * sizeof(int), "could not allocate ReSTIR PT visibility-result buffer") ||
+              !allocate_svgf_buffer(device_restir_pt_sample_ids_, pixels * sizeof(uint32_t), "could not allocate ReSTIR PT sample-ID buffer") ||
+              !allocate_svgf_buffer(device_restir_pt_duplication_counts_, pixels * sizeof(uint32_t), "could not allocate ReSTIR PT duplication-map buffer"))) {
+            return;
+        }
+        if (upload_restir_neighbor_offsets) {
+            static const std::vector<Vec2> neighbor_offsets = build_restir_neighbor_offsets();
+            cuda_error = cudaMemcpy(device_restir_neighbor_offsets_, neighbor_offsets.data(),
+                neighbor_offsets.size() * sizeof(Vec2), cudaMemcpyHostToDevice);
+            if (cuda_error != cudaSuccess) {
+                reset();
+                render_cpu_fallback(scene, settings, framebuffer,
+                    "could not upload ReSTIR neighbor offsets", cuda_error_text(cuda_error));
+                return;
+            }
         }
     }
     cached_pixels_ = pixels;
@@ -1563,6 +2131,85 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         gpu_lightmap.texels = static_cast<Vec3*>(device_lightmap_texels_);
         return true;
     };
+    const auto upload_restir_environment_sampler = [&](GpuEnvironmentSampler& gpu_sampler) {
+        PackedGpuEnvironmentSampler packed;
+        if (!build_environment_sampler(scene, packed)) {
+            return false;
+        }
+        const int count = packed.sampler.texel_count;
+        if (cached_restir_environment_texels_ != count) {
+            cudaFree(device_restir_environment_pmf_);
+            cudaFree(device_restir_environment_alias_probability_);
+            cudaFree(device_restir_environment_alias_index_);
+            device_restir_environment_pmf_ = nullptr;
+            device_restir_environment_alias_probability_ = nullptr;
+            device_restir_environment_alias_index_ = nullptr;
+            cached_restir_environment_texels_ = 0;
+        }
+        if (count > 0) {
+            if (!device_restir_environment_pmf_ && cudaMalloc(&device_restir_environment_pmf_, packed.pmf.size() * sizeof(float)) != cudaSuccess) return false;
+            if (!device_restir_environment_alias_probability_ && cudaMalloc(&device_restir_environment_alias_probability_, packed.alias_probability.size() * sizeof(float)) != cudaSuccess) return false;
+            if (!device_restir_environment_alias_index_ && cudaMalloc(&device_restir_environment_alias_index_, packed.alias_index.size() * sizeof(int)) != cudaSuccess) return false;
+            if (cudaMemcpy(device_restir_environment_pmf_, packed.pmf.data(), packed.pmf.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(device_restir_environment_alias_probability_, packed.alias_probability.data(), packed.alias_probability.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(device_restir_environment_alias_index_, packed.alias_index.data(), packed.alias_index.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            cached_restir_environment_texels_ = count;
+        }
+        gpu_sampler = packed.sampler;
+        gpu_sampler.pmf = static_cast<float*>(device_restir_environment_pmf_);
+        gpu_sampler.alias_probability = static_cast<float*>(device_restir_environment_alias_probability_);
+        gpu_sampler.alias_index = static_cast<int*>(device_restir_environment_alias_index_);
+        return true;
+    };
+    const auto upload_restir_light_sampler = [&](GpuLightSampler& gpu_sampler) {
+        PackedGpuLightSampler packed;
+        if (!build_restir_light_sampler(scene, cached_render_scene_, packed)) {
+            return false;
+        }
+        const int count = packed.sampler.light_count;
+        if (cached_restir_light_count_ != count) {
+            cudaFree(device_restir_light_pmf_);
+            cudaFree(device_restir_light_alias_probability_);
+            cudaFree(device_restir_light_alias_index_);
+            device_restir_light_pmf_ = nullptr;
+            device_restir_light_alias_probability_ = nullptr;
+            device_restir_light_alias_index_ = nullptr;
+            cached_restir_light_count_ = 0;
+        }
+        if (count > 0) {
+            if (!device_restir_light_pmf_ && cudaMalloc(&device_restir_light_pmf_, packed.pmf.size() * sizeof(float)) != cudaSuccess) return false;
+            if (!device_restir_light_alias_probability_ && cudaMalloc(&device_restir_light_alias_probability_, packed.alias_probability.size() * sizeof(float)) != cudaSuccess) return false;
+            if (!device_restir_light_alias_index_ && cudaMalloc(&device_restir_light_alias_index_, packed.alias_index.size() * sizeof(int)) != cudaSuccess) return false;
+            if (cudaMemcpy(device_restir_light_pmf_, packed.pmf.data(), packed.pmf.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(device_restir_light_alias_probability_, packed.alias_probability.data(), packed.alias_probability.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(device_restir_light_alias_index_, packed.alias_index.data(), packed.alias_index.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            cached_restir_light_count_ = count;
+        }
+        gpu_sampler = packed.sampler;
+        gpu_sampler.pmf = static_cast<float*>(device_restir_light_pmf_);
+        gpu_sampler.alias_probability = static_cast<float*>(device_restir_light_alias_probability_);
+        gpu_sampler.alias_index = static_cast<int*>(device_restir_light_alias_index_);
+        return true;
+    };
+    // The alias distribution depends on every environment edit, not just texel count.
+    const bool restir_environment_upload = restir_any_enabled &&
+        (full_upload || (!restir_was_enabled_ && !restir_gi_was_enabled_) || has_dirty(settings.dirty, RenderDirty::Environment) ||
+            (device_restir_environment_pmf_ == nullptr && scene.environment.texture != nullptr));
+    GpuEnvironmentSampler restir_environment_sampler;
+    if (restir_environment_upload && !upload_restir_environment_sampler(restir_environment_sampler)) {
+        reset();
+        render_cpu_fallback(scene, settings, framebuffer, "could not upload ReSTIR environment sampler");
+        return;
+    }
+    const bool restir_light_upload = restir_any_enabled &&
+        (full_upload || (!restir_was_enabled_ && !restir_gi_was_enabled_) ||
+            (device_restir_light_pmf_ == nullptr && !cached_render_scene_.light_triangle_indices.empty()));
+    GpuLightSampler restir_light_sampler;
+    if (restir_light_upload && !upload_restir_light_sampler(restir_light_sampler)) {
+        reset();
+        render_cpu_fallback(scene, settings, framebuffer, "could not upload ReSTIR local-light sampler");
+        return;
+    }
 
     if (full_upload) {
         PackedGpuScene packed;
@@ -1576,6 +2223,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             render_cpu_fallback(scene, settings, framebuffer, upload_textures ? "could not upload CUDA texture objects" : "could not apply cached CUDA texture objects");
             return;
         }
+        packed.scene.environment_sampler = restir_environment_sampler;
+        packed.scene.restir_light_sampler = restir_light_sampler;
         if (!upload_buffer(device_materials_, cached_materials_, packed.materials) ||
             !upload_buffer(device_textures_, cached_textures_, packed.textures) ||
             !upload_buffer(device_triangles_, cached_triangles_, packed.triangles) ||
@@ -1645,11 +2294,23 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         }
         if (has_dirty(settings.dirty, RenderDirty::Environment)) {
             GpuScene environment_scene;
+            environment_scene.environment_sampler = restir_environment_sampler;
             if (!make_environment_gpu(scene, environment_scene) || !upload_environment(device_scene, environment_scene)) {
                 reset();
                 render_cpu_fallback(scene, settings, framebuffer, "could not upload CUDA environment");
                 return;
             }
+        }
+        if (restir_environment_upload && !has_dirty(settings.dirty, RenderDirty::Environment) &&
+            !upload_scene_field(device_scene, offsetof(GpuScene, environment_sampler), restir_environment_sampler)) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "could not update ReSTIR environment sampler");
+            return;
+        }
+        if (restir_light_upload && !upload_scene_field(device_scene, offsetof(GpuScene, restir_light_sampler), restir_light_sampler)) {
+            reset();
+            render_cpu_fallback(scene, settings, framebuffer, "could not update ReSTIR local-light sampler");
+            return;
         }
         if (irradiance_volume_upload) {
             GpuIrradianceVolume gpu_volume;
@@ -1697,6 +2358,67 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     if (taa_history_invalidated) {
         taa_history_valid_ = false;
     }
+    const bool restir_history_invalidated = !restir_enabled || !restir_was_enabled_ ||
+        settings.cuda_restir_bias_correction != restir_history_bias_correction_ ||
+        settings.cuda_restir_final_visibility_reuse != restir_history_visibility_reuse_ ||
+        settings.frame_index == 0u ||
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform) ||
+        has_dirty(settings.dirty, RenderDirty::Material) ||
+        has_dirty(settings.dirty, RenderDirty::Texture) ||
+        has_dirty(settings.dirty, RenderDirty::Environment) ||
+        has_dirty(settings.dirty, RenderDirty::Lightmap) ||
+        has_dirty(settings.dirty, RenderDirty::IrradianceVolume);
+    if (restir_history_invalidated) {
+        restir_history_valid_ = false;
+    }
+    restir_was_enabled_ = restir_enabled;
+    restir_history_bias_correction_ = settings.cuda_restir_bias_correction;
+    restir_history_visibility_reuse_ = settings.cuda_restir_final_visibility_reuse;
+    const bool restir_gi_history_invalidated = !restir_gi_enabled || !restir_gi_was_enabled_ ||
+        settings.cuda_restir_gi_bias_correction != restir_gi_history_bias_correction_ ||
+        settings.cuda_restir_gi_resampling != restir_gi_history_resampling_ ||
+        settings.cuda_restir_gi_final_mis != restir_gi_history_final_mis_ ||
+        settings.cuda_restir_gi_boiling_filter != restir_gi_history_boiling_filter_ ||
+        fabsf(settings.cuda_restir_gi_secondary_roughness - restir_gi_history_secondary_roughness_) > 1e-6f ||
+        settings.frame_index == 0u ||
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform) ||
+        has_dirty(settings.dirty, RenderDirty::Material) ||
+        has_dirty(settings.dirty, RenderDirty::Texture) ||
+        has_dirty(settings.dirty, RenderDirty::Environment) ||
+        has_dirty(settings.dirty, RenderDirty::Lightmap) ||
+        has_dirty(settings.dirty, RenderDirty::IrradianceVolume);
+    if (restir_gi_history_invalidated) {
+        restir_gi_history_valid_ = false;
+    }
+    restir_gi_was_enabled_ = restir_gi_enabled;
+    restir_gi_history_bias_correction_ = settings.cuda_restir_gi_bias_correction;
+    restir_gi_history_resampling_ = settings.cuda_restir_gi_resampling;
+    restir_gi_history_final_mis_ = settings.cuda_restir_gi_final_mis;
+    restir_gi_history_boiling_filter_ = settings.cuda_restir_gi_boiling_filter;
+    restir_gi_history_secondary_roughness_ = settings.cuda_restir_gi_secondary_roughness;
+    const int restir_pt_max_bounces = std::clamp(settings.cuda_restir_pt_max_bounces,
+        2, std::max(2, std::min(settings.max_bounces, 8)));
+    const bool restir_pt_history_invalidated = !restir_pt_enabled || !restir_pt_was_enabled_ ||
+        settings.cuda_restir_pt_resampling != restir_pt_history_resampling_ ||
+        settings.cuda_restir_pt_reconnection != restir_pt_history_reconnection_ ||
+        restir_pt_max_bounces != restir_pt_history_max_bounces_ ||
+        settings.frame_index == 0u ||
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform) ||
+        has_dirty(settings.dirty, RenderDirty::Material) ||
+        has_dirty(settings.dirty, RenderDirty::Texture) ||
+        has_dirty(settings.dirty, RenderDirty::Environment) ||
+        has_dirty(settings.dirty, RenderDirty::Lightmap) ||
+        has_dirty(settings.dirty, RenderDirty::IrradianceVolume);
+    if (restir_pt_history_invalidated) {
+        restir_pt_history_valid_ = false;
+    }
+    restir_pt_was_enabled_ = restir_pt_enabled;
+    restir_pt_history_resampling_ = settings.cuda_restir_pt_resampling;
+    restir_pt_history_reconnection_ = settings.cuda_restir_pt_reconnection;
+    restir_pt_history_max_bounces_ = restir_pt_max_bounces;
 
     if (!svgf_denoising_enabled(settings) && (settings.frame_index == 0u || has_dirty(settings.dirty, RenderDirty::Render))) {
         cuda_error = cudaMemset(device_accumulation, 0, pixels * sizeof(Vec3));
@@ -1755,6 +2477,83 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         GpuWavefrontQueueCounters* queue_counters =
             static_cast<GpuWavefrontQueueCounters*>(device_wavefront_queue_counters_);
         Vec3* samples = static_cast<Vec3*>(device_wavefront_samples_);
+        GpuRestirReservoir* restir_initial = static_cast<GpuRestirReservoir*>(device_restir_initial_);
+        GpuRestirReservoir* restir_temporal = static_cast<GpuRestirReservoir*>(device_restir_temporal_);
+        GpuRestirReservoir* restir_history = static_cast<GpuRestirReservoir*>(device_restir_history_);
+        GpuRestirReservoir* restir_scratch = static_cast<GpuRestirReservoir*>(device_restir_scratch_);
+        GpuRestirSurface* restir_history_surfaces = static_cast<GpuRestirSurface*>(device_restir_history_surfaces_);
+        GpuRestirSurface* restir_current_surfaces = static_cast<GpuRestirSurface*>(device_restir_current_surfaces_);
+        GpuRestirTemporalState* restir_temporal_states =
+            static_cast<GpuRestirTemporalState*>(device_restir_temporal_states_);
+        GpuRestirSpatialState* restir_spatial_states =
+            static_cast<GpuRestirSpatialState*>(device_restir_spatial_states_);
+        GpuRestirVisibilityRay* restir_visibility_rays =
+            static_cast<GpuRestirVisibilityRay*>(device_restir_visibility_rays_);
+        int* restir_visibility_results = static_cast<int*>(device_restir_visibility_results_);
+        int* restir_visibility_indices = static_cast<int*>(device_restir_visibility_indices_);
+        int* restir_visibility_count = static_cast<int*>(device_restir_visibility_count_);
+        const Vec2* restir_neighbor_offsets = static_cast<const Vec2*>(device_restir_neighbor_offsets_);
+        GpuRestirGiInitialSample* restir_gi_initial_samples =
+            static_cast<GpuRestirGiInitialSample*>(device_restir_gi_initial_samples_);
+        GpuCompactHit* restir_gi_secondary_compact_hits =
+            static_cast<GpuCompactHit*>(device_restir_gi_secondary_compact_hits_);
+        GpuHit* restir_gi_secondary_hits = static_cast<GpuHit*>(device_restir_gi_secondary_hits_);
+        int* restir_gi_secondary_results = static_cast<int*>(device_restir_gi_secondary_results_);
+        GpuRestirReservoir* restir_gi_secondary_direct =
+            static_cast<GpuRestirReservoir*>(device_restir_gi_secondary_direct_);
+        GpuPackedRestirGiReservoir* restir_gi_initial =
+            static_cast<GpuPackedRestirGiReservoir*>(device_restir_gi_initial_);
+        GpuPackedRestirGiReservoir* restir_gi_temporal =
+            static_cast<GpuPackedRestirGiReservoir*>(device_restir_gi_temporal_);
+        GpuPackedRestirGiReservoir* restir_gi_history =
+            static_cast<GpuPackedRestirGiReservoir*>(device_restir_gi_history_);
+        GpuPackedRestirGiReservoir* restir_gi_scratch =
+            static_cast<GpuPackedRestirGiReservoir*>(device_restir_gi_scratch_);
+        GpuRestirSurface* restir_gi_current_surfaces =
+            static_cast<GpuRestirSurface*>(device_restir_gi_current_surfaces_);
+        GpuRestirSurface* restir_gi_history_surfaces =
+            static_cast<GpuRestirSurface*>(device_restir_gi_history_surfaces_);
+        GpuRestirGiTemporalState* restir_gi_temporal_states =
+            static_cast<GpuRestirGiTemporalState*>(device_restir_gi_temporal_states_);
+        GpuRestirGiSpatialState* restir_gi_spatial_states =
+            static_cast<GpuRestirGiSpatialState*>(device_restir_gi_spatial_states_);
+        GpuRestirVisibilityRay* restir_gi_visibility_rays =
+            static_cast<GpuRestirVisibilityRay*>(device_restir_gi_visibility_rays_);
+        int* restir_gi_visibility_results = static_cast<int*>(device_restir_gi_visibility_results_);
+        GpuRestirPtPathState* restir_pt_path_states =
+            static_cast<GpuRestirPtPathState*>(device_restir_pt_path_states_);
+        GpuCompactHit* restir_pt_compact_hits =
+            static_cast<GpuCompactHit*>(device_restir_pt_compact_hits_);
+        GpuHit* restir_pt_hits = static_cast<GpuHit*>(device_restir_pt_hits_);
+        int* restir_pt_trace_results = static_cast<int*>(device_restir_pt_trace_results_);
+        int* restir_pt_active_indices = static_cast<int*>(device_restir_pt_active_indices_);
+        int* restir_pt_next_indices = static_cast<int*>(device_restir_pt_next_indices_);
+        GpuRestirPtQueueCounters* restir_pt_queue_counters =
+            static_cast<GpuRestirPtQueueCounters*>(device_restir_pt_queue_counters_);
+        GpuRestirReservoir* restir_pt_nee_reservoirs =
+            static_cast<GpuRestirReservoir*>(device_restir_pt_nee_reservoirs_);
+        GpuPackedRestirPtReservoir* restir_pt_initial =
+            static_cast<GpuPackedRestirPtReservoir*>(device_restir_pt_initial_);
+        GpuPackedRestirPtReservoir* restir_pt_temporal =
+            static_cast<GpuPackedRestirPtReservoir*>(device_restir_pt_temporal_);
+        GpuPackedRestirPtReservoir* restir_pt_history =
+            static_cast<GpuPackedRestirPtReservoir*>(device_restir_pt_history_);
+        GpuPackedRestirPtReservoir* restir_pt_scratch =
+            static_cast<GpuPackedRestirPtReservoir*>(device_restir_pt_scratch_);
+        GpuRestirSurface* restir_pt_current_surfaces =
+            static_cast<GpuRestirSurface*>(device_restir_pt_current_surfaces_);
+        GpuRestirSurface* restir_pt_history_surfaces =
+            static_cast<GpuRestirSurface*>(device_restir_pt_history_surfaces_);
+        GpuRestirPtTemporalState* restir_pt_temporal_states =
+            static_cast<GpuRestirPtTemporalState*>(device_restir_pt_temporal_states_);
+        GpuRestirPtSpatialState* restir_pt_spatial_states =
+            static_cast<GpuRestirPtSpatialState*>(device_restir_pt_spatial_states_);
+        GpuRestirVisibilityRay* restir_pt_visibility_rays =
+            static_cast<GpuRestirVisibilityRay*>(device_restir_pt_visibility_rays_);
+        int* restir_pt_visibility_results = static_cast<int*>(device_restir_pt_visibility_results_);
+        uint32_t* restir_pt_sample_ids = static_cast<uint32_t*>(device_restir_pt_sample_ids_);
+        uint32_t* restir_pt_duplication_counts =
+            static_cast<uint32_t*>(device_restir_pt_duplication_counts_);
         cudaError_t render_error = cudaMemset(sample_sum, 0, pixels * sizeof(Vec3));
         bool has_alpha_visibility = false;
         bool has_transmission = false;
@@ -1779,7 +2578,14 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         const bool has_direct_lights =
             !cached_render_scene_.light_triangle_indices.empty() ||
             !scene.directional_lights.empty() ||
+            !scene.point_lights.empty() || restir_any_enabled;
+        const bool has_restir_local_lights =
+            !cached_render_scene_.light_triangle_indices.empty() ||
+            !scene.directional_lights.empty() ||
             !scene.point_lights.empty();
+        const bool has_restir_environment = scene.environment.strength > 0.0f &&
+            (scene.environment.texture != nullptr || scene.environment.color.x > 0.0f ||
+                scene.environment.color.y > 0.0f || scene.environment.color.z > 0.0f);
         const bool use_two_level = use_two_level_accel(cached_render_scene_, settings.acceleration_structure);
         const bool use_wide_bvh = use_wavefront_bvh8_layout(cached_render_scene_, settings);
         const bool use_cwbvh = use_wavefront_cwbvh_layout(cached_render_scene_, settings);
@@ -1787,10 +2593,26 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         for (int sample_index = 0;
              render_error == cudaSuccess && sample_index < settings.samples_per_pixel;
              ++sample_index) {
+            const uint32_t restir_gi_sequence_index = settings.frame_index *
+                static_cast<uint32_t>(std::max(1, settings.samples_per_pixel)) +
+                static_cast<uint32_t>(sample_index);
             int* sample_active_indices = active_indices;
             int* sample_next_indices = next_indices;
             const int full_queue_grid = queue_grid_size(pixel_count);
             const int full_intersect_grid = intersect_grid_size(pixel_count);
+            if (restir_enabled) {
+                restir_clear_surfaces_kernel<<<full_queue_grid, queue_block_size>>>(restir_current_surfaces, pixel_count);
+            }
+            if (restir_gi_enabled) {
+                restir_clear_surfaces_kernel<<<full_queue_grid, queue_block_size>>>(restir_gi_current_surfaces, pixel_count);
+                cudaMemset(restir_gi_initial_samples, 0, pixels * sizeof(GpuRestirGiInitialSample));
+                cudaMemset(restir_gi_initial, 0, pixels * sizeof(GpuPackedRestirGiReservoir));
+            }
+            if (restir_pt_enabled) {
+                restir_clear_surfaces_kernel<<<full_queue_grid, queue_block_size>>>(restir_pt_current_surfaces, pixel_count);
+                cudaMemset(restir_pt_path_states, 0, pixels * sizeof(GpuRestirPtPathState));
+                cudaMemset(restir_pt_initial, 0, pixels * sizeof(GpuPackedRestirPtReservoir));
+            }
             {
                 const ScopedNvtxRange range("wavefront initialize");
                 wavefront_initialize_kernel<<<queue_grid_size(pixel_count), queue_block_size>>>(
@@ -1807,6 +2629,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             }
             for (int step = 0; render_error == cudaSuccess && step < max_path_steps; ++step) {
                 const ScopedNvtxRange step_range("wavefront step");
+                GpuRestirReservoir* restir_final = nullptr;
                 wavefront_prepare_step_kernel<<<1, 1>>>(queue_counters);
 
                 {
@@ -1859,6 +2682,114 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                         gi_indices, shadow_indices, bsdf_indices, queue_counters, svgf_aov, samples);
                 }
 
+                if (restir_enabled && step == 0) {
+                    {
+                        const ScopedNvtxRange range("ReSTIR initial candidates");
+                        #define LT_LAUNCH_RESTIR_INITIAL(LOCAL, ENVIRONMENT) \
+                            restir_initial_candidates_kernel<LOCAL, ENVIRONMENT><<<full_queue_grid, queue_block_size>>>( \
+                                device_scene, settings, paths, hits, shadow_indices, queue_counters, \
+                                restir_initial, restir_current_surfaces)
+                        if (has_restir_local_lights && has_restir_environment) {
+                            LT_LAUNCH_RESTIR_INITIAL(true, true);
+                        } else if (has_restir_local_lights) {
+                            LT_LAUNCH_RESTIR_INITIAL(true, false);
+                        } else if (has_restir_environment) {
+                            LT_LAUNCH_RESTIR_INITIAL(false, true);
+                        } else {
+                            LT_LAUNCH_RESTIR_INITIAL(false, false);
+                        }
+                        #undef LT_LAUNCH_RESTIR_INITIAL
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR initial visibility rays");
+                        cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                        restir_generate_visibility_rays_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, shadow_indices, queue_counters,
+                            restir_initial, restir_visibility_rays, restir_visibility_results,
+                            restir_visibility_indices, restir_visibility_count);
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR initial visibility trace");
+                        if (has_alpha_visibility || has_transmission) {
+                            launch_restir_visibility_trace<true>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_visibility_rays, restir_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else {
+                            launch_restir_visibility_trace<false>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_visibility_rays, restir_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        }
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR initial visibility resolve");
+                        restir_resolve_initial_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
+                            paths, shadow_indices, queue_counters, restir_initial, restir_visibility_results);
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR temporal reuse");
+                        restir_temporal_resample_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, shadow_indices, queue_counters,
+                            restir_initial, restir_history, restir_current_surfaces, restir_history_surfaces,
+                            restir_temporal, restir_temporal_states, restir_history_camera_, restir_history_valid_);
+                        restir_temporal_finalize_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, shadow_indices, queue_counters, restir_initial,
+                            restir_history_surfaces, restir_temporal_states, restir_temporal);
+                        const dim3 boiling_block(16, 16);
+                        const dim3 boiling_grid(
+                            (settings.width + boiling_block.x - 1) / boiling_block.x,
+                            (settings.height + boiling_block.y - 1) / boiling_block.y);
+                        restir_boiling_filter_kernel<<<boiling_grid, boiling_block>>>(
+                            restir_current_surfaces, restir_temporal, settings.width, settings.height);
+                    }
+                    restir_final = restir_temporal;
+                    if constexpr (kRestirSpatialSamples > 0) {
+                        const ScopedNvtxRange range("ReSTIR spatial reuse");
+                        restir_spatial_resample_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, shadow_indices, queue_counters,
+                            restir_temporal, restir_current_surfaces, restir_neighbor_offsets,
+                            restir_scratch, restir_spatial_states);
+                        restir_spatial_finalize_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, shadow_indices, queue_counters,
+                            restir_temporal, restir_current_surfaces, restir_neighbor_offsets,
+                            restir_spatial_states, restir_scratch);
+                        restir_final = restir_scratch;
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR visibility rays");
+                        cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                        restir_generate_visibility_rays_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, shadow_indices, queue_counters,
+                            restir_final, restir_visibility_rays, restir_visibility_results,
+                            restir_visibility_indices, restir_visibility_count);
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR visibility trace");
+                        if (has_alpha_visibility || has_transmission) {
+                            launch_restir_visibility_trace<true>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_visibility_rays, restir_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else {
+                            launch_restir_visibility_trace<false>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_visibility_rays, restir_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        }
+                    }
+                    {
+                        const ScopedNvtxRange range("ReSTIR visibility resolve");
+                        restir_resolve_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, shadow_indices, queue_counters,
+                            restir_final, restir_visibility_results);
+                    }
+                }
+
                 if (settings.use_lightmap || settings.use_irradiance_volume) {
                     wavefront_gi_kernel<<<full_queue_grid, queue_block_size>>>(
                         device_scene, settings, paths, hits, gi_indices,
@@ -1866,13 +2797,517 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 }
 
                 if (settings.sampling_mode != PathSamplingMode::Unidirectional) {
-                    if (has_direct_lights) {
+                    if (has_direct_lights && !(restir_enabled && step == 0)) {
                         const ScopedNvtxRange range("wavefront direct visibility");
                         wavefront_direct_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
                             device_scene, settings, paths, hits, shadow_indices,
                             queue_counters, samples);
                     }
-                    {
+                    if (restir_enabled && step == 0) {
+                        if constexpr (kRestirSpatialSamples > 0) {
+                            std::swap(device_restir_history_, device_restir_scratch_);
+                        } else {
+                            std::swap(device_restir_history_, device_restir_temporal_);
+                        }
+                        std::swap(device_restir_history_surfaces_, device_restir_current_surfaces_);
+                        restir_history = static_cast<GpuRestirReservoir*>(device_restir_history_);
+                        restir_scratch = static_cast<GpuRestirReservoir*>(device_restir_scratch_);
+                        restir_temporal = static_cast<GpuRestirReservoir*>(device_restir_temporal_);
+                        restir_history_surfaces = static_cast<GpuRestirSurface*>(device_restir_history_surfaces_);
+                        restir_current_surfaces = static_cast<GpuRestirSurface*>(device_restir_current_surfaces_);
+                        restir_history_camera_ = scene.camera;
+                        restir_history_valid_ = true;
+                    }
+                    if (restir_pt_enabled && step == 0) {
+                        const ScopedNvtxRange pt_range("ReSTIR PT");
+                        cudaMemsetAsync(restir_pt_path_states, 0,
+                            pixels * sizeof(GpuRestirPtPathState));
+                        cudaMemsetAsync(restir_pt_initial, 0,
+                            pixels * sizeof(GpuPackedRestirPtReservoir));
+                        cudaMemsetAsync(restir_pt_current_surfaces, 0,
+                            pixels * sizeof(GpuRestirSurface));
+                        restir_pt_reset_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                        restir_pt_setup_initial_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, bsdf_indices, queue_counters,
+                            restir_pt_path_states, restir_pt_initial, restir_pt_current_surfaces,
+                            restir_pt_active_indices, restir_pt_queue_counters, samples,
+                            restir_gi_sequence_index);
+
+                        int* pt_active = restir_pt_active_indices;
+                        int* pt_next = restir_pt_next_indices;
+                        const int pt_trace_steps = std::clamp(settings.cuda_restir_pt_max_bounces,
+                            2, std::max(2, std::min(settings.max_bounces, 8))) + kRestirPtExtraDeltaBudget;
+                        for (int pt_step = 0; pt_step < pt_trace_steps; ++pt_step) {
+                            if (has_alpha_visibility) {
+                                launch_restir_pt_trace<true>(device_scene, restir_pt_path_states,
+                                    restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                    restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            } else {
+                                launch_restir_pt_trace<false>(device_scene, restir_pt_path_states,
+                                    restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                    restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            }
+                            restir_pt_resolve_trace_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, settings, restir_pt_path_states, restir_pt_compact_hits,
+                                restir_pt_hits, restir_pt_trace_results, pt_active, restir_pt_queue_counters);
+
+                            cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                            #define LT_LAUNCH_RESTIR_PT_NEE(LOCAL, ENVIRONMENT) \
+                                restir_pt_generate_nee_kernel<LOCAL, ENVIRONMENT> \
+                                    <<<full_queue_grid, queue_block_size>>>( \
+                                        device_scene, settings, restir_pt_path_states, restir_pt_hits, \
+                                        restir_pt_trace_results, pt_active, restir_pt_queue_counters, \
+                                        restir_pt_nee_reservoirs, restir_pt_visibility_rays, \
+                                        restir_pt_visibility_results, restir_visibility_indices, \
+                                        restir_visibility_count)
+                            if (has_restir_local_lights && has_restir_environment) {
+                                LT_LAUNCH_RESTIR_PT_NEE(true, true);
+                            } else if (has_restir_local_lights) {
+                                LT_LAUNCH_RESTIR_PT_NEE(true, false);
+                            } else if (has_restir_environment) {
+                                LT_LAUNCH_RESTIR_PT_NEE(false, true);
+                            } else {
+                                LT_LAUNCH_RESTIR_PT_NEE(false, false);
+                            }
+                            #undef LT_LAUNCH_RESTIR_PT_NEE
+                            if (has_alpha_visibility || has_transmission) {
+                                launch_restir_visibility_trace<true>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            } else {
+                                launch_restir_visibility_trace<false>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            }
+                            restir_pt_stream_nee_continue_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, settings, restir_pt_path_states, restir_pt_hits,
+                                restir_pt_trace_results, restir_pt_nee_reservoirs,
+                                restir_pt_visibility_results, pt_active, pt_next,
+                                restir_pt_queue_counters);
+                            restir_pt_promote_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                            std::swap(pt_active, pt_next);
+                        }
+                        restir_pt_finalize_initial_kernel<<<full_queue_grid, queue_block_size>>>(
+                            restir_pt_path_states, restir_pt_initial, pixel_count);
+
+                        GpuPackedRestirPtReservoir* pt_final = restir_pt_initial;
+                        if (settings.cuda_restir_pt_resampling != RestirPtResamplingMode::None) {
+                            cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                            restir_pt_temporal_prepare_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, settings, restir_pt_current_surfaces,
+                                restir_pt_history_surfaces, restir_pt_history,
+                                settings.cuda_restir_pt_resampling == RestirPtResamplingMode::TemporalSpatial
+                                    ? restir_pt_duplication_counts : nullptr,
+                                restir_pt_temporal_states,
+                                restir_pt_visibility_rays,
+                                restir_pt_visibility_results, restir_visibility_indices,
+                                restir_visibility_count, restir_pt_path_states,
+                                restir_pt_history_camera_, restir_pt_history_valid_,
+                                restir_gi_sequence_index, pixel_count);
+                            restir_pt_reset_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                            pt_active = restir_pt_active_indices;
+                            pt_next = restir_pt_next_indices;
+                            restir_pt_replay_setup_kernel<GpuRestirPtTemporalState>
+                                <<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, restir_pt_path_states, restir_pt_temporal_states,
+                                    restir_pt_history, restir_pt_current_surfaces,
+                                    pt_active, restir_pt_queue_counters, pixel_count);
+                            for (int replay_step = 0; replay_step < 8; ++replay_step) {
+                                if (has_alpha_visibility) {
+                                    launch_restir_pt_trace<true>(device_scene, restir_pt_path_states,
+                                        restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                        restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                } else {
+                                    launch_restir_pt_trace<false>(device_scene, restir_pt_path_states,
+                                        restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                        restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                }
+                                restir_pt_replay_resolve_kernel<GpuRestirPtTemporalState>
+                                    <<<full_queue_grid, queue_block_size>>>(
+                                        device_scene, settings, restir_pt_path_states, restir_pt_temporal_states,
+                                        restir_pt_compact_hits, restir_pt_trace_results, pt_active, pt_next,
+                                        restir_pt_queue_counters, restir_pt_scratch,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        restir_visibility_indices, restir_visibility_count);
+                                restir_pt_promote_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                                std::swap(pt_active, pt_next);
+                            }
+                            if (has_alpha_visibility || has_transmission) {
+                                launch_restir_visibility_trace<true>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            } else {
+                                launch_restir_visibility_trace<false>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            }
+                            restir_pt_temporal_select_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, restir_pt_current_surfaces, restir_pt_history_surfaces,
+                                restir_pt_initial, restir_pt_history, restir_pt_scratch,
+                                restir_pt_temporal_states,
+                                restir_pt_visibility_results,
+                                restir_pt_temporal, restir_gi_sequence_index, pixel_count);
+                            cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                            restir_pt_inverse_prepare_kernel<GpuRestirPtTemporalState>
+                                <<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, settings, restir_pt_history_surfaces, restir_pt_temporal,
+                                    restir_pt_temporal_states, restir_pt_path_states,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    restir_visibility_indices, restir_visibility_count, pixel_count);
+                            restir_pt_reset_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                            pt_active = restir_pt_active_indices;
+                            pt_next = restir_pt_next_indices;
+                            restir_pt_inverse_replay_setup_kernel<GpuRestirPtTemporalState>
+                                <<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, restir_pt_path_states, restir_pt_temporal_states,
+                                    restir_pt_temporal, restir_pt_history_surfaces,
+                                    pt_active, restir_pt_queue_counters, pixel_count);
+                            for (int replay_step = 0; replay_step < 8; ++replay_step) {
+                                if (has_alpha_visibility) {
+                                    launch_restir_pt_trace<true>(device_scene, restir_pt_path_states,
+                                        restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                        restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                } else {
+                                    launch_restir_pt_trace<false>(device_scene, restir_pt_path_states,
+                                        restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                        restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                }
+                                restir_pt_replay_resolve_kernel<GpuRestirPtTemporalState>
+                                    <<<full_queue_grid, queue_block_size>>>(
+                                        device_scene, settings, restir_pt_path_states, restir_pt_temporal_states,
+                                        restir_pt_compact_hits, restir_pt_trace_results, pt_active, pt_next,
+                                        restir_pt_queue_counters, restir_pt_scratch,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        restir_visibility_indices, restir_visibility_count);
+                                restir_pt_promote_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                                std::swap(pt_active, pt_next);
+                            }
+                            if (has_alpha_visibility || has_transmission) {
+                                launch_restir_visibility_trace<true>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            } else {
+                                launch_restir_visibility_trace<false>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_pt_visibility_rays, restir_pt_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            }
+                            restir_pt_pairwise_normalize_kernel<GpuRestirPtTemporalState>
+                                <<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, restir_pt_history_surfaces, restir_pt_initial,
+                                    restir_pt_temporal, restir_pt_scratch, restir_pt_temporal_states,
+                                    restir_pt_visibility_results, restir_pt_temporal, pixel_count);
+                            const dim3 boiling_block(16, 16);
+                            const dim3 boiling_grid(
+                                (settings.width + boiling_block.x - 1) / boiling_block.x,
+                                (settings.height + boiling_block.y - 1) / boiling_block.y);
+                            restir_pt_boiling_filter_kernel<<<boiling_grid, boiling_block>>>(
+                                restir_pt_temporal, restir_pt_scratch, settings.width, settings.height);
+                            pt_final = restir_pt_scratch;
+                            if (settings.cuda_restir_pt_resampling == RestirPtResamplingMode::TemporalSpatial) {
+                                cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                                restir_pt_spatial_prepare_kernel<<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, settings, restir_pt_current_surfaces, pt_final,
+                                    restir_pt_spatial_states, restir_pt_visibility_rays,
+                                    restir_pt_visibility_results, restir_visibility_indices,
+                                    restir_visibility_count, restir_pt_path_states,
+                                    restir_gi_sequence_index, pixel_count);
+                                restir_pt_reset_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                                pt_active = restir_pt_active_indices;
+                                pt_next = restir_pt_next_indices;
+                                restir_pt_replay_setup_kernel<GpuRestirPtSpatialState>
+                                    <<<full_queue_grid, queue_block_size>>>(
+                                        device_scene, restir_pt_path_states, restir_pt_spatial_states,
+                                        pt_final, restir_pt_current_surfaces,
+                                        pt_active, restir_pt_queue_counters, pixel_count);
+                                for (int replay_step = 0; replay_step < 8; ++replay_step) {
+                                    if (has_alpha_visibility) {
+                                        launch_restir_pt_trace<true>(device_scene, restir_pt_path_states,
+                                            restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                            restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                            full_intersect_grid, intersect_block_size);
+                                    } else {
+                                        launch_restir_pt_trace<false>(device_scene, restir_pt_path_states,
+                                            restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                            restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                            full_intersect_grid, intersect_block_size);
+                                    }
+                                    restir_pt_replay_resolve_kernel<GpuRestirPtSpatialState>
+                                        <<<full_queue_grid, queue_block_size>>>(
+                                            device_scene, settings, restir_pt_path_states, restir_pt_spatial_states,
+                                            restir_pt_compact_hits, restir_pt_trace_results, pt_active, pt_next,
+                                            restir_pt_queue_counters, restir_pt_initial,
+                                            restir_pt_visibility_rays, restir_pt_visibility_results,
+                                            restir_visibility_indices, restir_visibility_count);
+                                    restir_pt_promote_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                                    std::swap(pt_active, pt_next);
+                                }
+                                if (has_alpha_visibility || has_transmission) {
+                                    launch_restir_visibility_trace<true>(device_scene, paths,
+                                        restir_visibility_indices, restir_visibility_count,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                } else {
+                                    launch_restir_visibility_trace<false>(device_scene, paths,
+                                        restir_visibility_indices, restir_visibility_count,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                }
+                                restir_pt_spatial_select_kernel<<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, restir_pt_current_surfaces, pt_final,
+                                    restir_pt_initial, restir_pt_spatial_states,
+                                    restir_pt_visibility_results,
+                                    restir_pt_history, restir_gi_sequence_index, pixel_count);
+                                cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                                restir_pt_inverse_prepare_kernel<GpuRestirPtSpatialState>
+                                    <<<full_queue_grid, queue_block_size>>>(
+                                        device_scene, settings, restir_pt_current_surfaces, restir_pt_history,
+                                        restir_pt_spatial_states, restir_pt_path_states,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        restir_visibility_indices, restir_visibility_count, pixel_count);
+                                restir_pt_reset_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                                pt_active = restir_pt_active_indices;
+                                pt_next = restir_pt_next_indices;
+                                restir_pt_inverse_replay_setup_kernel<GpuRestirPtSpatialState>
+                                    <<<full_queue_grid, queue_block_size>>>(
+                                        device_scene, restir_pt_path_states, restir_pt_spatial_states,
+                                        restir_pt_history, restir_pt_current_surfaces,
+                                        pt_active, restir_pt_queue_counters, pixel_count);
+                                for (int replay_step = 0; replay_step < 8; ++replay_step) {
+                                    if (has_alpha_visibility) {
+                                        launch_restir_pt_trace<true>(device_scene, restir_pt_path_states,
+                                            restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                            restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                            full_intersect_grid, intersect_block_size);
+                                    } else {
+                                        launch_restir_pt_trace<false>(device_scene, restir_pt_path_states,
+                                            restir_pt_compact_hits, restir_pt_trace_results, pt_active,
+                                            restir_pt_queue_counters, use_two_level, use_wide_bvh, use_cwbvh,
+                                            full_intersect_grid, intersect_block_size);
+                                    }
+                                    restir_pt_replay_resolve_kernel<GpuRestirPtSpatialState>
+                                        <<<full_queue_grid, queue_block_size>>>(
+                                            device_scene, settings, restir_pt_path_states, restir_pt_spatial_states,
+                                            restir_pt_compact_hits, restir_pt_trace_results, pt_active, pt_next,
+                                            restir_pt_queue_counters, restir_pt_initial,
+                                            restir_pt_visibility_rays, restir_pt_visibility_results,
+                                            restir_visibility_indices, restir_visibility_count);
+                                    restir_pt_promote_queue_kernel<<<1, 1>>>(restir_pt_queue_counters);
+                                    std::swap(pt_active, pt_next);
+                                }
+                                if (has_alpha_visibility || has_transmission) {
+                                    launch_restir_visibility_trace<true>(device_scene, paths,
+                                        restir_visibility_indices, restir_visibility_count,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                } else {
+                                    launch_restir_visibility_trace<false>(device_scene, paths,
+                                        restir_visibility_indices, restir_visibility_count,
+                                        restir_pt_visibility_rays, restir_pt_visibility_results,
+                                        use_two_level, use_wide_bvh, use_cwbvh,
+                                        full_intersect_grid, intersect_block_size);
+                                }
+                                restir_pt_pairwise_normalize_kernel<GpuRestirPtSpatialState>
+                                    <<<full_queue_grid, queue_block_size>>>(
+                                        device_scene, restir_pt_current_surfaces, pt_final,
+                                        restir_pt_history, restir_pt_initial, restir_pt_spatial_states,
+                                        restir_pt_visibility_results, restir_pt_history, pixel_count);
+                                pt_final = restir_pt_history;
+                            }
+                        }
+
+                        cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                        restir_pt_generate_final_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
+                            restir_pt_current_surfaces, pt_final, restir_pt_path_states,
+                            restir_pt_visibility_rays, restir_pt_visibility_results,
+                            restir_visibility_indices, restir_visibility_count, pixel_count);
+                        if (has_alpha_visibility || has_transmission) {
+                            launch_restir_visibility_trace<true>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_pt_visibility_rays, restir_pt_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else {
+                            launch_restir_visibility_trace<false>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_pt_visibility_rays, restir_pt_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        }
+                        restir_pt_resolve_final_kernel<<<full_queue_grid, queue_block_size>>>(
+                            paths, restir_pt_path_states, pt_final,
+                            restir_pt_visibility_results, samples, pixel_count);
+                        if (pt_final != restir_pt_history) {
+                            cudaMemcpyAsync(restir_pt_history, pt_final,
+                                pixels * sizeof(GpuPackedRestirPtReservoir), cudaMemcpyDeviceToDevice);
+                        }
+                        if (settings.cuda_restir_pt_resampling == RestirPtResamplingMode::TemporalSpatial) {
+                            restir_pt_fill_sample_ids_kernel<<<full_queue_grid, queue_block_size>>>(
+                                pt_final, restir_pt_sample_ids, pixel_count);
+                            const dim3 duplication_block(16, 16);
+                            const dim3 duplication_grid(
+                                (settings.width + duplication_block.x - 1) / duplication_block.x,
+                                (settings.height + duplication_block.y - 1) / duplication_block.y);
+                            restir_pt_duplication_map_kernel<<<duplication_grid, duplication_block>>>(
+                                restir_pt_sample_ids, restir_pt_duplication_counts,
+                                settings.width, settings.height);
+                        }
+                        cudaMemcpyAsync(restir_pt_history_surfaces, restir_pt_current_surfaces,
+                            pixels * sizeof(GpuRestirSurface), cudaMemcpyDeviceToDevice);
+                        restir_pt_history_camera_ = scene.camera;
+                        restir_pt_history_valid_ = true;
+                    } else if (restir_gi_enabled && step == 0) {
+                        const ScopedNvtxRange gi_range("ReSTIR GI");
+                        restir_gi_generate_secondary_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, hits, bsdf_indices, sample_next_indices,
+                            queue_counters, samples, restir_gi_initial_samples, restir_gi_current_surfaces);
+
+                        if (has_alpha_visibility) {
+                            launch_restir_gi_secondary_trace<true>(device_scene, settings, paths,
+                                bsdf_indices, queue_counters, restir_gi_initial_samples,
+                                restir_gi_secondary_compact_hits, restir_gi_secondary_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else {
+                            launch_restir_gi_secondary_trace<false>(device_scene, settings, paths,
+                                bsdf_indices, queue_counters, restir_gi_initial_samples,
+                                restir_gi_secondary_compact_hits, restir_gi_secondary_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        }
+
+                        restir_gi_setup_secondary_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, bsdf_indices, queue_counters,
+                            restir_gi_secondary_compact_hits, restir_gi_secondary_hits,
+                            restir_gi_secondary_results, restir_gi_initial_samples, samples);
+
+                        cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                        #define LT_LAUNCH_RESTIR_GI_DIRECT(LOCAL, ENVIRONMENT) \
+                            restir_gi_sample_secondary_direct_kernel<LOCAL, ENVIRONMENT> \
+                                <<<full_queue_grid, queue_block_size>>>( \
+                                    device_scene, settings, paths, bsdf_indices, queue_counters, \
+                                    restir_gi_secondary_hits, restir_gi_secondary_results, \
+                                    restir_gi_initial_samples, restir_gi_secondary_direct, \
+                                    restir_gi_visibility_rays, restir_gi_visibility_results, \
+                                    restir_visibility_indices, restir_visibility_count)
+                        if (has_restir_local_lights && has_restir_environment) {
+                            LT_LAUNCH_RESTIR_GI_DIRECT(true, true);
+                        } else if (has_restir_local_lights) {
+                            LT_LAUNCH_RESTIR_GI_DIRECT(true, false);
+                        } else if (has_restir_environment) {
+                            LT_LAUNCH_RESTIR_GI_DIRECT(false, true);
+                        } else {
+                            LT_LAUNCH_RESTIR_GI_DIRECT(false, false);
+                        }
+                        #undef LT_LAUNCH_RESTIR_GI_DIRECT
+
+                        if (has_alpha_visibility || has_transmission) {
+                            launch_restir_visibility_trace<true>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_gi_visibility_rays, restir_gi_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else {
+                            launch_restir_visibility_trace<false>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_gi_visibility_rays, restir_gi_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        }
+
+                        restir_gi_build_initial_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, bsdf_indices, queue_counters,
+                            restir_gi_initial_samples, restir_gi_secondary_hits,
+                            restir_gi_secondary_results, restir_gi_secondary_direct,
+                            restir_gi_visibility_results, restir_gi_initial);
+
+                        GpuPackedRestirGiReservoir* gi_final = restir_gi_initial;
+                        if (settings.cuda_restir_gi_resampling != RestirGiResamplingMode::None) {
+                            restir_gi_temporal_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, settings, restir_gi_current_surfaces, restir_gi_history_surfaces,
+                                restir_gi_initial, restir_gi_history, restir_gi_temporal,
+                                restir_gi_temporal_states,
+                                restir_gi_history_camera_, restir_gi_history_valid_,
+                                restir_gi_sequence_index, pixel_count);
+                            restir_gi_temporal_finalize_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, settings, restir_gi_current_surfaces, restir_gi_history_surfaces,
+                                restir_gi_initial, restir_gi_temporal_states, restir_gi_temporal, pixel_count);
+                            gi_final = restir_gi_temporal;
+                            if (settings.cuda_restir_gi_boiling_filter) {
+                                const dim3 boiling_block(16, 16);
+                                const dim3 boiling_grid(
+                                    (settings.width + boiling_block.x - 1) / boiling_block.x,
+                                    (settings.height + boiling_block.y - 1) / boiling_block.y);
+                                restir_gi_boiling_filter_kernel<<<boiling_grid, boiling_block>>>(
+                                    gi_final, restir_gi_scratch, settings.width, settings.height);
+                                gi_final = restir_gi_scratch;
+                            }
+                            if (settings.cuda_restir_gi_resampling == RestirGiResamplingMode::TemporalSpatial) {
+                                GpuPackedRestirGiReservoir* spatial_output =
+                                    gi_final == restir_gi_scratch ? restir_gi_history : restir_gi_scratch;
+                                restir_gi_spatial_kernel<<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, settings, restir_gi_current_surfaces,
+                                    gi_final, spatial_output, restir_gi_spatial_states,
+                                    restir_gi_sequence_index, pixel_count);
+                                restir_gi_spatial_finalize_kernel<<<full_queue_grid, queue_block_size>>>(
+                                    device_scene, settings, restir_gi_current_surfaces, gi_final,
+                                    restir_gi_spatial_states, spatial_output, pixel_count);
+                                gi_final = spatial_output;
+                            }
+                        }
+
+                        cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                        restir_gi_generate_final_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, restir_gi_current_surfaces, gi_final, restir_gi_visibility_rays,
+                            restir_gi_visibility_results, restir_gi_initial_samples,
+                            restir_visibility_indices, restir_visibility_count, pixel_count);
+                        if (has_alpha_visibility || has_transmission) {
+                            launch_restir_visibility_trace<true>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_gi_visibility_rays, restir_gi_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else {
+                            launch_restir_visibility_trace<false>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_gi_visibility_rays, restir_gi_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        }
+
+                        restir_gi_resolve_final_kernel<<<full_queue_grid, queue_block_size>>>(
+                            device_scene, settings, paths, restir_gi_initial_samples,
+                            restir_gi_current_surfaces, restir_gi_initial, gi_final,
+                            restir_gi_visibility_results, samples, pixel_count);
+                        if (gi_final != restir_gi_history) {
+                            cudaMemcpyAsync(restir_gi_history, gi_final,
+                                pixels * sizeof(GpuPackedRestirGiReservoir), cudaMemcpyDeviceToDevice);
+                        }
+                        cudaMemcpyAsync(restir_gi_history_surfaces, restir_gi_current_surfaces,
+                            pixels * sizeof(GpuRestirSurface), cudaMemcpyDeviceToDevice);
+                        restir_gi_history_camera_ = scene.camera;
+                        restir_gi_history_valid_ = true;
+                    } else {
                         const ScopedNvtxRange range("wavefront BSDF sample");
                         wavefront_bsdf_sample_kernel<<<full_queue_grid, queue_block_size>>>(
                             device_scene, settings, paths, hits, bsdf_indices,
