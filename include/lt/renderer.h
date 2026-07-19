@@ -192,7 +192,7 @@ struct RenderSettings {
     char lightmap_cache_key[1024] = {};
     LightmapBakeProgress* lightmap_bake_progress = nullptr;
     DenoiserMode denoiser_mode = DenoiserMode::Off;
-    bool cuda_wavefront = false;
+    bool cuda_wavefront = true;
     bool cuda_restir_di = false;
     RestirBiasCorrection cuda_restir_bias_correction = RestirBiasCorrection::Basic;
     bool cuda_restir_final_visibility_reuse = false;
@@ -666,6 +666,7 @@ private:
     void* device_restir_pt_visibility_results_ = nullptr;
     void* device_restir_pt_sample_ids_ = nullptr;
     void* device_restir_pt_duplication_counts_ = nullptr;
+    void* device_restir_pt_spatial_pairs_ = nullptr;
     std::vector<void*> texture_arrays_;
     std::vector<uint64_t> texture_objects_;
     RenderScene cached_render_scene_;

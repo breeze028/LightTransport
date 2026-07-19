@@ -1,4 +1,4 @@
-# CUDA Wavefront ReSTIR PT：GRIS 理论与 RTXDI 实现对照
+# CUDA Wavefront ReSTIR PT：GRIS、RTXDI 与 Enhanced 实现对照
 
 ReSTIR PT 的理论来源是 Lin 等人的 GRIS 论文 *Generalized Resampled Importance Sampling: Foundations of ReSTIR*。论文不只提出一个 path tracer，而是给出在不同积分域、相关样本和未知边缘 PDF 下进行 reservoir resampling 的统一框架，并以全路径重用作为主要应用。RTXDI 3.0 在此基础上提供面向实时渲染的 ReSTIR PT pipeline。
 
@@ -26,6 +26,7 @@ ReSTIR PT 的理论来源是 Lin 等人的 GRIS 论文 *Generalized Resampled Im
 参考资料：
 
 - Lin et al., *Generalized Resampled Importance Sampling: Foundations of ReSTIR*, SIGGRAPH 2022。
+- Lin et al., *ReSTIR PT Enhanced: Algorithmic Advances for Faster and More Robust ReSTIR Path Tracing*, I3D 2026。
 - NVIDIA RTXDI: [ReSTIR PT](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirPT.md) 与 [Integration Guide](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/Integration.md)。
 
 ## 2. Sections 1–2：为什么需要 GRIS
@@ -306,7 +307,7 @@ $$
 
 ### 8.3 Section 8.3：参数
 
-当前采用 RTXDI Medium 风格固定值：一个 initial path、throughput cutoff 0.05、RR continuation 0.8、额外 delta budget 4、boiling 0.2。temporal history/age 有上限；spatial 默认一个 32 px 随机磁盘邻居，disocclusion 时可增加候选。
+当前采用一个 initial path、throughput cutoff 0.05、RR continuation 0.5、额外 delta budget 4、boiling 0.2。较积极的初始路径 roulette 用于抵消确定性 replay 增加的存活路径成本；temporal history/age 有上限。spatial 每帧从 3 张 reciprocal pairing map 中选择一张，每个像素恰好有一个互惠邻居，配对距离按 $\sigma=16$ px 的正态分布近似生成。
 
 这些值不是 GRIS 公式常数。改变它们会影响方差、成本和探索速度；改变 clamp/boiling/shift rejection 还可能改变偏差。
 
@@ -314,7 +315,7 @@ $$
 
 RTXDI 把 GRIS 组织成：initial path generation、temporal shift/resampling、boiling、spatial shift/resampling 和 final shading。应用通过 bridge 提供材质、BSDF、ray tracing、surface data 和 light sampling，RTXDI 负责 reservoir/shift 的公共数学框架。
 
-RTXDI 的 realtime hybrid shift 通常还配合 sample ID、duplication map、checkerboard、Primary Surface Replacement 和降噪器数据。当前项目只实现核心路径，没有完整复制这些辅助系统。
+RTXDI 的 realtime hybrid shift 通常还配合 sample ID、duplication map、checkerboard、Primary Surface Replacement 和降噪器数据。当前项目实现了基于 replay seed 的 17×17 duplication map 和自适应 temporal history cap，但没有完整复制其余辅助系统。
 
 ## 10. CUDA wavefront 管线
 
@@ -332,15 +333,16 @@ flowchart LR
     J --> K["Boiling filter"]
     K --> L["Spatial forward shift"]
     L --> M["Spatial selection"]
-    M --> N["Spatial inverse shift"]
-    N --> O["Pairwise normalize"]
-    O --> P["Final visibility / shading"]
+    M --> N["Reciprocal pair normalize"]
+    N --> P["Final visibility / shading"]
     P --> Q["History"]
 ```
 
 ### 10.1 Initial path
 
 `restir_pt_setup_initial_kernel` 从主表面分流。非 delta path 进入独立 replay RNG；delta chain 继续现有 wavefront 逻辑。每个 bounce 拆成 trace、resolve、NEE generate、NEE visibility 和 continuation，避免把 traversal 与复杂材质状态塞进一个高寄存器 kernel。
+
+Initial sampling 在次级表面完成 NEE 后，对更深的 continuation 应用 Russian roulette；随机数由 path seed 和 depth 哈希得到，不占用 BSDF replay 维度。Random replay 不重新执行随机生死判断，而是在已知 source path 存活的条件下继续应用 $1/p_{rr}$ 补偿；这样既保留 source proposal PDF，又不会让合法 shift 因第二次 roulette 随机失败。固定存活率取 0.5，使 initial path 更短；代价是 initial sample 方差增加，但时空复用会显著抑制这部分噪声。
 
 emissive hit、environment miss 和可见 NEE contribution 在同一 initial path stream 中竞争。每条已生成 initial path 最终都贡献 $M=1$，即使没有找到光或贡献为零。
 
@@ -369,7 +371,9 @@ temporal pass 重投影 current receiver，寻找历史 reservoir，然后：
 
 ### 10.4 Spatial reuse
 
-spatial pass 对随机磁盘邻居执行同样的 forward/inverse hybrid shift。跨像素 surface compatibility 只是第一层过滤；真正的路径还要通过 lobe、reconnection、Jacobian 和 visibility 检查。当前 spatial pass 使用当前 BVH，没有 previous-frame geometry。
+spatial pass 使用 host 端生成并上传的 reciprocal pairing map；该缓冲只在 `temporal-spatial` 模式首次使用时懒分配，`none` 和 `temporal` 不承担生成、上传或显存成本。若 $A$ 与 $B$ 配对，则严格满足 `pair[A] == B` 和 `pair[B] == A`；奇数像素总数下会有一个 self-pair，并在设备端跳过。两边各做一次 forward shift：$B\to A$ 与 $A\to B$；selection 后的 pairwise MIS 直接复用对向已经得到的 target、Jacobian 和 visibility，不再为 selected reservoir 启动第二轮 inverse replay。
+
+配对表只负责摊销 shift，不绕过合法性检查。跨像素 surface compatibility 仍是第一层过滤，路径还必须通过 lobe、footprint reconnection、Jacobian 与 visibility 检查。若一侧 shift 失败，其 reciprocal density 在 normalization 中为零。3 张独立配对表逐帧轮换，减少固定配对形成的时空结构。
 
 ### 10.5 Final shading
 
@@ -430,8 +434,11 @@ $$
 - 当前是 RTXDI 风格 hybrid shift 的本地重写，不是 SDK HLSL 的逐行移植。
 - 没有 previous-frame BVH；temporal visibility 使用当前 BVH，场景变化时清空 history。
 - 没有完整 Primary Surface Replacement、checkerboard 或 production denoiser 集成。
-- duplication/sample-ID 基础设施有限，无法覆盖 RTXDI 的所有历史去重策略。
+- duplication/sample-ID 当前以 replay seed 标识共同 initial candidate，并用 17×17 duplication count 缩短 temporal history；尚未覆盖 mutation、PSR 等更完整策略。
 - spatial pass 的实时 pairwise 近似可能有偏；GRIS 理论无偏性依赖更严格的 mapping/support 条件。
+- 尚未实现 Enhanced 的 RGB vector-weight marginalization；当前 final visibility 只覆盖最终选中样本，若直接累计未选候选会缺少对应 visibility，不能作为无代价改动加入。
+- 尚未实现 dual motion vectors；当前场景数据没有遮挡面/反遮挡面的第二套运动矢量和 previous-frame instance transforms。
+- 主表面直接光仍由独立 NEE/MIS 或 ReSTIR DI 处理，尚未实现 Enhanced Section 6.1 的完整 DI/GI unified reservoir。
 - footprint/fixed threshold 是 reconnect vertex 启发式，不保证 shift 一定合法。
 - Jacobian/throughput cutoff、RR、boiling、M cap 和 shift rejection 都要作为 estimator 设计的一部分验证，不能只按视觉调参。
 - path suffix 的 light identity、量化 UV、sampler index 和 environment mapping 必须在 shift 后重新求值；直接复用旧 receiver 的 radiance 会造成漏光和颜色错误。

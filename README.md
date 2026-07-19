@@ -57,10 +57,13 @@ Basic format:
 lt_render [scene_path] [output_path] [options...]
 ```
 
+With an available CUDA device, `lt_render` and the editor default to the CUDA Wavefront Path Tracer.
+Use `--cpu` or `--cuda-megakernel` to select another renderer explicitly.
+
 Examples:
 
 ```powershell
-.\build\Release\lt_render.exe scenes\cornell.lt out.png --cuda
+.\build\Release\lt_render.exe scenes\cornell.lt out.png
 .\build\Release\lt_render.exe scenes\cornell.lt out.ppm --cpu --size 512 512 --frames 16
 .\build\Release\lt_render.exe path\to\model.glb model.png --cpu
 .\build\Release\lt_render.exe https://example.com/model.glb remote.png --cpu

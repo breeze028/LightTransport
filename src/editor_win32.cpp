@@ -5597,7 +5597,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
 #if LT_HAS_CUDA
     if (g_editor.cuda.available()) {
         g_editor.renderer = &g_editor.cuda;
-        LT_LOG_INFO("CUDA renderer is available; editor will start with CUDA");
+        LT_LOG_INFO("CUDA renderer is available; editor will start with CUDA Wavefront Path Tracer");
     } else {
         LT_LOG_WARN("CUDA runtime device is unavailable; editor will start with CPU");
     }

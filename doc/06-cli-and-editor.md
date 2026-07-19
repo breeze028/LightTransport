@@ -21,6 +21,8 @@ lt_render [scene_path] [output_path] [options...]
 
 默认场景是 `scenes/cornell.lt`，默认输出是 `out.ppm`。输出路径支持 `.ppm` 和 `.png`；参数从 `argv[3]` 开始解析，因此只想传 option 时仍需写前两个位置参数。
 
+默认渲染器是 CUDA Wavefront Path Tracer；CUDA 设备不可用或场景启用了仅 CPU 支持的 NPR 材质时自动回退到 CPU。`--cpu` 可显式选择 CPU，`--cuda-megakernel` 可显式选择 CUDA megakernel。
+
 ### 当前选项
 
 | 选项 | 作用 |

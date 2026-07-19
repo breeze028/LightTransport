@@ -95,12 +95,13 @@ static constexpr int kRestirPtMaxHistoryLength = 8;
 static constexpr int kRestirPtMaxAge = 30;
 static constexpr float kRestirPtDepthThreshold = 0.10f;
 static constexpr float kRestirPtNormalThreshold = 0.60f;
-static constexpr float kRestirPtSpatialRadius = 32.0f;
 static constexpr float kRestirPtThroughputCutoff = 0.05f;
-static constexpr float kRestirPtRrProbability = 0.80f;
+static constexpr float kRestirPtRrProbability = 0.50f;
 static constexpr int kRestirPtExtraDeltaBudget = 4;
 static constexpr float kRestirPtBoilingStrength = 0.20f;
 static constexpr float kRestirPtHistoryReductionStrength = 0.80f;
+static constexpr int kRestirPtPairingMapCount = 3;
+static constexpr float kRestirPtPairingSigma = 16.0f;
 
 __device__ bool restir_pt_valid_gpu(const GpuRestirPtReservoir& reservoir) {
     return reservoir.M > 0 && isfinite(reservoir.weight_sum) &&
@@ -879,9 +880,11 @@ __global__ void restir_pt_stream_nee_continue_kernel(const GpuScene* scene_ptr,
         return;
     }
     Vec3 next_throughput = mul(state.throughput, sample.weight);
-    if (state.depth > 1) {
+    if (state.depth >= 1) {
+        uint32_t rr_rng = restir_rng_seed_gpu(state.selected.random_seed,
+            0xa4093822u ^ static_cast<uint32_t>(state.depth) * 0x9e3779b9u);
         if (max_channel_gpu(next_throughput) < kRestirPtThroughputCutoff ||
-            rng_float(state.replay_rng) >= kRestirPtRrProbability) {
+            rng_float(rr_rng) >= kRestirPtRrProbability) {
             restir_pt_finalize_path_reservoir_gpu(state);
             return;
         }
@@ -1272,12 +1275,10 @@ __global__ void restir_pt_replay_resolve_kernel(const GpuScene* scene_ptr,
     }
 
     Vec3 throughput = mul(state.throughput, replay_sample.weight);
-    if (state.depth > 1) {
-        if (rng_float(state.replay_rng) >= kRestirPtRrProbability) {
-            reuse.valid = 0;
-            state.active = 0;
-            return;
-        }
+    if (state.depth >= 1) {
+        // Replay is conditioned on the source path having survived roulette. Keep
+        // its PDF compensation, but do not introduce a new failure or consume a
+        // BSDF replay dimension.
         throughput = divv(throughput, kRestirPtRrProbability);
         ++state.rr_count;
     }
@@ -1431,14 +1432,9 @@ __global__ void restir_pt_boiling_filter_kernel(const GpuPackedRestirPtReservoir
     output[pixel] = value > average * multiplier ? GpuPackedRestirPtReservoir{} : input[pixel];
 }
 
-__device__ int restir_pt_reflect_index_gpu(int value, int extent) {
-    if (value < 0) value = -value;
-    if (value >= extent) value = 2 * extent - value - 1;
-    return iclamp_gpu(value, 0, extent - 1);
-}
-
 __global__ void restir_pt_spatial_prepare_kernel(const GpuScene* scene_ptr, RenderSettings settings,
     const GpuRestirSurface* surfaces, const GpuPackedRestirPtReservoir* input,
+    const int* pairing_maps,
     GpuRestirPtSpatialState* states, GpuRestirVisibilityRay* rays, int* results,
     int* visibility_indices, int* visibility_count, const GpuRestirPtPathState* path_states,
     uint32_t sequence_index, int pixel_count) {
@@ -1448,33 +1444,13 @@ __global__ void restir_pt_spatial_prepare_kernel(const GpuScene* scene_ptr, Rend
     rays[pixel] = {};
     results[pixel] = -1;
     const GpuRestirSurface surface = surfaces[pixel];
-    if (!surface.valid) return;
-    const int x = pixel % settings.width;
-    const int y = pixel / settings.width;
-    uint32_t rng = make_pixel_seed(static_cast<uint32_t>(x), static_cast<uint32_t>(y),
-        sequence_index ^ 0x510e527fu);
-    const GpuRestirPtReservoir canonical = restir_pt_unpack_gpu(input[pixel]);
-    const int sample_count = !restir_pt_valid_gpu(canonical) || canonical.M <= 1 ? 4 : 1;
-    int source_pixel = -1;
-    for (int attempt = 0; attempt < sample_count && source_pixel < 0; ++attempt) {
-        const float angle = 2.0f * kPi * rng_float(rng);
-        const float radius = kRestirPtSpatialRadius * sqrtf(rng_float(rng));
-        const int nx = restir_pt_reflect_index_gpu(x + static_cast<int>(cosf(angle) * radius), settings.width);
-        const int ny = restir_pt_reflect_index_gpu(y + static_cast<int>(sinf(angle) * radius), settings.height);
-        const int candidate = ny * settings.width + nx;
-        if (!restir_pt_surfaces_compatible_gpu(surface, surfaces[candidate], surface.depth)) continue;
-        const GpuRestirPtReservoir source = restir_pt_unpack_gpu(input[candidate]);
-        if (!restir_pt_valid_gpu(source)) continue;
-        if (source.rc_length <= 2) {
-            const Vec3 target = restir_pt_shift_target_gpu(*scene_ptr, surface, surfaces[candidate], source);
-            if (!(restir_luminance_gpu(target) > 0.0f) ||
-                !(restir_pt_reconnection_jacobian_gpu(surface, source) > 0.0f) ||
-                !restir_pt_validate_reconnection_gpu(*scene_ptr, settings, surface, source)) continue;
-        }
-        source_pixel = candidate;
-    }
-    if (source_pixel < 0) return;
+    if (!surface.valid || pairing_maps == nullptr) return;
+    const int map_index = static_cast<int>(sequence_index % kRestirPtPairingMapCount);
+    const int source_pixel = pairing_maps[map_index * pixel_count + pixel];
+    if (source_pixel < 0 || source_pixel >= pixel_count || source_pixel == pixel ||
+        !restir_pt_surfaces_compatible_gpu(surface, surfaces[source_pixel], surface.depth)) return;
     const GpuRestirPtReservoir source = restir_pt_unpack_gpu(input[source_pixel]);
+    if (!restir_pt_valid_gpu(source)) return;
     GpuRestirPtSpatialState state;
     state.source_pixel = source_pixel;
     state.source_m = source.M;
@@ -1489,6 +1465,59 @@ __global__ void restir_pt_spatial_prepare_kernel(const GpuScene* scene_ptr, Rend
         visibility_indices[atomicAdd(visibility_count, 1)] = pixel;
     }
     states[pixel] = state;
+}
+
+__global__ void restir_pt_paired_spatial_normalize_kernel(const GpuScene* scene_ptr,
+    const GpuRestirSurface* surfaces, const GpuPackedRestirPtReservoir* canonical_reservoirs,
+    const GpuPackedRestirPtReservoir* forward_shifted_reservoirs,
+    const GpuPackedRestirPtReservoir* provisional_reservoirs,
+    const GpuRestirPtSpatialState* states, const int* forward_visibility_results,
+    GpuPackedRestirPtReservoir* output, int pixel_count) {
+    const int pixel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pixel >= pixel_count) return;
+    const GpuRestirPtReservoir canonical = restir_pt_unpack_gpu(canonical_reservoirs[pixel]);
+    GpuRestirPtReservoir selected = restir_pt_unpack_gpu(provisional_reservoirs[pixel]);
+    if (!restir_pt_valid_gpu(selected)) { output[pixel] = {}; return; }
+
+    const GpuRestirPtSpatialState state = states[pixel];
+    const float selected_target = restir_luminance_gpu(selected.target);
+    float inverse_density = 0.0f;
+    if (state.valid && state.source_pixel >= 0 && state.source_pixel < pixel_count &&
+        state.source_m > 0) {
+        if (state.selected_source != 0) {
+            const GpuRestirPtReservoir source =
+                restir_pt_unpack_gpu(canonical_reservoirs[state.source_pixel]);
+            if (restir_pt_valid_gpu(source) && state.jacobian > 0.0f) {
+                inverse_density = restir_luminance_gpu(source.target) / state.jacobian;
+            }
+        } else {
+            const GpuRestirPtSpatialState reciprocal = states[state.source_pixel];
+            if (reciprocal.valid && reciprocal.source_pixel == pixel &&
+                reciprocal.jacobian > 0.0f &&
+                forward_visibility_results[state.source_pixel] > 0) {
+                Vec3 reciprocal_target;
+                if (reciprocal.replayed != 0) {
+                    reciprocal_target = restir_pt_unpack_gpu(
+                        forward_shifted_reservoirs[state.source_pixel]).target;
+                } else {
+                    reciprocal_target = restir_pt_shift_target_gpu(*scene_ptr,
+                        surfaces[state.source_pixel], surfaces[pixel], canonical);
+                }
+                inverse_density = restir_luminance_gpu(reciprocal_target) * reciprocal.jacobian;
+            }
+        }
+    }
+    if (!isfinite(inverse_density)) inverse_density = 0.0f;
+
+    float pi = selected_target;
+    float pi_sum = selected_target * static_cast<float>(canonical.M);
+    if (state.valid && state.source_m > 0) {
+        if (state.selected_source != 0) pi = inverse_density;
+        pi_sum += inverse_density * static_cast<float>(state.source_m);
+    }
+    selected.weight_sum = selected_target > 0.0f && pi_sum > 0.0f
+        ? selected.weight_sum * pi / (selected_target * pi_sum) : 0.0f;
+    output[pixel] = restir_pt_pack_gpu(selected);
 }
 
 __global__ void restir_pt_spatial_select_kernel(const GpuScene* scene_ptr,

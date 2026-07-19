@@ -18,7 +18,7 @@ struct RenderOptions {
     std::string scene_path = "scenes/cornell.lt";
     std::string output_path = "out.ppm";
     RenderSettings settings;
-    bool prefer_cuda = false;
+    bool prefer_cuda = true;
     bool quiet = false;
     bool log_file_enabled = true;
     std::string log_file_path = "logs/lt_render.log";
