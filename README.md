@@ -15,6 +15,7 @@ LightTransport is an experimental light transport renderer playground for protot
 - **NPR experiments**: Color Map, X-Toon, Cross Hatching, primarily via CPU fallback.
 - **Precomputed GI**: Irradiance Volume and Lightmap, with caching, editor background baking, and CPU/CUDA queries.
 - **SVGF real-time denoising**: CPU/CUDA implementations, supporting rasterized G-buffer, debug view, StablePostAA/TAA.
+- **CUDA wavefront experiments**: queue-based path tracing, internal BVH8/CWBVH traversal layouts, and ReSTIR DI/GI/PT prototypes.
 - **Image output**: CLI writes `.ppm` or `.png` based on file extension; the editor can save the current rendered framebuffer as a PNG screenshot.
 
 ## Building
@@ -167,6 +168,11 @@ Detailed developer documentation is available at [doc/README.md](doc/README.md).
 - [Lightmap](doc/11-lightmap.md)
 - [Viewport View](doc/12-viewport-view.md)
 - [SVGF](doc/13-svgf.md)
+- [CWBVH](doc/13.5-cwbvh.md)
+- [Wavefront Path Tracing Optimization](doc/14-wavefront-path-tracing-optimization.md)
+- [ReSTIR DI](doc/15-wavefront-restir-di.md)
+- [ReSTIR GI](doc/16-wavefront-restir-gi.md)
+- [ReSTIR PT](doc/17-wavefront-restir-pt.md)
 
 Each topic covers the theory and formulas, data structures, CPU/CUDA/D3D11 implementation paths, editor entry points, and dirty/cache/history rules with verification methods.
 

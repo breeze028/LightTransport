@@ -8,6 +8,11 @@
 - [11-lightmap.md](11-lightmap.md)
 - [12-viewport-view.md](12-viewport-view.md)
 - [13-svgf.md](13-svgf.md)
+- [13.5-cwbvh.md](13.5-cwbvh.md)
+- [14-wavefront-path-tracing-optimization.md](14-wavefront-path-tracing-optimization.md)
+- [15-wavefront-restir-di.md](15-wavefront-restir-di.md)
+- [16-wavefront-restir-gi.md](16-wavefront-restir-gi.md)
+- [17-wavefront-restir-pt.md](17-wavefront-restir-pt.md)
 
 ## 修改点总表
 

@@ -103,7 +103,7 @@ FBX 基础：
 | StandardSurface | CPU/CUDA、各 lobe 独立和组合、transmission 路径 |
 | 纹理 | CPU/CUDA、无 mip/有 mip、alpha、环境、角色/色彩空间标记 |
 | 法线贴图 | 有效 UV 和退化 UV |
-| 几何/求交 | Flat/TwoLevel/Auto，单 Mesh 和多 Mesh |
+| 几何/求交 | Flat/TwoLevel，单 Mesh 和多 Mesh；CUDA wavefront 另测内部 BVH8/CWBVH fallback |
 | 灯光 | 单面/双面、材质 emission、Mesh light、方向光、无灯 |
 | Scene I/O | load、save、reload、非法 token、方向光读写 |
 | glTF | 外部资源、GLB 嵌入资源、多个 primitive |
@@ -115,6 +115,8 @@ FBX 基础：
 | NPR | 每种 style、style depth、CPU fallback |
 | 辐照度体积 | 烘焙完成、运行时查找、缓存读写、手动/自动边界、调试探针 |
 | MaterialInput | 各通道正确映射、UV 变换应用、色彩空间标记 |
+| CUDA Wavefront | `--cuda-wavefront`/`--cuda-megakernel` 对比、SVGF first-hit AOV、BVH8/CWBVH fallback、无 per-bounce D2H |
+| ReSTIR | DI/GI/PT 分别开启，visibility、history、bias correction 和与 SVGF/TAA 共存 |
 
 ## CPU/CUDA 对比
 

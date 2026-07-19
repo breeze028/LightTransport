@@ -8,6 +8,8 @@
 - [11-lightmap.md](11-lightmap.md)：Lightmap 的编辑器按钮、overlay 预览、CPU/CUDA 上传路径。
 - [12-viewport-view.md](12-viewport-view.md)：viewport 模式切换、GPU picking、选中描边、Material Preview 和 raster G-buffer。
 - [13-svgf.md](13-svgf.md)：SVGF、rasterized G-buffer、AA mode、debug view 的 CLI/编辑器触达点。
+- [13.5-cwbvh.md](13.5-cwbvh.md)：CUDA Wavefront 内部 BVH8/CWBVH traversal layout；它不是 CLI 或编辑器公开选项。
+- [15-wavefront-restir-di.md](15-wavefront-restir-di.md)、[16-wavefront-restir-gi.md](16-wavefront-restir-gi.md)、[17-wavefront-restir-pt.md](17-wavefront-restir-pt.md)：ReSTIR DI/GI/PT 参数与 wavefront 管线。
 
 ## 命令行入口
 
@@ -24,12 +26,35 @@ lt_render [scene_path] [output_path] [options...]
 | 选项 | 作用 |
 | --- | --- |
 | `--cpu` / `--cuda` | 后端偏好 |
+| `--cuda-wavefront` / `--cuda-megakernel` | CUDA 后端内部选择 wavefront 或 megakernel |
+| `--restir-di` / `--no-restir-di` | CUDA wavefront 主表面 ReSTIR DI |
+| `--restir-bias basic|ray-traced` | ReSTIR DI bias correction |
+| `--restir-final-visibility-reuse` / `--no-restir-final-visibility-reuse` | ReSTIR DI final visibility reuse |
+| `--restir-gi` / `--no-restir-gi` | CUDA wavefront ReSTIR GI |
+| `--restir-gi-bias basic|ray-traced` | ReSTIR GI bias correction |
+| `--restir-gi-resampling none|temporal|temporal-spatial` | ReSTIR GI reservoir resampling |
+| `--restir-gi-final-mis` / `--no-restir-gi-final-mis` | ReSTIR GI final MIS |
+| `--restir-gi-boiling-filter` / `--no-restir-gi-boiling-filter` | ReSTIR GI boiling filter |
+| `--restir-gi-secondary-roughness F` | ReSTIR GI secondary roughness floor |
+| `--restir-pt` / `--no-restir-pt` | CUDA wavefront ReSTIR PT |
+| `--restir-pt-resampling none|temporal|temporal-spatial` | ReSTIR PT reservoir resampling |
+| `--restir-pt-max-bounces N` | ReSTIR PT replay 最大弹射数 |
+| `--restir-pt-reconnection fixed|footprint` | ReSTIR PT reconnection 策略 |
 | `--mis` / `--no-mis` | MIS |
 | `--mis-heuristic balance|power` | MIS 启发式 |
 | `--accel flat|two-level` | 加速结构 |
 | `--spp N` | 每帧每像素样本 |
 | `--frames N` | 累积帧数 |
 | `--size W H` | 输出尺寸 |
+| `--denoiser svgf|off` | SVGF 降噪 |
+| `--aa off|stable|taa` | 后处理 AA/TAA |
+| `--svgf-iterations N` | A-trous pass 数 |
+| `--svgf-alpha F` | SVGF illumination history alpha |
+| `--svgf-moments-alpha F` | SVGF moments history alpha |
+| `--svgf-phi-color F` | SVGF 颜色权重参数 |
+| `--svgf-phi-normal F` | SVGF 法线权重参数 |
+| `--svgf-phi-depth F` | SVGF 深度权重参数 |
+| `--svgf-debug final|raw|albedo|normal|depth|variance|history` | SVGF debug view |
 | `--style STYLE` | 为所有材质设置 NPR |
 | `--material-style NAME STYLE` | 覆盖单个材质 |
 | `--style-samples N` | NPR 内部样本 |
@@ -231,7 +256,7 @@ if (ImGui::DragFloat("Aperture", &g_editor.scene.camera.aperture,
 
 SVGF 是 denoiser 选择，不会反向禁用 CUDA Wavefront。CUDA Wavefront 使用内部 custom/wide BVH
 layout，编辑器会固定 `Acceleration` 为 `Two-level BVH (Wavefront internal)`；切回 CPU 或 CUDA
-Megakernel 后用户可重新选择 `Flat BVH` 或 `Two-level BVH`。
+Megakernel 后用户可重新选择 `Flat BVH` 或 `Two-level BVH`。BVH8/CWBVH 不出现在该下拉框中；它们由 CUDA backend 根据 wavefront、Two-level、内存预算和实验门槛自行选择。
 
 状态栏显示的是实际有效后端。新增 CPU-only 功能时应建立统一能力检查，而不是只在一个 UI 控件里禁用 CUDA，否则 CLI 和编辑器可能行为不一致。
 

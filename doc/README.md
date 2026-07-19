@@ -28,6 +28,11 @@
 | Lightmap | [11-lightmap.md](11-lightmap.md) | `src/cpu/lightmap*.inl`、`src/gpu/shading.cuh`、`src/gpu/cuda_path_tracer.cu`、xatlas 集成 |
 | Viewport View | [12-viewport-view.md](12-viewport-view.md) | `src/editor_win32.cpp`、`src/editor/solid_preview.*` |
 | SVGF | [13-svgf.md](13-svgf.md) | `src/denoise/svgf.cpp`、`src/gpu/kernel.cuh`、`src/gpu/cuda_path_tracer.cu`、raster G-buffer 代码 |
+| CWBVH | [13.5-cwbvh.md](13.5-cwbvh.md) | `src/gpu/scene_upload.cuh`、`src/gpu/intersection.cuh`、`src/gpu/types.cuh` |
+| Wavefront Path Tracing 优化 | [14-wavefront-path-tracing-optimization.md](14-wavefront-path-tracing-optimization.md) | `src/gpu/cuda_path_tracer.cu`、`src/gpu/kernel.cuh`、`src/gpu/intersection.cuh` |
+| ReSTIR DI | [15-wavefront-restir-di.md](15-wavefront-restir-di.md) | `src/gpu/restir_di.cuh`、`src/gpu/cuda_path_tracer.cu` |
+| ReSTIR GI | [16-wavefront-restir-gi.md](16-wavefront-restir-gi.md) | `src/gpu/restir_gi.cuh`、`src/gpu/restir_di.cuh` |
+| ReSTIR PT | [17-wavefront-restir-pt.md](17-wavefront-restir-pt.md) | `src/gpu/restir_pt.cuh`、`src/gpu/restir_di.cuh` |
 
 ## 快速定位
 
@@ -43,6 +48,8 @@
 | 修改 Lightmap | [11-lightmap.md](11-lightmap.md) | xatlas unwrap、bake、cache、runtime lookup、GPU upload |
 | 修改 Viewport 预览 | [12-viewport-view.md](12-viewport-view.md) | D3D11 solid/material/wireframe、GPU picking、outline、raster G-buffer |
 | 修改 SVGF/TAA/Post AA | [13-svgf.md](13-svgf.md) | AOV 生成、temporal reprojection、A-trous filter、final resolve |
+| 修改 CUDA wavefront traversal | [13.5-cwbvh.md](13.5-cwbvh.md)、[14-wavefront-path-tracing-optimization.md](14-wavefront-path-tracing-optimization.md) | BVH8/CWBVH 打包、compact hit、kernel layout 选择、profile |
+| 修改 ReSTIR | [15-wavefront-restir-di.md](15-wavefront-restir-di.md)、[16-wavefront-restir-gi.md](16-wavefront-restir-gi.md)、[17-wavefront-restir-pt.md](17-wavefront-restir-pt.md) | reservoir、visibility、secondary trace、history |
 
 ## 跨模块规则
 

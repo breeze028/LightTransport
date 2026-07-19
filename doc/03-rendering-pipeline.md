@@ -8,6 +8,9 @@
 - [11-lightmap.md](11-lightmap.md)：lightmap 的 UV 展开、烘焙积分、`.lmap` 缓存、运行时查找。
 - [12-viewport-view.md](12-viewport-view.md)：编辑器 Rendered/Material Preview/Solid/Wireframe 视图、D3D11 picking/outline、raster G-buffer。
 - [13-svgf.md](13-svgf.md)：SVGF 的 AOV、重投影、方差估计、A-trous 滤波、final AA resolve。
+- [13.5-cwbvh.md](13.5-cwbvh.md)：CUDA wavefront 内部的 BVH8/CWBVH traversal layout、fallback 和 profiling 门槛。
+- [14-wavefront-path-tracing-optimization.md](14-wavefront-path-tracing-optimization.md)：wavefront 队列化、调度、profiling 和 Sponza 后续优化记录。
+- [15-wavefront-restir-di.md](15-wavefront-restir-di.md)、[16-wavefront-restir-gi.md](16-wavefront-restir-gi.md)、[17-wavefront-restir-pt.md](17-wavefront-restir-pt.md)：CUDA wavefront 上的 ReSTIR 直接光、间接光和全路径复用。
 
 ## 一帧怎样生成
 
@@ -66,8 +69,7 @@ CUDA 只拷回显示用 `rgba`，设备上的 HDR accumulation 继续保留。CP
 - `TwoLevel`：先 TLAS，再进入每个 Mesh 的 BLAS。
 
 CPU 选择发生在 `src/cpu/intersection.inl` 的 `use_two_level()`；GPU 选择发生在 `src/gpu/scene_upload.cuh` 的 `use_two_level_accel()`。修改策略时要保持两处一致。
-CUDA Wavefront 在编辑器中固定使用 TwoLevel，并在 CUDA backend 内部选择 custom/wide BLAS layout；
-这不是用户可见的 `AccelerationStructure` 枚举值。
+CUDA Wavefront 在编辑器中固定使用 TwoLevel，并在 CUDA backend 内部选择 binary/BVH8/CWBVH BLAS traversal layout；这些 wide layout 不是用户可见的 `AccelerationStructure` 枚举值。旧 `Auto` 模式已经移除，默认值是 `TwoLevel`。
 
 BVH 构建使用：
 
