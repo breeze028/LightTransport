@@ -70,6 +70,10 @@ MinSizeRel/
 external/*
 !external/tinybvh/
 !external/tinybvh/tiny_bvh.h
+!external/ufbx/
+!external/ufbx/LICENSE
+!external/ufbx/ufbx.c
+!external/ufbx/ufbx.h
 logs/
 papers/
 tmp/
