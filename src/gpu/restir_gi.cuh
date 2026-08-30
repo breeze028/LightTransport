@@ -26,10 +26,10 @@ struct GpuRestirGiTemporalState {
 };
 
 struct GpuRestirGiSpatialState {
-    int neighbor_pixels[2] = {-1, -1};
-    int neighbor_m[2] = {};
-    int neighbor_count = 0;
-    int selected_neighbor = -1;
+    int source_pixel = -1;
+    int source_m = 0;
+    int selected_source = 0;
+    int valid = 0;
     uint32_t correction_rng = 0;
 };
 
@@ -48,10 +48,10 @@ static_assert(sizeof(GpuPackedRestirGiReservoir) == 32, "packed ReSTIR GI reserv
 
 static constexpr int kRestirGiMaxHistoryLength = 8;
 static constexpr int kRestirGiMaxAge = 30;
-static constexpr int kRestirGiSpatialSamples = 2;
+static constexpr int kRestirGiPairingMapCount = 3;
 static constexpr float kRestirGiDepthThreshold = 0.10f;
 static constexpr float kRestirGiNormalThreshold = 0.60f;
-static constexpr float kRestirGiSpatialRadius = 32.0f;
+static constexpr float kRestirGiPairingSigma = 16.0f;
 static constexpr float kRestirGiBoilingStrength = 0.20f;
 static constexpr float kRestirGiFinalMisRoughness = 0.30f;
 
@@ -765,48 +765,44 @@ __global__ void restir_gi_boiling_filter_kernel(const GpuPackedRestirGiReservoir
     output[pixel] = value > average * multiplier ? GpuPackedRestirGiReservoir{} : input[pixel];
 }
 
-__device__ int restir_gi_reflect_index(int value, int extent) {
-    if (value < 0) value = -value;
-    if (value >= extent) value = 2 * extent - value - 1;
-    return iclamp_gpu(value, 0, extent - 1);
-}
-
 __global__ void restir_gi_spatial_kernel(const GpuScene* scene_ptr, RenderSettings settings,
     const GpuRestirSurface* surfaces, const GpuPackedRestirGiReservoir* input,
-    GpuPackedRestirGiReservoir* output, GpuRestirGiSpatialState* states,
+    const int* pairing_maps, GpuPackedRestirGiReservoir* output, GpuRestirGiSpatialState* states,
     uint32_t sequence_index, int pixel_count) {
     const int pixel = blockIdx.x * blockDim.x + threadIdx.x;
     if (pixel >= pixel_count) return;
+    states[pixel] = {};
     const GpuRestirSurface surface = surfaces[pixel];
-    if (!surface.valid) { output[pixel] = {}; states[pixel] = {}; return; }
+    if (!surface.valid) { output[pixel] = {}; return; }
     const GpuScene& scene = *scene_ptr;
-    const int x = pixel % settings.width;
-    const int y = pixel / settings.width;
-    uint32_t rng = restir_rng_seed_gpu(static_cast<uint32_t>(pixel) ^ sequence_index, 0xd1b54a35u);
+    uint32_t rng = make_pixel_seed(static_cast<uint32_t>(pixel), sequence_index, 0xd1b54a35u);
     GpuRestirGiReservoir result = {};
     const GpuRestirGiReservoir canonical = restir_gi_unpack(input[pixel]);
     const float canonical_target = restir_gi_target_gpu(scene, surface, canonical);
     restir_gi_combine_gpu(result, canonical, canonical_target, 1.0f, 0.5f);
-    GpuRestirGiSpatialState state;
-    for (int i = 0; i < kRestirGiSpatialSamples; ++i) {
-        const float angle = 2.0f * kPi * rng_float(rng);
-        const float radius = kRestirGiSpatialRadius * sqrtf(rng_float(rng));
-        const int nx = restir_gi_reflect_index(x + static_cast<int>(cosf(angle) * radius), settings.width);
-        const int ny = restir_gi_reflect_index(y + static_cast<int>(sinf(angle) * radius), settings.height);
-        const int neighbor_pixel = ny * settings.width + nx;
-        const GpuRestirSurface neighbor_surface = surfaces[neighbor_pixel];
-        if (!restir_gi_surfaces_compatible_gpu(surface, neighbor_surface, surface.depth)) continue;
-        const GpuRestirGiReservoir neighbor = restir_gi_unpack(input[neighbor_pixel]);
-        if (!restir_gi_valid(neighbor)) continue;
-        const float jacobian = restir_gi_jacobian_gpu(surface.position, neighbor_surface.position,
-            neighbor.position, restir_gi_sample_geo_normal_gpu(scene, neighbor));
-        if (!(jacobian > 0.0f)) continue;
-        const int state_index = state.neighbor_count++;
-        state.neighbor_pixels[state_index] = neighbor_pixel;
-        state.neighbor_m[state_index] = neighbor.M;
-        const float target = restir_gi_target_gpu(scene, surface, neighbor);
-        if (restir_gi_combine_gpu(result, neighbor, target, jacobian, rng_float(rng))) {
-            state.selected_neighbor = state_index;
+
+    GpuRestirGiSpatialState state = {};
+    if (pairing_maps != nullptr) {
+        const int map_index = static_cast<int>(sequence_index % kRestirGiPairingMapCount);
+        const int source_pixel = pairing_maps[map_index * pixel_count + pixel];
+        if (source_pixel >= 0 && source_pixel < pixel_count && source_pixel != pixel) {
+            const GpuRestirSurface source_surface = surfaces[source_pixel];
+            if (restir_gi_surfaces_compatible_gpu(surface, source_surface, surface.depth)) {
+                const GpuRestirGiReservoir source = restir_gi_unpack(input[source_pixel]);
+                if (restir_gi_valid(source)) {
+                    const float jacobian = restir_gi_jacobian_gpu(surface.position, source_surface.position,
+                        source.position, restir_gi_sample_geo_normal_gpu(scene, source));
+                    if (jacobian > 0.0f) {
+                        state.source_pixel = source_pixel;
+                        state.source_m = source.M;
+                        state.valid = 1;
+                        const float target = restir_gi_target_gpu(scene, surface, source);
+                        if (restir_gi_combine_gpu(result, source, target, jacobian, rng_float(rng))) {
+                            state.selected_source = 1;
+                        }
+                    }
+                }
+            }
         }
     }
     state.correction_rng = rng;
@@ -829,16 +825,15 @@ __global__ void restir_gi_spatial_finalize_kernel(const GpuScene* scene_ptr, Ren
     float pi = selected_target;
     float pi_sum = selected_target * static_cast<float>(canonical.M);
     uint32_t rng = state.correction_rng;
-    for (int i = 0; i < state.neighbor_count; ++i) {
-        const int neighbor_pixel = state.neighbor_pixels[i];
-        if (neighbor_pixel < 0 || state.neighbor_m[i] <= 0) continue;
-        const GpuRestirSurface neighbor_surface = surfaces[neighbor_pixel];
-        float neighbor_p = restir_gi_target_gpu(scene, neighbor_surface, result);
-        if (settings.cuda_restir_gi_bias_correction == RestirBiasCorrection::RayTraced && neighbor_p > 0.0f &&
-            !restir_gi_visible_gpu(scene, neighbor_surface.position, neighbor_surface.normal, result.position, rng))
-            neighbor_p = 0.0f;
-        if (state.selected_neighbor == i) pi = neighbor_p;
-        pi_sum += neighbor_p * static_cast<float>(state.neighbor_m[i]);
+    if (state.valid != 0 && state.source_pixel >= 0 &&
+        state.source_pixel < pixel_count && state.source_m > 0) {
+        const GpuRestirSurface source_surface = surfaces[state.source_pixel];
+        float source_p = restir_gi_target_gpu(scene, source_surface, result);
+        if (settings.cuda_restir_gi_bias_correction == RestirBiasCorrection::RayTraced && source_p > 0.0f &&
+            !restir_gi_visible_gpu(scene, source_surface.position, source_surface.normal, result.position, rng))
+            source_p = 0.0f;
+        if (state.selected_source != 0) pi = source_p;
+        pi_sum += source_p * static_cast<float>(state.source_m);
     }
     restir_gi_finalize_gpu(result, pi, selected_target * pi_sum);
     output[pixel] = restir_gi_pack(result);

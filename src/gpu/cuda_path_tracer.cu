@@ -207,16 +207,17 @@ std::vector<Vec2> build_restir_neighbor_offsets() {
     return offsets;
 }
 
-std::vector<int> build_restir_pt_spatial_pairs(int width, int height) {
+std::vector<int> build_restir_spatial_pairs(int width, int height, int map_count,
+    float sigma, uint32_t salt) {
     const int pixel_count = width * height;
-    std::vector<int> maps(static_cast<size_t>(pixel_count) * kRestirPtPairingMapCount, -1);
+    std::vector<int> maps(static_cast<size_t>(pixel_count) * map_count, -1);
     std::vector<int> order(static_cast<size_t>(pixel_count));
     std::iota(order.begin(), order.end(), 0);
-    std::mt19937 rng(0x6a09e667u ^ static_cast<uint32_t>(width) * 73856093u ^
+    std::mt19937 rng(salt ^ static_cast<uint32_t>(width) * 73856093u ^
         static_cast<uint32_t>(height) * 19349663u);
-    std::normal_distribution<float> offset_distribution(0.0f, kRestirPtPairingSigma);
+    std::normal_distribution<float> offset_distribution(0.0f, sigma);
 
-    for (int map_index = 0; map_index < kRestirPtPairingMapCount; ++map_index) {
+    for (int map_index = 0; map_index < map_count; ++map_index) {
         int* pairs = maps.data() + static_cast<size_t>(map_index) * pixel_count;
         std::shuffle(order.begin(), order.end(), rng);
         size_t fallback_cursor = 0;
@@ -245,6 +246,16 @@ std::vector<int> build_restir_pt_spatial_pairs(int width, int height) {
         }
     }
     return maps;
+}
+
+std::vector<int> build_restir_gi_spatial_pairs(int width, int height) {
+    return build_restir_spatial_pairs(width, height, kRestirGiPairingMapCount,
+        kRestirGiPairingSigma, 0xbb67ae85u);
+}
+
+std::vector<int> build_restir_pt_spatial_pairs(int width, int height) {
+    return build_restir_spatial_pairs(width, height, kRestirPtPairingMapCount,
+        kRestirPtPairingSigma, 0x6a09e667u);
 }
 
 float environment_sampler_luminance(Vec3 color) {
@@ -1248,6 +1259,7 @@ void CudaPathTracer::reset() {
     cudaFree(device_restir_gi_spatial_states_);
     cudaFree(device_restir_gi_visibility_rays_);
     cudaFree(device_restir_gi_visibility_results_);
+    cudaFree(device_restir_gi_spatial_pairs_);
     cudaFree(device_restir_pt_path_states_);
     cudaFree(device_restir_pt_compact_hits_);
     cudaFree(device_restir_pt_hits_);
@@ -1381,6 +1393,7 @@ void CudaPathTracer::reset() {
     device_restir_gi_spatial_states_ = nullptr;
     device_restir_gi_visibility_rays_ = nullptr;
     device_restir_gi_visibility_results_ = nullptr;
+    device_restir_gi_spatial_pairs_ = nullptr;
     device_restir_pt_path_states_ = nullptr;
     device_restir_pt_compact_hits_ = nullptr;
     device_restir_pt_hits_ = nullptr;
@@ -1749,6 +1762,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         cudaFree(device_restir_gi_spatial_states_);
         cudaFree(device_restir_gi_visibility_rays_);
         cudaFree(device_restir_gi_visibility_results_);
+        cudaFree(device_restir_gi_spatial_pairs_);
         cudaFree(device_restir_pt_path_states_);
         cudaFree(device_restir_pt_compact_hits_);
         cudaFree(device_restir_pt_hits_);
@@ -1861,6 +1875,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         device_restir_gi_spatial_states_ = nullptr;
         device_restir_gi_visibility_rays_ = nullptr;
         device_restir_gi_visibility_results_ = nullptr;
+        device_restir_gi_spatial_pairs_ = nullptr;
         device_restir_pt_path_states_ = nullptr;
         device_restir_pt_compact_hits_ = nullptr;
         device_restir_pt_hits_ = nullptr;
@@ -1968,6 +1983,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         settings.sampling_mode != PathSamplingMode::Unidirectional &&
         settings.max_bounces >= 2 &&
         !settings.use_lightmap && !settings.use_irradiance_volume && !restir_pt_enabled;
+    const bool restir_gi_spatial_enabled = restir_gi_enabled &&
+        settings.cuda_restir_gi_resampling == RestirGiResamplingMode::TemporalSpatial;
     const bool restir_any_enabled = restir_enabled || restir_gi_enabled || restir_pt_enabled;
     if (settings.cuda_restir_gi && settings.cuda_restir_pt) {
         const std::string key = "ReSTIR GI and PT requested together; PT takes precedence";
@@ -1978,6 +1995,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         }
     }
     const bool upload_restir_neighbor_offsets = restir_enabled && !device_restir_neighbor_offsets_;
+    const bool upload_restir_gi_spatial_pairs = restir_gi_spatial_enabled &&
+        !device_restir_gi_spatial_pairs_;
     const bool upload_restir_pt_spatial_pairs = restir_pt_spatial_enabled &&
         !device_restir_pt_spatial_pairs_;
     if (wavefront_enabled) {
@@ -2039,6 +2058,12 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
              !allocate_svgf_buffer(device_restir_gi_visibility_results_, pixels * sizeof(int), "could not allocate ReSTIR GI visibility result buffer"))) {
             return;
         }
+        if (restir_gi_spatial_enabled &&
+            !allocate_svgf_buffer(device_restir_gi_spatial_pairs_,
+                pixels * kRestirGiPairingMapCount * sizeof(int),
+                "could not allocate ReSTIR GI reciprocal-pairing buffer")) {
+            return;
+        }
         if (restir_pt_enabled &&
             (!allocate_svgf_buffer(device_restir_pt_path_states_, pixels * sizeof(GpuRestirPtPathState), "could not allocate ReSTIR PT path-state buffer") ||
              !allocate_svgf_buffer(device_restir_pt_compact_hits_, pixels * sizeof(GpuCompactHit), "could not allocate ReSTIR PT compact-hit buffer") ||
@@ -2076,6 +2101,18 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 reset();
                 render_cpu_fallback(scene, settings, framebuffer,
                     "could not upload ReSTIR neighbor offsets", cuda_error_text(cuda_error));
+                return;
+            }
+        }
+        if (upload_restir_gi_spatial_pairs) {
+            const std::vector<int> spatial_pairs = build_restir_gi_spatial_pairs(
+                settings.width, settings.height);
+            cuda_error = cudaMemcpy(device_restir_gi_spatial_pairs_, spatial_pairs.data(),
+                spatial_pairs.size() * sizeof(int), cudaMemcpyHostToDevice);
+            if (cuda_error != cudaSuccess) {
+                reset();
+                render_cpu_fallback(scene, settings, framebuffer,
+                    "could not upload ReSTIR GI reciprocal pairing maps", cuda_error_text(cuda_error));
                 return;
             }
         }
@@ -2585,6 +2622,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             static_cast<GpuRestirGiTemporalState*>(device_restir_gi_temporal_states_);
         GpuRestirGiSpatialState* restir_gi_spatial_states =
             static_cast<GpuRestirGiSpatialState*>(device_restir_gi_spatial_states_);
+        const int* restir_gi_spatial_pairs =
+            static_cast<const int*>(device_restir_gi_spatial_pairs_);
         GpuRestirVisibilityRay* restir_gi_visibility_rays =
             static_cast<GpuRestirVisibilityRay*>(device_restir_gi_visibility_rays_);
         int* restir_gi_visibility_results = static_cast<int*>(device_restir_gi_visibility_results_);
@@ -3295,7 +3334,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                                     gi_final == restir_gi_scratch ? restir_gi_history : restir_gi_scratch;
                                 restir_gi_spatial_kernel<<<full_queue_grid, queue_block_size>>>(
                                     device_scene, settings, restir_gi_current_surfaces,
-                                    gi_final, spatial_output, restir_gi_spatial_states,
+                                    gi_final, restir_gi_spatial_pairs,
+                                    spatial_output, restir_gi_spatial_states,
                                     restir_gi_sequence_index, pixel_count);
                                 restir_gi_spatial_finalize_kernel<<<full_queue_grid, queue_block_size>>>(
                                     device_scene, settings, restir_gi_current_surfaces, gi_final,

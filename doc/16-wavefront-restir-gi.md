@@ -196,7 +196,9 @@ $$
 
 本项目拒绝 $J\notin[0.1,10]$ 的复用，并把保留值钳制到 $[1/3,3]$。这是稳定性措施，会引入偏差；原论文也强调几何奇异点和极端 Jacobian 是 GI reuse 的主要风险。
 
-空间 pass 默认采两个 32 px 随机磁盘邻居，屏幕边界反射寻址。邻居 surface 必须通过深度、法线和材质检查。
+空间 pass 使用预生成的 reciprocal pairing map，而不是每个像素独立抽随机磁盘邻居。每帧从 3 张配对图中轮换一张；每张图把像素两两配成互惠 partner，偏移服从约 16 px 标准差的二维高斯分布。像素 $q$ 复用像素 $r$ 时，$r$ 在同一张图中也指回 $q$，因此 spatial finalize 的 normalization 只需要统计 canonical receiver 与这个互惠 partner。邻居 surface 仍必须通过深度、法线和材质检查，secondary sample 搬移时仍使用上面的 Jacobian。
+
+这个改动牺牲了“每次尝试多个邻居”的探索量，但修掉了单向随机邻域在高对比场景中容易形成的屏幕空间能量台阶。典型表现就是画面中轴线两侧一边整体偏亮、另一边偏暗；互惠配对让两个方向的 proposal 和归一化分母保持一致，行为与当前 ReSTIR PT spatial reuse 的修复路径一致。
 
 ## 5. Section 4.3：Bias
 
@@ -288,7 +290,7 @@ flowchart LR
 5. initial reservoir 保存 secondary position、normal、radiance、weight、$M$ 和 age；持久形式压缩 normal 与 LogLuv radiance。
 6. temporal stream/finalize 执行重投影、surface validation、Jacobian 与 correction。
 7. boiling filter 在 temporal 后限制 tile 内离群 reservoir。
-8. spatial stream/finalize 使用随机磁盘邻居与 canonical receiver normalization。
+8. spatial stream/finalize 使用 reciprocal pairing map 与 canonical/partner receiver normalization。
 9. final visibility 从当前 primary 连接 selected secondary；resolve 计算真实 primary BSDF、cosine、radiance 和 reservoir weight。
 
 ## 9. Final MIS

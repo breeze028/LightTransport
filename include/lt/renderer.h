@@ -646,6 +646,7 @@ private:
     void* device_restir_gi_spatial_states_ = nullptr;
     void* device_restir_gi_visibility_rays_ = nullptr;
     void* device_restir_gi_visibility_results_ = nullptr;
+    void* device_restir_gi_spatial_pairs_ = nullptr;
     void* device_restir_pt_path_states_ = nullptr;
     void* device_restir_pt_compact_hits_ = nullptr;
     void* device_restir_pt_hits_ = nullptr;
