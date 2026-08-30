@@ -620,10 +620,15 @@ __device__ void wavefront_sample_bsdf_to_next(
     int path_index,
     int* next_indices,
     GpuWavefrontQueueCounters* queue_counters,
+    bool finish_restir_direct_paths,
     Vec3* samples) {
     const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
     const GpuMaterial material = scene.materials[hit.material];
     const Vec3 wo = mul(path.ray.direction, -1.0f);
+    if (finish_restir_direct_paths && !wavefront_material_may_continue_as_transmission(material)) {
+        finish_wavefront_path(path, samples);
+        return;
+    }
     if (shading_bounce + 1 >= settings.max_bounces &&
         !wavefront_material_may_continue_as_transmission(material)) {
         finish_wavefront_path(path, samples);
@@ -691,6 +696,7 @@ __global__ void wavefront_bsdf_sample_kernel(
     const int* bsdf_indices,
     int* next_indices,
     GpuWavefrontQueueCounters* queue_counters,
+    bool finish_restir_direct_paths,
     Vec3* samples) {
     const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
     const int bsdf_count = queue_counters->num_queued[GpuWavefrontQueueBsdf];
@@ -700,7 +706,9 @@ __global__ void wavefront_bsdf_sample_kernel(
     const int path_index = bsdf_indices[queue_index];
     GpuWavefrontPathRef path = wavefront_path_ref(paths, path_index);
     const GpuHit hit = hits[path_index];
-    wavefront_sample_bsdf_to_next(scene, settings, path, hit, path_index, next_indices, queue_counters, samples);
+    wavefront_sample_bsdf_to_next(
+        scene, settings, path, hit, path_index, next_indices,
+        queue_counters, finish_restir_direct_paths, samples);
 }
 
 __global__ void wavefront_resolve_kernel(

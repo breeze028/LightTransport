@@ -69,7 +69,7 @@ __device__ bool restir_visibility_hit_is_target_gpu(const GpuRestirVisibilityRay
 // proposal. The actual count is smaller when a family is absent.
 static constexpr int kRestirInitialCandidates = 8;
 static constexpr int kRestirEnvironmentCandidates = 1;
-static constexpr int kRestirEnvironmentBrdfCandidates = 1;
+static constexpr int kRestirEnvironmentBrdfCandidates = 0;
 static constexpr int kRestirTemporalM = 16;
 static constexpr int kRestirMaxM = 32;
 static constexpr int kRestirSpatialSamples = 1;
@@ -645,7 +645,7 @@ __global__ void restir_initial_candidates_kernel(const GpuScene* scene_ptr, Rend
     const Vec3 wo = mul(path.ray.direction, -1.0f);
     Vec3 brdf_direction = {};
     bool brdf_sample_valid = false;
-    if constexpr (HasEnvironment) {
+    if constexpr (HasEnvironment && kRestirEnvironmentBrdfCandidates > 0) {
         const GpuMaterialSample brdf_sample =
             sample_material_gpu(scene, material, hit.normal, wo, hit.uv, hit.front_face, restir_rng);
         brdf_direction = brdf_sample.direction;
@@ -1153,6 +1153,26 @@ __global__ void restir_trace_visibility_kernel(const GpuScene* scene_ptr, GpuWav
         }
         visibility_results[pixel] = visible ? 1 : 0;
     }
+}
+
+template <bool AlphaVisibility, bool TwoLevel, GpuTraversalLayout Layout>
+__global__ void restir_trace_environment_visibility_kernel(const GpuScene* scene_ptr, GpuWavefrontPaths paths,
+    const int* visibility_indices, const int* visibility_count,
+    const GpuRestirVisibilityRay* visibility_rays, int* visibility_results) {
+    const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (queue_index >= *visibility_count) return;
+    const int pixel = visibility_indices[queue_index];
+    const GpuRestirVisibilityRay visibility = visibility_rays[pixel];
+    if (visibility.sample_type != static_cast<int>(GpuRestirLightType::Environment)) {
+        visibility_results[pixel] = 0;
+        return;
+    }
+
+    const GpuScene& scene = *scene_ptr;
+    GpuWavefrontPathRef path = wavefront_path_ref(paths, visibility.path_index);
+    const bool occluded = occluded_compact_gpu<TwoLevel, Layout, AlphaVisibility>(
+        scene, visibility.ray, path.rng);
+    visibility_results[pixel] = occluded ? 0 : 1;
 }
 
 __global__ void restir_resolve_visibility_kernel(const GpuScene* scene_ptr, RenderSettings settings,

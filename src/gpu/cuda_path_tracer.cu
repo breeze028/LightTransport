@@ -91,6 +91,28 @@ void launch_restir_visibility_trace(const GpuScene* scene, GpuWavefrontPaths pat
 }
 
 template <bool AlphaVisibility>
+void launch_restir_environment_visibility_trace(const GpuScene* scene, GpuWavefrontPaths paths,
+    const int* visibility_indices, const int* visibility_count,
+    const GpuRestirVisibilityRay* visibility_rays, int* visibility_results,
+    bool two_level, bool wide_bvh, bool cwbvh, int grid_size, int block_size) {
+    #define LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE(TWO_LEVEL, LAYOUT) \
+        restir_trace_environment_visibility_kernel<AlphaVisibility, TWO_LEVEL, LAYOUT><<<grid_size, block_size>>>( \
+            scene, paths, visibility_indices, visibility_count, visibility_rays, visibility_results)
+    if (two_level && cwbvh) {
+        LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE(true, GpuTraversalLayout::CwBvh);
+    } else if (two_level && wide_bvh) {
+        LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE(true, GpuTraversalLayout::Bvh8);
+    } else if (two_level) {
+        LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE(true, GpuTraversalLayout::Binary);
+    } else if (wide_bvh) {
+        LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE(false, GpuTraversalLayout::Bvh8);
+    } else {
+        LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE(false, GpuTraversalLayout::Binary);
+    }
+    #undef LT_LAUNCH_RESTIR_ENV_VISIBILITY_TRACE
+}
+
+template <bool AlphaVisibility>
 void launch_restir_gi_secondary_trace(const GpuScene* scene, RenderSettings settings,
     GpuWavefrontPaths paths, const int* bsdf_indices, const GpuWavefrontQueueCounters* queue_counters,
     const GpuRestirGiInitialSample* initial_samples, GpuCompactHit* secondary_hits, int* results,
@@ -2690,7 +2712,6 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             !cached_render_scene_.light_triangle_indices.empty() ||
             !scene.directional_lights.empty() ||
             !scene.point_lights.empty();
-        const bool queue_shadow_paths = has_local_direct_lights || restir_any_enabled;
         const bool has_restir_local_lights =
             !cached_render_scene_.light_triangle_indices.empty() ||
             !scene.directional_lights.empty() ||
@@ -2701,8 +2722,12 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         const bool use_two_level = use_two_level_accel(cached_render_scene_, settings.acceleration_structure);
         const bool use_wide_bvh = use_wavefront_bvh8_layout(cached_render_scene_, settings);
         const bool use_cwbvh = use_wavefront_cwbvh_layout(cached_render_scene_, settings);
+        const bool restir_environment_visibility_fast =
+            restir_enabled && use_cwbvh && !has_restir_local_lights && has_restir_environment &&
+            !has_blend_visibility && !has_transmission;
+        const bool finish_restir_direct_paths = restir_environment_visibility_fast;
         const bool terminal_occlusion_only =
-            !queue_shadow_paths && !settings.use_lightmap && !settings.use_irradiance_volume &&
+            !has_local_direct_lights && !settings.use_lightmap && !settings.use_irradiance_volume &&
             !has_blend_visibility;
 
         for (int sample_index = 0;
@@ -2745,6 +2770,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             for (int step = 0; render_error == cudaSuccess && step < max_path_steps; ++step) {
                 const ScopedNvtxRange step_range("wavefront step");
                 GpuRestirReservoir* restir_final = nullptr;
+                const bool queue_shadow_paths = has_local_direct_lights || (restir_any_enabled && step == 0);
                 wavefront_prepare_step_kernel<<<1, 1>>>(queue_counters);
 
                 {
@@ -2816,34 +2842,36 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                         }
                         #undef LT_LAUNCH_RESTIR_INITIAL
                     }
-                    {
-                        const ScopedNvtxRange range("ReSTIR initial visibility rays");
-                        cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
-                        restir_generate_visibility_rays_kernel<<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, paths, hits, shadow_indices, queue_counters,
-                            restir_initial, restir_visibility_rays, restir_visibility_results,
-                            restir_visibility_indices, restir_visibility_count);
-                    }
-                    {
-                        const ScopedNvtxRange range("ReSTIR initial visibility trace");
-                        if (has_alpha_visibility || has_transmission) {
-                            launch_restir_visibility_trace<true>(device_scene, paths,
-                                restir_visibility_indices, restir_visibility_count,
-                                restir_visibility_rays, restir_visibility_results,
-                                use_two_level, use_wide_bvh, use_cwbvh,
-                                full_intersect_grid, intersect_block_size);
-                        } else {
-                            launch_restir_visibility_trace<false>(device_scene, paths,
-                                restir_visibility_indices, restir_visibility_count,
-                                restir_visibility_rays, restir_visibility_results,
-                                use_two_level, use_wide_bvh, use_cwbvh,
-                                full_intersect_grid, intersect_block_size);
+                    if (!restir_environment_visibility_fast) {
+                        {
+                            const ScopedNvtxRange range("ReSTIR initial visibility rays");
+                            cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));
+                            restir_generate_visibility_rays_kernel<<<full_queue_grid, queue_block_size>>>(
+                                device_scene, settings, paths, hits, shadow_indices, queue_counters,
+                                restir_initial, restir_visibility_rays, restir_visibility_results,
+                                restir_visibility_indices, restir_visibility_count);
                         }
-                    }
-                    {
-                        const ScopedNvtxRange range("ReSTIR initial visibility resolve");
-                        restir_resolve_initial_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
-                            paths, shadow_indices, queue_counters, restir_initial, restir_visibility_results);
+                        {
+                            const ScopedNvtxRange range("ReSTIR initial visibility trace");
+                            if (has_alpha_visibility || has_transmission) {
+                                launch_restir_visibility_trace<true>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_visibility_rays, restir_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            } else {
+                                launch_restir_visibility_trace<false>(device_scene, paths,
+                                    restir_visibility_indices, restir_visibility_count,
+                                    restir_visibility_rays, restir_visibility_results,
+                                    use_two_level, use_wide_bvh, use_cwbvh,
+                                    full_intersect_grid, intersect_block_size);
+                            }
+                        }
+                        {
+                            const ScopedNvtxRange range("ReSTIR initial visibility resolve");
+                            restir_resolve_initial_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
+                                paths, shadow_indices, queue_counters, restir_initial, restir_visibility_results);
+                        }
                     }
                     {
                         const ScopedNvtxRange range("ReSTIR temporal reuse");
@@ -2884,7 +2912,19 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                     }
                     {
                         const ScopedNvtxRange range("ReSTIR visibility trace");
-                        if (has_alpha_visibility || has_transmission) {
+                        if (restir_environment_visibility_fast && has_alpha_visibility) {
+                            launch_restir_environment_visibility_trace<true>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_visibility_rays, restir_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else if (restir_environment_visibility_fast) {
+                            launch_restir_environment_visibility_trace<false>(device_scene, paths,
+                                restir_visibility_indices, restir_visibility_count,
+                                restir_visibility_rays, restir_visibility_results,
+                                use_two_level, use_wide_bvh, use_cwbvh,
+                                full_intersect_grid, intersect_block_size);
+                        } else if (has_alpha_visibility || has_transmission) {
                             launch_restir_visibility_trace<true>(device_scene, paths,
                                 restir_visibility_indices, restir_visibility_count,
                                 restir_visibility_rays, restir_visibility_results,
@@ -3379,14 +3419,14 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                         const ScopedNvtxRange range("wavefront BSDF sample");
                         wavefront_bsdf_sample_kernel<<<full_queue_grid, queue_block_size>>>(
                             device_scene, settings, paths, hits, bsdf_indices,
-                            sample_next_indices, queue_counters, samples);
+                            sample_next_indices, queue_counters, finish_restir_direct_paths, samples);
                     }
                 }
 
                 if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
                     wavefront_bsdf_sample_kernel<<<full_queue_grid, queue_block_size>>>(
                         device_scene, settings, paths, hits, bsdf_indices,
-                        sample_next_indices, queue_counters, samples);
+                        sample_next_indices, queue_counters, finish_restir_direct_paths, samples);
                 }
 
                 wavefront_promote_next_kernel<<<1, 1>>>(queue_counters);
