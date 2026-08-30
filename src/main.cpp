@@ -1,8 +1,13 @@
 #include "lt/image_io.h"
 #include "cli/render_options.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <iomanip>
 #include <iostream>
+#include <numeric>
+#include <vector>
 
 namespace {
 
@@ -34,6 +39,37 @@ void set_lightmap_cache_defaults(lt::RenderSettings& settings, const std::string
     if (settings.lightmap_cache_path[0] == '\0' && !scene_path.empty()) {
         copy_setting_text(settings.lightmap_cache_path, scene_path + ".lmap");
     }
+}
+
+void print_benchmark_summary(const std::vector<double>& frame_times_ms, int warmup_frames) {
+    if (frame_times_ms.empty()) {
+        return;
+    }
+    const size_t begin = std::min(static_cast<size_t>(std::max(0, warmup_frames)), frame_times_ms.size());
+    std::vector<double> measured(frame_times_ms.begin() + begin, frame_times_ms.end());
+    if (measured.empty()) {
+        measured = frame_times_ms;
+        warmup_frames = 0;
+    }
+    std::sort(measured.begin(), measured.end());
+    const size_t count = measured.size();
+    const double mean = std::accumulate(measured.begin(), measured.end(), 0.0) / static_cast<double>(count);
+    const double median = count % 2 == 0
+        ? (measured[count / 2 - 1] + measured[count / 2]) * 0.5
+        : measured[count / 2];
+    const size_t p95_index = std::min(count - 1, (count * 95 + 99) / 100 - 1);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "Benchmark render_ms"
+              << " frames=" << frame_times_ms.size()
+              << " warmup=" << begin
+              << " measured=" << count
+              << " mean=" << mean
+              << " median=" << median
+              << " p95=" << measured[p95_index]
+              << " min=" << measured.front()
+              << " max=" << measured.back()
+              << "\n";
 }
 
 } // namespace
@@ -72,6 +108,10 @@ int main(int argc, char** argv) {
     lt::Framebuffer framebuffer;
     framebuffer.resize(options.settings.width, options.settings.height);
     const uint32_t frames = options.settings.frame_index + 1u;
+    std::vector<double> frame_times_ms;
+    if (options.benchmark) {
+        frame_times_ms.reserve(frames);
+    }
     for (uint32_t frame = 0; frame < frames; ++frame) {
         options.settings.frame_index = frame;
         options.settings.dirty = frame == 0 ? lt::RenderDirty::All : lt::RenderDirty::None;
@@ -83,13 +123,21 @@ int main(int argc, char** argv) {
             options.settings.camera_jitter_x = 0.0f;
             options.settings.camera_jitter_y = 0.0f;
         }
+        const auto render_begin = std::chrono::steady_clock::now();
         renderer->render(loaded.scene, options.settings, framebuffer);
+        if (options.benchmark) {
+            const auto render_end = std::chrono::steady_clock::now();
+            frame_times_ms.push_back(std::chrono::duration<double, std::milli>(render_end - render_begin).count());
+        }
         if (!options.quiet) {
             std::cout << "\r" << renderer->name() << " frame " << (frame + 1u) << "/" << frames << std::flush;
         }
     }
     if (!options.quiet) {
         std::cout << "\n" << std::flush;
+    }
+    if (options.benchmark) {
+        print_benchmark_summary(frame_times_ms, options.benchmark_warmup_frames);
     }
 
     std::string output_error;

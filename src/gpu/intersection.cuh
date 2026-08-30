@@ -27,6 +27,8 @@ __device__ bool traversal_material_has_alpha(int material_and_flags) {
     return (material_and_flags & kTraversalMaterialAlphaBit) != 0;
 }
 
+__device__ bool material_visible_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv, uint32_t& rng);
+
 __device__ Vec2 sphere_uv_gpu(Vec3 normal) {
     const float u = atan2f(normal.z, normal.x) / (2.0f * kPi) + 0.5f;
     const float v = acosf(dclamp(normal.y, -1.0f, 1.0f)) / kPi;
@@ -198,6 +200,71 @@ __device__ Vec2 compact_hit_uv_gpu(const GpuScene& scene, const Ray& ray, const 
         return sphere_uv_gpu(outward_normal);
     }
     return {};
+}
+
+template <bool AlphaVisibility>
+__device__ bool occluded_spheres_compact_gpu(const GpuScene& scene, const Ray& ray, uint32_t& rng) {
+    for (int i = 0; i < scene.sphere_count; ++i) {
+        const GpuSphere sphere = scene.spheres[i];
+        if (sphere.material < 0 || sphere.material >= scene.material_count) {
+            continue;
+        }
+        GpuCompactHit hit;
+        if (!intersect_sphere_compact_gpu(sphere, i, ray, hit)) {
+            continue;
+        }
+        if constexpr (!AlphaVisibility) {
+            return true;
+        } else {
+            const GpuMaterial material = scene.materials[hit.material];
+            if (material_visible_gpu(scene, material, compact_hit_uv_gpu(scene, ray, hit), rng)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+template <bool MaskAlphaVisibility>
+__device__ __forceinline__ bool store_compact_triangle_hit_gpu(
+    const GpuScene& scene,
+    const Ray& ray,
+    int tri_index,
+    int material_and_flags,
+    float t,
+    float u,
+    float v,
+    GpuCompactHit& hit)
+{
+    const int material_index = traversal_material_index(material_and_flags);
+    if (material_index < 0 || material_index >= scene.material_count) {
+        return false;
+    }
+    if constexpr (MaskAlphaVisibility) {
+        if (traversal_material_has_alpha(material_and_flags)) {
+            const GpuMaterial material = scene.materials[material_index];
+            if (material.alpha_mode == static_cast<int>(AlphaMode::Mask)) {
+                GpuCompactHit candidate;
+                candidate.t = t;
+                candidate.u = u;
+                candidate.v = v;
+                candidate.material = material_and_flags;
+                candidate.triangle = tri_index;
+                candidate.sphere = -1;
+                uint32_t ignored_rng = 0;
+                if (!material_visible_gpu(scene, material, compact_hit_uv_gpu(scene, ray, candidate), ignored_rng)) {
+                    return false;
+                }
+            }
+        }
+    }
+    hit.t = t;
+    hit.u = u;
+    hit.v = v;
+    hit.material = material_and_flags;
+    hit.triangle = tri_index;
+    hit.sphere = -1;
+    return true;
 }
 
 __device__ Vec3 inverse_ray_direction_gpu(Vec3 direction) {
@@ -599,6 +666,7 @@ __device__ __forceinline__ bool intersect_cwbvh_quantized_child_gpu(
     return tmax >= tmin;
 }
 
+template <bool MaskAlphaVisibility = false>
 __device__ __forceinline__ bool intersect_cwbvh_triangle_compact_gpu(
     const GpuScene& scene,
     const Ray& ray,
@@ -626,17 +694,63 @@ __device__ __forceinline__ bool intersect_cwbvh_triangle_compact_gpu(
     float u = 0.0f;
     float v = 0.0f;
     if (intersect_triangle(traversal_tri, ray, t, u, v) && t < hit.t) {
-        hit.t = t;
-        hit.u = u;
-        hit.v = v;
-        hit.material = material_and_flags;
-        hit.triangle = tri_index;
-        hit.sphere = -1;
-        return true;
+        return store_compact_triangle_hit_gpu<MaskAlphaVisibility>(
+            scene, ray, tri_index, material_and_flags, t, u, v, hit);
     }
     return false;
 }
 
+template <bool AlphaVisibility>
+__device__ __forceinline__ bool occluded_cwbvh_triangle_gpu(
+    const GpuScene& scene,
+    const Ray& ray,
+    int tri_addr,
+    uint32_t& rng)
+{
+    if (tri_addr < 0 || tri_addr + 2 >= scene.cwbvh_triangle_count || scene.cwbvh_triangles == nullptr) {
+        return false;
+    }
+    const float4 edge2_block = scene.cwbvh_triangles[tri_addr + 0];
+    const float4 edge1_block = scene.cwbvh_triangles[tri_addr + 1];
+    const float4 v0_block = scene.cwbvh_triangles[tri_addr + 2];
+    const int tri_index = static_cast<int>(cwbvh_float_bits_gpu(v0_block.w));
+    const int material_and_flags = static_cast<int>(cwbvh_float_bits_gpu(edge2_block.w));
+    const GpuTraversalTriangle traversal_tri{
+        Vec3{v0_block.x, v0_block.y, v0_block.z},
+        Vec3{edge1_block.x, edge1_block.y, edge1_block.z},
+        Vec3{edge2_block.x, edge2_block.y, edge2_block.z},
+        material_and_flags,
+    };
+    float t = 0.0f;
+    float u = 0.0f;
+    float v = 0.0f;
+    if (!intersect_triangle(traversal_tri, ray, t, u, v)) {
+        return false;
+    }
+    const int material_index = traversal_material_index(material_and_flags);
+    if (material_index < 0 || material_index >= scene.material_count ||
+        tri_index < 0 || tri_index >= scene.triangle_count) {
+        return true;
+    }
+    if constexpr (AlphaVisibility) {
+        if (traversal_material_has_alpha(material_and_flags)) {
+            GpuCompactHit candidate;
+            candidate.t = t;
+            candidate.u = u;
+            candidate.v = v;
+            candidate.material = material_and_flags;
+            candidate.triangle = tri_index;
+            candidate.sphere = -1;
+            const GpuMaterial material = scene.materials[material_index];
+            if (!material_visible_gpu(scene, material, compact_hit_uv_gpu(scene, ray, candidate), rng)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template <bool MaskAlphaVisibility = false>
 __device__ bool intersect_cwbvh_compact_gpu(
     const GpuScene& scene,
     const Ray& ray,
@@ -650,7 +764,8 @@ __device__ bool intersect_cwbvh_compact_gpu(
     }
 
     bool found = false;
-    uint2 stack[32];
+    constexpr int kCwBvhStackCapacity = 32;
+    uint2 stack[kCwBvhStackCapacity];
     int stack_size = 0;
     const unsigned int octinv = 7u - ((ray.direction.x < 0.0f ? 4u : 0u) |
         (ray.direction.y < 0.0f ? 2u : 0u) |
@@ -665,7 +780,7 @@ __device__ bool intersect_cwbvh_compact_gpu(
             const unsigned int child_bit_index = 31u - static_cast<unsigned int>(__clz(hits));
             const unsigned int child_node_base = ngroup.x;
             ngroup.y &= ~(1u << child_bit_index);
-            if (ngroup.y > 0x00ffffffu && stack_size < 32) {
+            if (ngroup.y > 0x00ffffffu && stack_size < kCwBvhStackCapacity) {
                 stack[stack_size++] = ngroup;
             }
 
@@ -724,7 +839,8 @@ __device__ bool intersect_cwbvh_compact_gpu(
         while (tgroup.y != 0u) {
             const unsigned int tri_bit = 31u - static_cast<unsigned int>(__clz(tgroup.y));
             tgroup.y &= ~(1u << tri_bit);
-            found = intersect_cwbvh_triangle_compact_gpu(scene, ray, static_cast<int>(tgroup.x + tri_bit * 3u), hit) || found;
+            found = intersect_cwbvh_triangle_compact_gpu<MaskAlphaVisibility>(
+                scene, ray, static_cast<int>(tgroup.x + tri_bit * 3u), hit) || found;
         }
 
         if (ngroup.y <= 0x00ffffffu) {
@@ -738,8 +854,114 @@ __device__ bool intersect_cwbvh_compact_gpu(
     return found;
 }
 
+template <bool AlphaVisibility = false>
+__device__ bool occluded_cwbvh_compact_gpu(
+    const GpuScene& scene,
+    const Ray& ray,
+    Vec3 inv_direction,
+    int root,
+    uint32_t& rng)
+{
+    if (root < 0 || root >= scene.cwbvh_node_count || scene.traversal_cwbvh_nodes == nullptr ||
+        scene.cwbvh_triangles == nullptr) {
+        return false;
+    }
+
+    constexpr int kCwBvhStackCapacity = 32;
+    uint2 stack[kCwBvhStackCapacity];
+    int stack_size = 0;
+    const unsigned int octinv = 7u - ((ray.direction.x < 0.0f ? 4u : 0u) |
+        (ray.direction.y < 0.0f ? 2u : 0u) |
+        (ray.direction.z < 0.0f ? 1u : 0u));
+    uint2 ngroup = make_uint2(static_cast<unsigned int>(root), 0x80000000u);
+    uint2 tgroup = make_uint2(0u, 0u);
+
+    while (true) {
+        if (ngroup.y > 0x00ffffffu) {
+            const unsigned int hits = ngroup.y;
+            const unsigned int imask = ngroup.y;
+            const unsigned int child_bit_index = 31u - static_cast<unsigned int>(__clz(hits));
+            const unsigned int child_node_base = ngroup.x;
+            ngroup.y &= ~(1u << child_bit_index);
+            if (ngroup.y > 0x00ffffffu && stack_size < kCwBvhStackCapacity) {
+                stack[stack_size++] = ngroup;
+            }
+
+            const unsigned int slot_index = (child_bit_index - 24u) ^ octinv;
+            const unsigned int lower_slot_mask = slot_index == 0u ? 0u : ((1u << slot_index) - 1u);
+            const unsigned int relative_index = __popc(imask & lower_slot_mask);
+            const int node_index = static_cast<int>(child_node_base + relative_index);
+            if (node_index < 0 || node_index >= scene.cwbvh_node_count) {
+                ngroup = make_uint2(0u, 0u);
+                tgroup = make_uint2(0u, 0u);
+            } else {
+                const GpuCwBvhNode& node = scene.traversal_cwbvh_nodes[node_index];
+                const unsigned int node_imask = cwbvh_internal_mask_gpu(node);
+                const unsigned int exyz_imask = cwbvh_float_bits_gpu(node.block[0].w);
+                const float sx = cwbvh_pow2_scale_gpu(cwbvh_signed_byte_gpu(exyz_imask, 0));
+                const float sy = cwbvh_pow2_scale_gpu(cwbvh_signed_byte_gpu(exyz_imask, 1));
+                const float sz = cwbvh_pow2_scale_gpu(cwbvh_signed_byte_gpu(exyz_imask, 2));
+                const float orig_x = (node.block[0].x - ray.origin.x) * inv_direction.x;
+                const float orig_y = (node.block[0].y - ray.origin.y) * inv_direction.y;
+                const float orig_z = (node.block[0].z - ray.origin.z) * inv_direction.z;
+                const float idir_x = sx * inv_direction.x;
+                const float idir_y = sy * inv_direction.y;
+                const float idir_z = sz * inv_direction.z;
+                const bool neg_x = inv_direction.x < 0.0f;
+                const bool neg_y = inv_direction.y < 0.0f;
+                const bool neg_z = inv_direction.z < 0.0f;
+                const unsigned int meta0 = cwbvh_float_bits_gpu(node.block[1].z);
+                const unsigned int meta1 = cwbvh_float_bits_gpu(node.block[1].w);
+
+                unsigned int hitmask = 0;
+                #pragma unroll
+                for (int slot = 0; slot < 8; ++slot) {
+                    const unsigned int meta_word = slot < 4 ? meta0 : meta1;
+                    const unsigned char meta = static_cast<unsigned char>((meta_word >> ((slot & 3) * 8)) & 0xffu);
+                    if (meta == 0) {
+                        continue;
+                    }
+                    if (!intersect_cwbvh_quantized_child_gpu(node, slot, orig_x, orig_y, orig_z, idir_x, idir_y, idir_z,
+                            neg_x, neg_y, neg_z, kInfinity)) {
+                        continue;
+                    }
+                    if ((node_imask & (1u << slot)) != 0) {
+                        hitmask |= 1u << (24u + (static_cast<unsigned int>(slot) ^ octinv));
+                    } else {
+                        hitmask |= static_cast<unsigned int>(meta >> 5) << (meta & 31);
+                    }
+                }
+                ngroup = make_uint2(cwbvh_child_base_gpu(node), (hitmask & 0xff000000u) | node_imask);
+                tgroup = make_uint2(cwbvh_triangle_base_gpu(node), hitmask & 0x00ffffffu);
+            }
+        } else {
+            tgroup = ngroup;
+            ngroup = make_uint2(0u, 0u);
+        }
+
+        while (tgroup.y != 0u) {
+            const unsigned int tri_bit = 31u - static_cast<unsigned int>(__clz(tgroup.y));
+            tgroup.y &= ~(1u << tri_bit);
+            if (occluded_cwbvh_triangle_gpu<AlphaVisibility>(
+                    scene, ray, static_cast<int>(tgroup.x + tri_bit * 3u), rng)) {
+                return true;
+            }
+        }
+
+        if (ngroup.y <= 0x00ffffffu) {
+            if (stack_size > 0) {
+                ngroup = stack[--stack_size];
+            } else {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+template <bool MaskAlphaVisibility = false>
 __device__ bool intersect_blas_cwbvh_compact_gpu(const GpuScene& scene, const Ray& ray, Vec3 inv_direction, int root, GpuCompactHit& hit) {
-    return intersect_cwbvh_compact_gpu(scene, ray, inv_direction, root, hit);
+    return intersect_cwbvh_compact_gpu<MaskAlphaVisibility>(scene, ray, inv_direction, root, hit);
 }
 
 __device__ bool intersect_gpu(const GpuScene& scene, const Ray& ray, GpuHit& hit) {
@@ -807,7 +1029,7 @@ __device__ bool intersect_gpu(const GpuScene& scene, const Ray& ray, GpuHit& hit
     return found;
 }
 
-template <bool TwoLevel, GpuTraversalLayout Layout>
+template <bool TwoLevel, GpuTraversalLayout Layout, bool MaskAlphaVisibility = false>
 __device__ bool intersect_compact_gpu(const GpuScene& scene, const Ray& ray, GpuCompactHit& hit) {
     const Vec3 inv_direction = inverse_ray_direction_gpu(ray.direction);
     if constexpr (!TwoLevel) {
@@ -856,7 +1078,8 @@ __device__ bool intersect_compact_gpu(const GpuScene& scene, const Ray& ray, Gpu
                         if (intersect_aabb_gpu(instance.bounds_min, instance.bounds_max, ray, inv_direction, hit.t)) {
                             if constexpr (Layout == GpuTraversalLayout::CwBvh) {
                                 if (instance.cwbvh_root >= 0) {
-                                    found = intersect_blas_cwbvh_compact_gpu(scene, ray, inv_direction, instance.cwbvh_root, hit) || found;
+                                    found = intersect_blas_cwbvh_compact_gpu<MaskAlphaVisibility>(
+                                        scene, ray, inv_direction, instance.cwbvh_root, hit) || found;
                                 } else if (instance.bvh8_root >= 0) {
                                     found = intersect_blas_bvh8_compact_gpu(scene, ray, inv_direction, instance.bvh8_root, hit) || found;
                                 } else if (instance.bvh_root >= 0) {
@@ -956,4 +1179,82 @@ __device__ bool intersect_compact_gpu(const GpuScene& scene, const Ray& ray, Gpu
     }
     found = intersect_spheres_compact_gpu(scene, ray, hit) || found;
     return found;
+}
+
+template <bool TwoLevel, GpuTraversalLayout Layout, bool AlphaVisibility = false>
+__device__ bool occluded_compact_gpu(const GpuScene& scene, const Ray& ray, uint32_t& rng) {
+    const Vec3 inv_direction = inverse_ray_direction_gpu(ray.direction);
+    if constexpr (!TwoLevel) {
+        if constexpr (Layout == GpuTraversalLayout::CwBvh) {
+            if (scene.cwbvh_node_count > 0 &&
+                occluded_cwbvh_compact_gpu<AlphaVisibility>(scene, ray, inv_direction, 0, rng)) {
+                return true;
+            }
+        }
+        return occluded_spheres_compact_gpu<AlphaVisibility>(scene, ray, rng);
+    }
+
+    if constexpr (Layout == GpuTraversalLayout::CwBvh) {
+        if (scene.tlas_node_count > 0 && scene.mesh_instance_count > 0) {
+            int stack[64];
+            int stack_size = 0;
+            float root_t = 0.0f;
+            if (intersect_aabb_gpu(scene.traversal_tlas_nodes[0].bounds_min,
+                    scene.traversal_tlas_nodes[0].bounds_max, ray, inv_direction, kInfinity, &root_t)) {
+                stack[stack_size++] = 0;
+            }
+
+            while (stack_size > 0) {
+                const int node_index = stack[--stack_size];
+                if (node_index < 0 || node_index >= scene.tlas_node_count) {
+                    continue;
+                }
+                const GpuTraversalBvhNode node = scene.traversal_tlas_nodes[node_index];
+
+                if (traversal_node_is_leaf(node)) {
+                    const int first = node.left_or_first;
+                    const int count = traversal_node_count(node);
+                    for (int i = 0; i < count; ++i) {
+                        const int index_offset = first + i;
+                        if (index_offset < 0 || index_offset >= scene.mesh_instance_count) {
+                            continue;
+                        }
+                        const int instance_index = scene.mesh_instance_indices[index_offset];
+                        if (instance_index < 0 || instance_index >= scene.mesh_instance_count) {
+                            continue;
+                        }
+                        const GpuMeshInstance instance = scene.mesh_instances[instance_index];
+                        if (instance.cwbvh_root >= 0 &&
+                            intersect_aabb_gpu(instance.bounds_min, instance.bounds_max, ray, inv_direction, kInfinity) &&
+                            occluded_cwbvh_compact_gpu<AlphaVisibility>(
+                                scene, ray, inv_direction, instance.cwbvh_root, rng)) {
+                            return true;
+                        }
+                    }
+                } else {
+                    float left_t = kInfinity;
+                    float right_t = kInfinity;
+                    const int left = node.left_or_first;
+                    const int right = node.right_or_neg_count;
+                    const bool hit_left = left >= 0 && left < scene.tlas_node_count &&
+                        intersect_aabb_gpu(scene.traversal_tlas_nodes[left].bounds_min,
+                            scene.traversal_tlas_nodes[left].bounds_max, ray, inv_direction, kInfinity, &left_t);
+                    const bool hit_right = right >= 0 && right < scene.tlas_node_count &&
+                        intersect_aabb_gpu(scene.traversal_tlas_nodes[right].bounds_min,
+                            scene.traversal_tlas_nodes[right].bounds_max, ray, inv_direction, kInfinity, &right_t);
+                    if (hit_left && hit_right) {
+                        const int near_child = left_t <= right_t ? left : right;
+                        const int far_child = left_t <= right_t ? right : left;
+                        if (stack_size < 64) stack[stack_size++] = far_child;
+                        if (stack_size < 64) stack[stack_size++] = near_child;
+                    } else if (hit_left) {
+                        if (stack_size < 64) stack[stack_size++] = left;
+                    } else if (hit_right) {
+                        if (stack_size < 64) stack[stack_size++] = right;
+                    }
+                }
+            }
+        }
+    }
+    return occluded_spheres_compact_gpu<AlphaVisibility>(scene, ray, rng);
 }

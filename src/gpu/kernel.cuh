@@ -313,6 +313,13 @@ __device__ void finish_wavefront_path(PathT& path, Vec3* samples) {
     samples[path.pixel] = path.radiance;
 }
 
+__device__ bool wavefront_material_may_continue_as_transmission(const GpuMaterial& material) {
+    return material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+        material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission) ||
+        material.transmission > 0.5f ||
+        material.transmission_texture_index >= 0;
+}
+
 #include "restir_di.cuh"
 
 __global__ void wavefront_initialize_kernel(
@@ -382,6 +389,7 @@ __global__ void wavefront_intersect_kernel(
     const int* active_indices,
     int* shade_indices,
     GpuWavefrontQueueCounters* queue_counters,
+    bool terminal_occlusion_only,
     Vec3* samples) {
     const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
     const int active_count = queue_counters->num_queued[GpuWavefrontQueueActive];
@@ -398,10 +406,24 @@ __global__ void wavefront_intersect_kernel(
 
     const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
     Ray ray = path.ray;
+    if constexpr (Layout == GpuTraversalLayout::CwBvh) {
+        if (!Primary && terminal_occlusion_only && shading_bounce + 1 >= settings.max_bounces &&
+            scene.cwbvh_node_count > 0 && scene.cwbvh_triangles != nullptr) {
+            if (!occluded_compact_gpu<TwoLevel, Layout, AlphaVisibility>(scene, ray, path.rng)) {
+                if (!(wavefront_restir_direct(path) && !wavefront_previous_delta(path))) {
+                    path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
+                        mul(path.throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
+                }
+            }
+            finish_wavefront_path(path, samples);
+            return;
+        }
+    }
     int transparent_steps = wavefront_transparent_steps(path);
     for (;;) {
         GpuCompactHit hit;
-        if (!intersect_compact_gpu<TwoLevel, Layout>(scene, ray, hit)) {
+        if (!intersect_compact_gpu<TwoLevel, Layout, AlphaVisibility && Layout == GpuTraversalLayout::CwBvh>(
+                scene, ray, hit)) {
             if (!(wavefront_restir_direct(path) && !wavefront_previous_delta(path))) {
                 path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
                     mul(path.throughput, environment_radiance_gpu(scene, ray.direction, settings)), sample_clamp));
@@ -455,6 +477,7 @@ __global__ void wavefront_direct_light_kernel(
     int* shadow_indices,
     int* bsdf_indices,
     GpuWavefrontQueueCounters* queue_counters,
+    bool queue_shadow_paths,
     GpuWavefrontSvgfAov svgf_aov,
     Vec3* samples) {
     const int queue_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -518,14 +541,22 @@ __global__ void wavefront_direct_light_kernel(
             &queue_counters->num_queued[GpuWavefrontQueueGi], path_index);
         return;
     }
+    if (shading_bounce + 1 >= settings.max_bounces &&
+        !wavefront_material_may_continue_as_transmission(material) &&
+        !queue_shadow_paths) {
+        finish_wavefront_path(path, samples);
+        return;
+    }
     hits[path_index] = hit;
     if (settings.sampling_mode == PathSamplingMode::Unidirectional) {
         wavefront_append_queue(bsdf_indices,
             &queue_counters->num_queued[GpuWavefrontQueueBsdf], path_index);
         return;
     }
-    wavefront_append_queue(shadow_indices,
-        &queue_counters->num_queued[GpuWavefrontQueueShadow], path_index);
+    if (queue_shadow_paths) {
+        wavefront_append_queue(shadow_indices,
+            &queue_counters->num_queued[GpuWavefrontQueueShadow], path_index);
+    }
     wavefront_append_queue(bsdf_indices,
         &queue_counters->num_queued[GpuWavefrontQueueBsdf], path_index);
 }
@@ -593,6 +624,11 @@ __device__ void wavefront_sample_bsdf_to_next(
     const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
     const GpuMaterial material = scene.materials[hit.material];
     const Vec3 wo = mul(path.ray.direction, -1.0f);
+    if (shading_bounce + 1 >= settings.max_bounces &&
+        !wavefront_material_may_continue_as_transmission(material)) {
+        finish_wavefront_path(path, samples);
+        return;
+    }
     if (shading_bounce >= 3) {
         const float p = dclamp(fmaxf(path.throughput.x, fmaxf(path.throughput.y, path.throughput.z)), 0.05f, 0.95f);
         if (rng_float(path.rng) > p) {

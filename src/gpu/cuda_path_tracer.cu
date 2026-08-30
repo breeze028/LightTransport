@@ -2509,7 +2509,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         GpuWavefrontSvgfAov svgf_aov) -> cudaError_t {
         const int pixel_count = static_cast<int>(pixels);
         const int queue_block_size = 256;
-        const int intersect_block_size = 128;
+        const int intersect_block_size = 64;
         const auto queue_grid_size = [queue_block_size](int count) {
             return (count + queue_block_size - 1) / queue_block_size;
         };
@@ -2626,12 +2626,14 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             static_cast<const int*>(device_restir_pt_spatial_pairs_);
         cudaError_t render_error = cudaMemset(sample_sum, 0, pixels * sizeof(Vec3));
         bool has_alpha_visibility = false;
+        bool has_blend_visibility = false;
         bool has_transmission = false;
         for (const std::shared_ptr<Material>& material : scene.materials) {
             if (!material) {
                 continue;
             }
             has_alpha_visibility = has_alpha_visibility || material->alpha_mode != AlphaMode::Opaque;
+            has_blend_visibility = has_blend_visibility || material->alpha_mode == AlphaMode::Blend;
             const BrdfModel model = material->model();
             has_transmission = has_transmission ||
                 model == BrdfModel::Dielectric ||
@@ -2645,10 +2647,11 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         constexpr int kExtraTransmissionBounces = 12;
         const int max_path_steps = std::max(1, settings.max_bounces) +
             (has_transmission ? kExtraTransmissionBounces : 0);
-        const bool has_direct_lights =
+        const bool has_local_direct_lights =
             !cached_render_scene_.light_triangle_indices.empty() ||
             !scene.directional_lights.empty() ||
-            !scene.point_lights.empty() || restir_any_enabled;
+            !scene.point_lights.empty();
+        const bool queue_shadow_paths = has_local_direct_lights || restir_any_enabled;
         const bool has_restir_local_lights =
             !cached_render_scene_.light_triangle_indices.empty() ||
             !scene.directional_lights.empty() ||
@@ -2659,6 +2662,9 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         const bool use_two_level = use_two_level_accel(cached_render_scene_, settings.acceleration_structure);
         const bool use_wide_bvh = use_wavefront_bvh8_layout(cached_render_scene_, settings);
         const bool use_cwbvh = use_wavefront_cwbvh_layout(cached_render_scene_, settings);
+        const bool terminal_occlusion_only =
+            !queue_shadow_paths && !settings.use_lightmap && !settings.use_irradiance_volume &&
+            !has_blend_visibility;
 
         for (int sample_index = 0;
              render_error == cudaSuccess && sample_index < settings.samples_per_pixel;
@@ -2707,7 +2713,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                     #define LT_LAUNCH_WAVEFRONT_INTERSECT(ALPHA, TWO_LEVEL, PRIMARY, LAYOUT) \
                         wavefront_intersect_kernel<ALPHA, TWO_LEVEL, PRIMARY, LAYOUT><<<full_intersect_grid, intersect_block_size>>>( \
                             device_scene, settings, intersect_paths, compact_hits, sample_active_indices, \
-                            shade_indices, queue_counters, samples)
+                            shade_indices, queue_counters, terminal_occlusion_only, samples)
 
                     if (has_alpha_visibility && use_two_level && use_cwbvh && step == 0) {
                         LT_LAUNCH_WAVEFRONT_INTERSECT(true, true, true, GpuTraversalLayout::CwBvh);
@@ -2749,7 +2755,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                     const ScopedNvtxRange range("wavefront surface setup");
                     wavefront_direct_light_kernel<<<full_queue_grid, queue_block_size>>>(
                         device_scene, settings, paths, compact_hits, hits, shade_indices,
-                        gi_indices, shadow_indices, bsdf_indices, queue_counters, svgf_aov, samples);
+                        gi_indices, shadow_indices, bsdf_indices, queue_counters,
+                        queue_shadow_paths, svgf_aov, samples);
                 }
 
                 if (restir_enabled && step == 0) {
@@ -2867,7 +2874,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 }
 
                 if (settings.sampling_mode != PathSamplingMode::Unidirectional) {
-                    if (has_direct_lights && !(restir_enabled && step == 0)) {
+                    if (has_local_direct_lights && !(restir_enabled && step == 0)) {
                         const ScopedNvtxRange range("wavefront direct visibility");
                         wavefront_direct_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
                             device_scene, settings, paths, hits, shadow_indices,

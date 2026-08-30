@@ -122,6 +122,10 @@ RenderOptions parse_render_options(int argc, char** argv) {
         } else if (argument == "--quiet") {
             options.quiet = true;
             options.log_console_level = LogLevel::Warn;
+        } else if (argument == "--benchmark") {
+            options.benchmark = true;
+        } else if (argument == "--benchmark-warmup" && i + 1 < argc) {
+            options.benchmark_warmup_frames = std::max(0, std::atoi(argv[++i]));
         } else if (argument == "--log-level" && i + 1 < argc) {
             const LogLevel level = parse_log_level(argv[++i], options.log_console_level);
             options.log_console_level = level;

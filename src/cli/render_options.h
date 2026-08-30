@@ -20,6 +20,8 @@ struct RenderOptions {
     RenderSettings settings;
     bool prefer_cuda = true;
     bool quiet = false;
+    bool benchmark = false;
+    int benchmark_warmup_frames = 4;
     bool log_file_enabled = true;
     std::string log_file_path = "logs/lt_render.log";
     LogLevel log_console_level = LogLevel::Info;
