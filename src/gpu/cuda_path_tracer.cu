@@ -2975,9 +2975,20 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 if (settings.sampling_mode != PathSamplingMode::Unidirectional) {
                     if (has_local_direct_lights && !(restir_enabled && step == 0)) {
                         const ScopedNvtxRange range("wavefront direct visibility");
-                        wavefront_direct_visibility_kernel<<<full_queue_grid, queue_block_size>>>(
-                            device_scene, settings, paths, hits, shadow_indices,
-                            queue_counters, samples);
+                        #define LT_LAUNCH_WAVEFRONT_DIRECT_VISIBILITY(TWO_LEVEL, LAYOUT) \
+                            wavefront_direct_visibility_kernel<TWO_LEVEL, LAYOUT><<<full_queue_grid, queue_block_size>>>( \
+                                device_scene, settings, paths, hits, shadow_indices, \
+                                queue_counters, samples)
+                        if (use_two_level && use_cwbvh) {
+                            LT_LAUNCH_WAVEFRONT_DIRECT_VISIBILITY(true, GpuTraversalLayout::CwBvh);
+                        } else if (use_two_level && use_wide_bvh) {
+                            LT_LAUNCH_WAVEFRONT_DIRECT_VISIBILITY(true, GpuTraversalLayout::Bvh8);
+                        } else if (use_two_level) {
+                            LT_LAUNCH_WAVEFRONT_DIRECT_VISIBILITY(true, GpuTraversalLayout::Binary);
+                        } else {
+                            LT_LAUNCH_WAVEFRONT_DIRECT_VISIBILITY(false, GpuTraversalLayout::Binary);
+                        }
+                        #undef LT_LAUNCH_WAVEFRONT_DIRECT_VISIBILITY
                     }
                     if (restir_enabled && step == 0) {
                         if constexpr (kRestirSpatialSamples > 0) {

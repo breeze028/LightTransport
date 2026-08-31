@@ -669,6 +669,7 @@ __device__ void wavefront_sample_bsdf_to_next(
 #include "restir_gi.cuh"
 #include "restir_pt.cuh"
 
+template <bool TwoLevel, GpuTraversalLayout Layout>
 __global__ void wavefront_direct_visibility_kernel(
     const GpuScene* scene_ptr,
     RenderSettings settings,
@@ -690,7 +691,8 @@ __global__ void wavefront_direct_visibility_kernel(
     const GpuMaterial material = scene.materials[hit.material];
     const Vec3 wo = mul(path.ray.direction, -1.0f);
     path.radiance = add(path.radiance, clamp_sample_radiance_gpu(
-        mul(path.throughput, estimate_direct_gpu(scene, hit, material, wo, path.rng, settings)), sample_clamp));
+        mul(path.throughput, estimate_direct_wavefront_gpu<TwoLevel, Layout>(
+            scene, hit, material, wo, path.rng, settings)), sample_clamp));
 }
 
 __global__ void wavefront_bsdf_sample_kernel(

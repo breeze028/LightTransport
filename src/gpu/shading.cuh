@@ -660,7 +660,73 @@ __device__ float mis_weight_gpu(float pdf_a, float pdf_b, int heuristic) {
     return a2 / fmaxf(1.0e-8f, a2 + b2);
 }
 
-__device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material, Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
+template <bool UseCompactShadow, bool TwoLevel, GpuTraversalLayout Layout>
+__device__ bool direct_shadow_blocked_gpu(const GpuScene& scene, Ray shadow_ray, float remaining,
+    int target_triangle, uint32_t& rng, const RenderSettings& settings) {
+    const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
+    for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
+        if constexpr (UseCompactShadow) {
+            GpuCompactHit shadow_hit{};
+            shadow_hit.t = remaining;
+            if (!intersect_compact_gpu<TwoLevel, Layout>(scene, shadow_ray, shadow_hit)) {
+                return false;
+            }
+            if (target_triangle >= 0 && shadow_hit.triangle == target_triangle) {
+                return false;
+            }
+            const int material_index = shadow_hit.triangle >= 0
+                ? traversal_material_index(shadow_hit.material)
+                : shadow_hit.material;
+            if (material_index < 0 || material_index >= scene.material_count) {
+                return true;
+            }
+            const GpuMaterial shadow_material = scene.materials[material_index];
+            const Vec2 uv = compact_hit_uv_gpu(scene, shadow_ray, shadow_hit);
+            if (!material_visible_gpu(scene, shadow_material, uv, rng) ||
+                shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+                material_transmission_gpu(scene, shadow_material, uv) > 0.5f) {
+                const Vec3 position = compact_hit_position_gpu(shadow_ray, shadow_hit);
+                shadow_ray = {add(position, mul(shadow_ray.direction, 0.002f)), shadow_ray.direction};
+                if (isfinite(remaining)) {
+                    remaining -= shadow_hit.t + 0.002f;
+                    if (remaining <= 0.001f) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            return true;
+        } else {
+            GpuHit shadow_hit;
+            shadow_hit.t = remaining;
+            if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
+                return false;
+            }
+            if (target_triangle >= 0 && shadow_hit.triangle == target_triangle) {
+                return false;
+            }
+            const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
+            if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
+                shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+                material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
+                shadow_ray = {add(shadow_hit.position, mul(shadow_ray.direction, 0.002f)), shadow_ray.direction};
+                if (isfinite(remaining)) {
+                    remaining -= shadow_hit.t + 0.002f;
+                    if (remaining <= 0.001f) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+template <bool UseCompactShadow, bool TwoLevel, GpuTraversalLayout Layout>
+__device__ Vec3 estimate_direct_impl_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material,
+    Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
     Vec3 direct{};
     if (scene.light_count > 0) {
         const int list_index = iclamp_gpu(static_cast<int>(rng_float(rng) * static_cast<float>(scene.light_count)), 0, scene.light_count - 1);
@@ -683,32 +749,11 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                 const bool material_emissive_double_sided = !has_light_emission_gpu(light.emission) && light_material.double_sided && has_light_emission_gpu(material_emission_gpu(scene, light_material, light_uv, settings));
                 const float ldot = mesh_light_double_sided || material_emissive_double_sided ? fabsf(ldot_raw) : fmaxf(0.0f, ldot_raw);
                 if (ndotl > 0.0f && ldot > 0.0f) {
-                    bool blocked = false;
                     const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
                     Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
                     float shadow_remaining = dist - 0.01f;
-                    const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
-                    for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
-                        GpuHit shadow_hit;
-                        shadow_hit.t = shadow_remaining;
-                        if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
-                            break;
-                        }
-                        if (shadow_hit.triangle == light_index) {
-                            break;
-                        }
-                        const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
-                        if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
-                            shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
-                            material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
-                            shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
-                            shadow_remaining -= shadow_hit.t + 0.002f;
-                            if (shadow_remaining <= 0.001f) break;
-                            continue;
-                        }
-                        blocked = true;
-                        break;
-                    }
+                    const bool blocked = direct_shadow_blocked_gpu<UseCompactShadow, TwoLevel, Layout>(
+                        scene, shadow_ray, shadow_remaining, light_index, rng, settings);
                     const float light_pmf = 1.0f / static_cast<float>(scene.light_count);
                     const float light_pdf = light_pdf_solid_angle_gpu(light, light_material, hit.position, light_point, light_pmf);
                     const Vec3 light_emission = emitted_radiance_gpu(light, light_material, light.emission, material_emission_gpu(scene, light_material, light_uv, settings), light.light_double_sided != 0, light_dir);
@@ -735,25 +780,10 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         if (ndotl <= 0.0f) {
             continue;
         }
-        bool blocked = false;
         const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
         Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
-        const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
-        for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
-            GpuHit shadow_hit;
-            if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
-                break;
-            }
-            const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
-            if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
-                shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
-                material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
-                shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
-                continue;
-            }
-            blocked = true;
-            break;
-        }
+        const bool blocked = direct_shadow_blocked_gpu<UseCompactShadow, TwoLevel, Layout>(
+            scene, shadow_ray, kInfinity, -1, rng, settings);
         if (!blocked) {
             direct = add(direct, clamp_sample_radiance_gpu(mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv), mul(light.color, light.intensity)), ndotl)));
         }
@@ -774,29 +804,11 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         const float ndotl = (material.double_sided || diffuse_transmission) ? fabsf(ndotl_raw) : fmaxf(0.0f, ndotl_raw);
         if (ndotl <= 0.0f) continue;
 
-        bool blocked = false;
         const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
         Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
         float shadow_remaining = dist - 0.01f;
-        const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
-        for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
-            GpuHit shadow_hit;
-            shadow_hit.t = shadow_remaining;
-            if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
-                break;
-            }
-            const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
-            if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
-                shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
-                material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {
-                shadow_ray = {add(shadow_hit.position, mul(light_dir, 0.002f)), light_dir};
-                shadow_remaining -= shadow_hit.t + 0.002f;
-                if (shadow_remaining <= 0.001f) break;
-                continue;
-            }
-            blocked = true;
-            break;
-        }
+        const bool blocked = direct_shadow_blocked_gpu<UseCompactShadow, TwoLevel, Layout>(
+            scene, shadow_ray, shadow_remaining, -1, rng, settings);
         if (!blocked) {
             direct = add(direct, clamp_sample_radiance_gpu(
                 mul(mul(evaluate_brdf_gpu(scene, material, hit.normal, wo, light_dir, hit.uv),
@@ -804,6 +816,19 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         }
     }
     return direct;
+}
+
+__device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material,
+    Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
+    return estimate_direct_impl_gpu<false, false, GpuTraversalLayout::Binary>(
+        scene, hit, material, wo, rng, settings);
+}
+
+template <bool TwoLevel, GpuTraversalLayout Layout>
+__device__ Vec3 estimate_direct_wavefront_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material,
+    Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
+    return estimate_direct_impl_gpu<true, TwoLevel, Layout>(
+        scene, hit, material, wo, rng, settings);
 }
 
 __device__ Vec3 estimate_direct_environment_gpu(const GpuScene& scene, const GpuHit& hit, const GpuMaterial& material, Vec3 wo, uint32_t& rng, const RenderSettings& settings) {
