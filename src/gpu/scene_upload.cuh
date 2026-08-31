@@ -1002,15 +1002,19 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
             emission, tri.uv0, tri.uv1, tri.uv2, tri.lightmap_uv0, tri.lightmap_uv1, tri.lightmap_uv2,
             tri.material, tri.mesh, light_double_sided, tri.has_lightmap ? 1 : 0,
         };
+        const std::shared_ptr<Material>& material = scene.materials[static_cast<size_t>(tri.material)];
         packed.traversal_triangles[static_cast<size_t>(i)] = {
             tri.v0,
             sub(tri.v1, tri.v0),
             sub(tri.v2, tri.v0),
             tri.material |
-                (scene.materials[static_cast<size_t>(tri.material)]->alpha_mode != AlphaMode::Opaque
+                (material->alpha_mode != AlphaMode::Opaque
                     ? kTraversalMaterialAlphaBit
                     : 0) |
-                (material_is_opaque_shadow_blocker(*scene.materials[static_cast<size_t>(tri.material)])
+                (material->alpha_mode == AlphaMode::Mask
+                    ? kTraversalMaterialMaskAlphaBit
+                    : 0) |
+                (material_is_opaque_shadow_blocker(*material)
                     ? kTraversalMaterialOpaqueShadowBlockerBit
                     : 0),
         };

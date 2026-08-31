@@ -27,6 +27,10 @@ __device__ bool traversal_material_has_alpha(int material_and_flags) {
     return (material_and_flags & kTraversalMaterialAlphaBit) != 0;
 }
 
+__device__ bool traversal_material_has_mask_alpha(int material_and_flags) {
+    return (material_and_flags & kTraversalMaterialMaskAlphaBit) != 0;
+}
+
 __device__ bool traversal_material_is_opaque_shadow_blocker(int material_and_flags) {
     return (material_and_flags & kTraversalMaterialOpaqueShadowBlockerBit) != 0;
 }
@@ -245,20 +249,18 @@ __device__ __forceinline__ bool store_compact_triangle_hit_gpu(
         return false;
     }
     if constexpr (MaskAlphaVisibility) {
-        if (traversal_material_has_alpha(material_and_flags)) {
+        if (traversal_material_has_mask_alpha(material_and_flags)) {
             const GpuMaterial material = scene.materials[material_index];
-            if (material.alpha_mode == static_cast<int>(AlphaMode::Mask)) {
-                GpuCompactHit candidate;
-                candidate.t = t;
-                candidate.u = u;
-                candidate.v = v;
-                candidate.material = material_and_flags;
-                candidate.triangle = tri_index;
-                candidate.sphere = -1;
-                uint32_t ignored_rng = 0;
-                if (!material_visible_gpu(scene, material, compact_hit_uv_gpu(scene, ray, candidate), ignored_rng)) {
-                    return false;
-                }
+            GpuCompactHit candidate;
+            candidate.t = t;
+            candidate.u = u;
+            candidate.v = v;
+            candidate.material = material_and_flags;
+            candidate.triangle = tri_index;
+            candidate.sphere = -1;
+            uint32_t ignored_rng = 0;
+            if (!material_visible_gpu(scene, material, compact_hit_uv_gpu(scene, ray, candidate), ignored_rng)) {
+                return false;
             }
         }
     }
@@ -737,7 +739,7 @@ __device__ __forceinline__ bool occluded_cwbvh_triangle_gpu(
         return true;
     }
     if constexpr (AlphaVisibility) {
-        if (traversal_material_has_alpha(material_and_flags)) {
+        if (traversal_material_has_mask_alpha(material_and_flags)) {
             GpuCompactHit candidate;
             candidate.t = t;
             candidate.u = u;
