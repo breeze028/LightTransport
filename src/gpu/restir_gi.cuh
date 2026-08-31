@@ -317,12 +317,14 @@ __device__ GpuRestirReservoir restir_gi_sample_secondary_direct_gpu(const GpuSce
     restir_clear_initial_gpu(strategy);
     for (int i = 0; i < triangle_count; ++i) {
         GpuRestirLightSample sample; float discrete_pdf = 0.0f;
-        if (!restir_sample_triangle_gpu(scene, rng, sample, discrete_pdf)) continue;
+        GpuTriangle light;
+        if (!restir_sample_triangle_gpu(scene, rng, sample, discrete_pdf, light)) continue;
+        const GpuMaterial light_material = scene.materials[light.material];
         Vec3 direction; float distance;
         const Vec3 c = restir_evaluate_triangle_sample_gpu(
-            scene, hit, material, wo, sample, settings, direction, distance);
+            scene, hit, material, wo, sample, light, light_material, settings, direction, distance);
         restir_add_initial_gpu(strategy, sample, restir_luminance_gpu(c),
-            restir_triangle_proposal_pdf_gpu(scene, hit, sample), rng);
+            restir_triangle_proposal_pdf_gpu(scene, hit, sample, light, light_material), rng);
     }
     restir_finalize_initial_strategy_gpu(strategy, triangle_count, static_cast<float>(triangle_count));
     restir_stream_initial_strategy_gpu(result, strategy, total, rng);

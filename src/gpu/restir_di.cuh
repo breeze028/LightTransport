@@ -244,7 +244,7 @@ __device__ float restir_environment_mis_proposal_pdf_gpu(const GpuScene& scene, 
 }
 
 __device__ bool restir_sample_triangle_gpu(const GpuScene& scene, uint32_t& rng,
-    GpuRestirLightSample& sample, float& discrete_pdf) {
+    GpuRestirLightSample& sample, float& discrete_pdf, GpuTriangle& light) {
     if (scene.light_count <= 0 || scene.light_indices == nullptr) return false;
     const GpuLightSampler sampler = scene.restir_light_sampler;
     int list_index = 0;
@@ -260,7 +260,7 @@ __device__ bool restir_sample_triangle_gpu(const GpuScene& scene, uint32_t& rng,
     }
     const int light_index = scene.light_indices[list_index];
     if (light_index < 0 || light_index >= scene.triangle_count || !(discrete_pdf > 0.0f)) return false;
-    const GpuTriangle light = scene.triangles[light_index];
+    light = scene.triangles[light_index];
     sample = {};
     sample.type = GpuRestirLightType::Triangle;
     sample.index = light_index;
@@ -269,17 +269,28 @@ __device__ bool restir_sample_triangle_gpu(const GpuScene& scene, uint32_t& rng,
     return true;
 }
 
+__device__ bool restir_sample_triangle_gpu(const GpuScene& scene, uint32_t& rng,
+    GpuRestirLightSample& sample, float& discrete_pdf) {
+    GpuTriangle light;
+    return restir_sample_triangle_gpu(scene, rng, sample, discrete_pdf, light);
+}
+
 __device__ float restir_triangle_proposal_pdf_gpu(const GpuScene& scene, const GpuHit& hit,
-    const GpuRestirLightSample& sample) {
-    if (sample.index < 0 || sample.index >= scene.triangle_count) return 0.0f;
+    const GpuRestirLightSample& sample, const GpuTriangle& light, const GpuMaterial& light_material) {
     const GpuLightSampler sampler = scene.restir_light_sampler;
     const float discrete_pdf = sampler.light_count == scene.light_count && sampler.pmf != nullptr &&
         sample.sampler_index >= 0 && sample.sampler_index < sampler.light_count
         ? sampler.pmf[sample.sampler_index]
         : (scene.light_count > 0 ? 1.0f / static_cast<float>(scene.light_count) : 0.0f);
-    const GpuTriangle light = scene.triangles[sample.index];
-    return light_pdf_solid_angle_gpu(light, scene.materials[light.material], hit.position,
+    return light_pdf_solid_angle_gpu(light, light_material, hit.position,
         sample.position_or_direction, discrete_pdf);
+}
+
+__device__ float restir_triangle_proposal_pdf_gpu(const GpuScene& scene, const GpuHit& hit,
+    const GpuRestirLightSample& sample) {
+    if (sample.index < 0 || sample.index >= scene.triangle_count) return 0.0f;
+    const GpuTriangle light = scene.triangles[sample.index];
+    return restir_triangle_proposal_pdf_gpu(scene, hit, sample, light, scene.materials[light.material]);
 }
 
 __device__ bool restir_sample_directional_gpu(const GpuScene& scene, uint32_t& rng,
@@ -325,11 +336,10 @@ __device__ Vec3 restir_evaluate_environment_sample_gpu(const GpuScene& scene, co
 
 __device__ Vec3 restir_evaluate_triangle_sample_gpu(const GpuScene& scene, const GpuHit& hit,
     const GpuMaterial& material, Vec3 wo, const GpuRestirLightSample& sample,
-    const RenderSettings& settings, Vec3& direction, float& distance) {
+    const GpuTriangle& light, const GpuMaterial& light_material, const RenderSettings& settings,
+    Vec3& direction, float& distance) {
     direction = {};
     distance = kInfinity;
-    if (sample.index < 0 || sample.index >= scene.triangle_count) return {};
-    const GpuTriangle light = scene.triangles[sample.index];
     const Vec3 to_light = sub(sample.position_or_direction, hit.position);
     const float dist2 = ddot(to_light, to_light);
     if (dist2 <= 1.0e-8f) return {};
@@ -337,7 +347,6 @@ __device__ Vec3 restir_evaluate_triangle_sample_gpu(const GpuScene& scene, const
     direction = divv(to_light, distance);
     float ndotl_raw = 0.0f;
     const float ndotl = restir_surface_ndotl_gpu(material, hit, direction, ndotl_raw);
-    const GpuMaterial light_material = scene.materials[light.material];
     const float ldot_raw = ddot(mul(light.normal, -1.0f), direction);
     const bool material_double_sided = !has_light_emission_gpu(light.emission) && light_material.double_sided &&
         has_light_emission_gpu(material_emission_gpu(scene, light_material, sample.uv, settings));
@@ -349,6 +358,17 @@ __device__ Vec3 restir_evaluate_triangle_sample_gpu(const GpuScene& scene, const
     const Vec3 radiance = mul(mul(evaluate_brdf_gpu(
         scene, material, hit.normal, wo, direction, hit.uv), emission), ndotl);
     return finite_vec_gpu(radiance) ? radiance : Vec3{};
+}
+
+__device__ Vec3 restir_evaluate_triangle_sample_gpu(const GpuScene& scene, const GpuHit& hit,
+    const GpuMaterial& material, Vec3 wo, const GpuRestirLightSample& sample,
+    const RenderSettings& settings, Vec3& direction, float& distance) {
+    direction = {};
+    distance = kInfinity;
+    if (sample.index < 0 || sample.index >= scene.triangle_count) return {};
+    const GpuTriangle light = scene.triangles[sample.index];
+    return restir_evaluate_triangle_sample_gpu(scene, hit, material, wo, sample,
+        light, scene.materials[light.material], settings, direction, distance);
 }
 
 __device__ Vec3 restir_evaluate_directional_sample_gpu(const GpuScene& scene, const GpuHit& hit,
@@ -679,13 +699,15 @@ __global__ void restir_initial_candidates_kernel(const GpuScene* scene_ptr, Rend
     for (int i = 0; i < triangle_sample_count; ++i) {
         GpuRestirLightSample sample;
         float discrete_pdf = 0.0f;
-        if (!restir_sample_triangle_gpu(scene, restir_rng, sample, discrete_pdf)) continue;
+        GpuTriangle light;
+        if (!restir_sample_triangle_gpu(scene, restir_rng, sample, discrete_pdf, light)) continue;
+        const GpuMaterial light_material = scene.materials[light.material];
         Vec3 direction;
         float distance = 0.0f;
         const Vec3 contribution = restir_evaluate_triangle_sample_gpu(
-            scene, hit, material, wo, sample, settings, direction, distance);
+            scene, hit, material, wo, sample, light, light_material, settings, direction, distance);
         const float target = restir_luminance_gpu(contribution);
-        const float proposal = restir_triangle_proposal_pdf_gpu(scene, hit, sample);
+        const float proposal = restir_triangle_proposal_pdf_gpu(scene, hit, sample, light, light_material);
         restir_add_initial_gpu(strategy_reservoir, sample, target, proposal, restir_rng);
     }
     restir_finalize_initial_strategy_gpu(strategy_reservoir, triangle_sample_count,
