@@ -2,6 +2,19 @@ __host__ __device__ bool has_light_emission_gpu(Vec3 emission) {
     return emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f;
 }
 
+static constexpr int kDefaultDirectLightTransparentShadowSteps = 8;
+static constexpr int kWavefrontDirectLightTransparentShadowSteps = 2;
+static constexpr int kWavefrontExtraTransmissionBounces = 2;
+
+__host__ __device__ int direct_light_transparent_shadow_steps_gpu(const RenderSettings& settings) {
+    return settings.cuda_wavefront ? kWavefrontDirectLightTransparentShadowSteps
+                                   : kDefaultDirectLightTransparentShadowSteps;
+}
+
+__host__ __device__ int wavefront_extra_transmission_bounces_gpu() {
+    return kWavefrontExtraTransmissionBounces;
+}
+
 __host__ __device__ float emissive_intensity_scale_gpu(const RenderSettings& settings) {
     return fmaxf(0.0f, settings.emissive_intensity_scale);
 }
@@ -674,7 +687,8 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
                     const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
                     Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
                     float shadow_remaining = dist - 0.01f;
-                    for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+                    const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
+                    for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
                         GpuHit shadow_hit;
                         shadow_hit.t = shadow_remaining;
                         if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
@@ -724,7 +738,8 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         bool blocked = false;
         const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
         Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
-        for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+        const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
+        for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
             GpuHit shadow_hit;
             if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {
                 break;
@@ -763,7 +778,8 @@ __device__ Vec3 estimate_direct_gpu(const GpuScene& scene, const GpuHit& hit, co
         const float shadow_offset_side = ndotl_raw >= 0.0f ? 1.0f : -1.0f;
         Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * shadow_offset_side)), light_dir};
         float shadow_remaining = dist - 0.01f;
-        for (int shadow_step = 0; shadow_step < 8; ++shadow_step) {
+        const int shadow_step_limit = direct_light_transparent_shadow_steps_gpu(settings);
+        for (int shadow_step = 0; shadow_step < shadow_step_limit; ++shadow_step) {
             GpuHit shadow_hit;
             shadow_hit.t = shadow_remaining;
             if (!intersect_gpu(scene, shadow_ray, shadow_hit)) {

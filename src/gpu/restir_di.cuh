@@ -429,7 +429,7 @@ __device__ bool restir_sample_visible_gpu(const GpuScene& scene, const GpuHit& h
     restir_surface_ndotl_gpu(material, hit, direction, ndotl_raw);
     Ray shadow_ray{add(hit.position, mul(hit.normal, 0.002f * (ndotl_raw >= 0.0f ? 1.0f : -1.0f))), direction};
     float remaining = isfinite(distance) ? distance - 0.01f : kInfinity;
-    for (int step = 0; step < 8; ++step) {
+    for (int step = 0; step < kWavefrontDirectLightTransparentShadowSteps; ++step) {
         GpuHit shadow_hit;
         shadow_hit.t = remaining;
         if (!intersect_gpu(scene, shadow_ray, shadow_hit)) return true;
@@ -1123,7 +1123,7 @@ __global__ void restir_trace_visibility_kernel(const GpuScene* scene_ptr, GpuWav
         visibility_results[pixel] = visible ? 1 : 0;
     } else {
         GpuWavefrontPathRef path = wavefront_path_ref(paths, visibility.path_index);
-        for (int step = 0; step < 8; ++step) {
+        for (int step = 0; step < kWavefrontDirectLightTransparentShadowSteps; ++step) {
             GpuCompactHit hit{};
             hit.t = remaining;
             if (!intersect_compact_gpu<TwoLevel, Layout>(scene, ray, hit)) break;

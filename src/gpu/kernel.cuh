@@ -495,6 +495,10 @@ __global__ void wavefront_direct_light_kernel(
     const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
     const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
     const GpuMaterial material = scene.materials[hit.material];
+    const bool skip_direct_lighting_for_transmission =
+        material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+        material_transmission_gpu(scene, material, hit.uv) > 0.5f;
+    const bool queue_surface_shadow_paths = queue_shadow_paths && !skip_direct_lighting_for_transmission;
 
     hit.normal = apply_normal_map_gpu(scene, material, hit, path.ray.direction);
     const Vec3 material_emission = material_emission_gpu(scene, material, hit.uv, settings);
@@ -543,7 +547,7 @@ __global__ void wavefront_direct_light_kernel(
     }
     if (shading_bounce + 1 >= settings.max_bounces &&
         !wavefront_material_may_continue_as_transmission(material) &&
-        !queue_shadow_paths) {
+        !queue_surface_shadow_paths) {
         finish_wavefront_path(path, samples);
         return;
     }
@@ -553,7 +557,7 @@ __global__ void wavefront_direct_light_kernel(
             &queue_counters->num_queued[GpuWavefrontQueueBsdf], path_index);
         return;
     }
-    if (queue_shadow_paths) {
+    if (queue_surface_shadow_paths) {
         wavefront_append_queue(shadow_indices,
             &queue_counters->num_queued[GpuWavefrontQueueShadow], path_index);
     }
@@ -650,7 +654,8 @@ __device__ void wavefront_sample_bsdf_to_next(
     path.previous_position = hit.position;
     path.previous_bsdf_pdf = sample.pdf;
     wavefront_set_previous_delta(path, sample.delta);
-    if (sample.delta && material_transmission_gpu(scene, material, hit.uv) > 0.5f && wavefront_transmission_bounces(path) < 12) {
+    if (sample.delta && material_transmission_gpu(scene, material, hit.uv) > 0.5f &&
+        wavefront_transmission_bounces(path) < wavefront_extra_transmission_bounces_gpu()) {
         wavefront_increment_transmission_bounce(path);
     }
     const float offset_side = ddot(sample.direction, hit.normal) >= 0.0f ? 1.0f : -1.0f;

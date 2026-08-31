@@ -1993,6 +1993,18 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     }
     const bool wavefront_enabled = settings.cuda_wavefront &&
         !(settings.use_irradiance_volume && settings.irradiance_volume_debug_probes);
+    const bool render_scene_dirty =
+        has_dirty(settings.dirty, RenderDirty::Geometry) ||
+        has_dirty(settings.dirty, RenderDirty::Transform) ||
+        has_dirty(settings.dirty, RenderDirty::Material) ||
+        has_dirty(settings.dirty, RenderDirty::Texture);
+    if (render_scene_dirty) {
+        cached_render_scene_valid_ = false;
+    }
+    if (wavefront_enabled && !cached_render_scene_valid_) {
+        cached_render_scene_ = build_render_scene(scene);
+        cached_render_scene_valid_ = true;
+    }
     const bool scene_has_restir_di_local_lights =
         !cached_render_scene_.light_triangle_indices.empty() ||
         !scene.directional_lights.empty() ||
@@ -2170,10 +2182,6 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     uint32_t* device_rgba = static_cast<uint32_t*>(device_rgba_);
     GpuScene* device_scene = static_cast<GpuScene*>(device_scene_);
 
-    if (has_dirty(settings.dirty, RenderDirty::Geometry) ||
-        has_dirty(settings.dirty, RenderDirty::Transform)) {
-        cached_render_scene_valid_ = false;
-    }
     if ((lightmap_rendering_enabled(settings) || irradiance_volume_rendering_enabled(settings)) && !cached_render_scene_valid_) {
         cached_render_scene_ = build_render_scene(scene);
         cached_render_scene_valid_ = true;
@@ -2718,9 +2726,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                     standard->transmission_input.texture != nullptr;
             }
         }
-        constexpr int kExtraTransmissionBounces = 12;
         const int max_path_steps = std::max(1, settings.max_bounces) +
-            (has_transmission ? kExtraTransmissionBounces : 0);
+            (has_transmission ? wavefront_extra_transmission_bounces_gpu() : 0);
         const bool has_local_direct_lights =
             !cached_render_scene_.light_triangle_indices.empty() ||
             !scene.directional_lights.empty() ||
