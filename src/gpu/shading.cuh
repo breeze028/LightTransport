@@ -660,6 +660,14 @@ __device__ float mis_weight_gpu(float pdf_a, float pdf_b, int heuristic) {
     return a2 / fmaxf(1.0e-8f, a2 + b2);
 }
 
+__device__ bool material_may_pass_direct_shadow_gpu(const GpuMaterial& material) {
+    return material.alpha_mode != static_cast<int>(AlphaMode::Opaque) ||
+        material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+        material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission) ||
+        material.transmission > 0.5f ||
+        material.transmission_texture_index >= 0;
+}
+
 template <bool UseCompactShadow, bool TwoLevel, GpuTraversalLayout Layout>
 __device__ bool direct_shadow_blocked_gpu(const GpuScene& scene, Ray shadow_ray, float remaining,
     int target_triangle, uint32_t& rng, const RenderSettings& settings) {
@@ -681,6 +689,9 @@ __device__ bool direct_shadow_blocked_gpu(const GpuScene& scene, Ray shadow_ray,
                 return true;
             }
             const GpuMaterial shadow_material = scene.materials[material_index];
+            if (!material_may_pass_direct_shadow_gpu(shadow_material)) {
+                return true;
+            }
             const Vec2 uv = compact_hit_uv_gpu(scene, shadow_ray, shadow_hit);
             if (!material_visible_gpu(scene, shadow_material, uv, rng) ||
                 shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
@@ -706,6 +717,9 @@ __device__ bool direct_shadow_blocked_gpu(const GpuScene& scene, Ray shadow_ray,
                 return false;
             }
             const GpuMaterial shadow_material = scene.materials[shadow_hit.material];
+            if (!material_may_pass_direct_shadow_gpu(shadow_material)) {
+                return true;
+            }
             if (!material_visible_gpu(scene, shadow_material, shadow_hit.uv, rng) ||
                 shadow_material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
                 material_transmission_gpu(scene, shadow_material, shadow_hit.uv) > 0.5f) {

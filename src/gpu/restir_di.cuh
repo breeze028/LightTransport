@@ -435,6 +435,9 @@ __device__ bool restir_sample_visible_gpu(const GpuScene& scene, const GpuHit& h
         if (!intersect_gpu(scene, shadow_ray, shadow_hit)) return true;
         if (sample.type == GpuRestirLightType::Triangle && shadow_hit.triangle == sample.index) return true;
         const GpuMaterial blocker = scene.materials[shadow_hit.material];
+        if (!material_may_pass_direct_shadow_gpu(blocker)) {
+            return false;
+        }
         if (!material_visible_gpu(scene, blocker, shadow_hit.uv, rng) ||
             blocker.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
             material_transmission_gpu(scene, blocker, shadow_hit.uv) > 0.5f) {
@@ -1136,6 +1139,10 @@ __global__ void restir_trace_visibility_kernel(const GpuScene* scene_ptr, GpuWav
                 break;
             }
             const GpuMaterial material = scene.materials[material_index];
+            if (!material_may_pass_direct_shadow_gpu(material)) {
+                visible = false;
+                break;
+            }
             const Vec2 uv = compact_hit_uv_gpu(scene, ray, hit);
             if (!material_visible_gpu(scene, material, uv, path.rng) ||
                 material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
