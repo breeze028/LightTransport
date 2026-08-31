@@ -495,10 +495,16 @@ __global__ void wavefront_direct_light_kernel(
     const int shading_bounce = wavefront_bounce(path) - wavefront_transmission_bounces(path);
     const float sample_clamp = shading_bounce == 0 ? 64.0f : 8.0f;
     const GpuMaterial material = scene.materials[hit.material];
+    const bool skip_direct_lighting_for_delta =
+        material.brdf_model == static_cast<int>(BrdfModel::Mirror) ||
+        (material.brdf_model == static_cast<int>(BrdfModel::Conductor) &&
+            material_roughness_gpu(scene, material, hit.uv) <= 0.001f);
     const bool skip_direct_lighting_for_transmission =
-        material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
-        material_transmission_gpu(scene, material, hit.uv) > 0.5f;
-    const bool queue_surface_shadow_paths = queue_shadow_paths && !skip_direct_lighting_for_transmission;
+        !skip_direct_lighting_for_delta &&
+        (material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
+            material_transmission_gpu(scene, material, hit.uv) > 0.5f);
+    const bool queue_surface_shadow_paths =
+        queue_shadow_paths && !skip_direct_lighting_for_transmission && !skip_direct_lighting_for_delta;
 
     hit.normal = apply_normal_map_gpu(scene, material, hit, path.ray.direction);
     const Vec3 material_emission = material_emission_gpu(scene, material, hit.uv, settings);
