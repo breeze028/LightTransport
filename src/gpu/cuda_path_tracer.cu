@@ -1993,8 +1993,13 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     }
     const bool wavefront_enabled = settings.cuda_wavefront &&
         !(settings.use_irradiance_volume && settings.irradiance_volume_debug_probes);
-    const bool restir_enabled = wavefront_enabled && settings.cuda_restir_di &&
+    const bool scene_has_restir_di_local_lights =
+        !cached_render_scene_.light_triangle_indices.empty() ||
+        !scene.directional_lights.empty() ||
+        !scene.point_lights.empty();
+    const bool requested_restir_di = wavefront_enabled && settings.cuda_restir_di &&
         settings.sampling_mode != PathSamplingMode::Unidirectional;
+    const bool restir_enabled = requested_restir_di && scene_has_restir_di_local_lights;
     const bool restir_pt_enabled = wavefront_enabled && settings.cuda_restir_pt &&
         settings.sampling_mode != PathSamplingMode::Unidirectional &&
         settings.max_bounces >= 2 &&
@@ -2010,6 +2015,14 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
     const bool restir_any_enabled = restir_enabled || restir_gi_enabled || restir_pt_enabled;
     if (settings.cuda_restir_gi && settings.cuda_restir_pt) {
         const std::string key = "ReSTIR GI and PT requested together; PT takes precedence";
+        if (std::find(reported_fallback_reasons_.begin(), reported_fallback_reasons_.end(), key) ==
+            reported_fallback_reasons_.end()) {
+            reported_fallback_reasons_.push_back(key);
+            LT_LOG_WARN("{}", key);
+        }
+    }
+    if (requested_restir_di && !scene_has_restir_di_local_lights) {
+        const std::string key = "ReSTIR DI disabled for scenes without non-environment direct lights; using wavefront direct lighting";
         if (std::find(reported_fallback_reasons_.begin(), reported_fallback_reasons_.end(), key) ==
             reported_fallback_reasons_.end()) {
             reported_fallback_reasons_.push_back(key);
