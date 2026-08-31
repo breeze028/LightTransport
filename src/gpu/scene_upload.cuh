@@ -39,6 +39,20 @@ bool use_wavefront_cwbvh_layout(const RenderScene& render_scene, const RenderSet
     return estimated_bytes > 0 && estimated_bytes <= kMaxEstimatedCwBvhBytes;
 }
 
+bool material_is_opaque_shadow_blocker(const Material& material) {
+    if (material.alpha_mode != AlphaMode::Opaque) {
+        return false;
+    }
+    const BrdfModel model = material.model();
+    if (model == BrdfModel::Dielectric || model == BrdfModel::DiffuseTransmission) {
+        return false;
+    }
+    if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(&material)) {
+        return standard->transmission_weight <= 0.5f;
+    }
+    return true;
+}
+
 float pack_bvh_surface_area(const Aabb& bounds) {
     const Vec3 extent = bounds.max - bounds.min;
     return std::max(0.0f, 2.0f * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x));
@@ -995,6 +1009,9 @@ bool pack_scene_from_render_scene(const Scene& scene, const RenderSettings& sett
             tri.material |
                 (scene.materials[static_cast<size_t>(tri.material)]->alpha_mode != AlphaMode::Opaque
                     ? kTraversalMaterialAlphaBit
+                    : 0) |
+                (material_is_opaque_shadow_blocker(*scene.materials[static_cast<size_t>(tri.material)])
+                    ? kTraversalMaterialOpaqueShadowBlockerBit
                     : 0),
         };
     }

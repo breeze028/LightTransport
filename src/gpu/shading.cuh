@@ -681,6 +681,9 @@ __device__ bool direct_shadow_blocked_gpu(const GpuScene& scene, Ray shadow_ray,
             if (target_triangle >= 0 && shadow_hit.triangle == target_triangle) {
                 return false;
             }
+            if (shadow_hit.triangle >= 0 && traversal_material_is_opaque_shadow_blocker(shadow_hit.material)) {
+                return true;
+            }
             const int material_index = shadow_hit.triangle >= 0
                 ? traversal_material_index(shadow_hit.material)
                 : shadow_hit.material;

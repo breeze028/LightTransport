@@ -27,6 +27,10 @@ __device__ bool traversal_material_has_alpha(int material_and_flags) {
     return (material_and_flags & kTraversalMaterialAlphaBit) != 0;
 }
 
+__device__ bool traversal_material_is_opaque_shadow_blocker(int material_and_flags) {
+    return (material_and_flags & kTraversalMaterialOpaqueShadowBlockerBit) != 0;
+}
+
 __device__ bool material_visible_gpu(const GpuScene& scene, const GpuMaterial& material, Vec2 uv, uint32_t& rng);
 
 __device__ Vec2 sphere_uv_gpu(Vec3 normal) {

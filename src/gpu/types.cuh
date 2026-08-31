@@ -92,7 +92,8 @@ struct GpuTraversalTriangle {
 };
 
 constexpr int kTraversalMaterialAlphaBit = 0x40000000;
-constexpr int kTraversalMaterialIndexMask = kTraversalMaterialAlphaBit - 1;
+constexpr int kTraversalMaterialOpaqueShadowBlockerBit = 0x20000000;
+constexpr int kTraversalMaterialIndexMask = kTraversalMaterialOpaqueShadowBlockerBit - 1;
 
 struct GpuSphere {
     Vec3 center;

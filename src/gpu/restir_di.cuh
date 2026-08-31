@@ -1133,6 +1133,10 @@ __global__ void restir_trace_visibility_kernel(const GpuScene* scene_ptr, GpuWav
             if (restir_visibility_hit_is_target_gpu(visibility, hit)) {
                 break;
             }
+            if (hit.triangle >= 0 && traversal_material_is_opaque_shadow_blocker(hit.material)) {
+                visible = false;
+                break;
+            }
             const int material_index = hit.triangle >= 0 ? traversal_material_index(hit.material) : hit.material;
             if (material_index < 0 || material_index >= scene.material_count) {
                 visible = false;
