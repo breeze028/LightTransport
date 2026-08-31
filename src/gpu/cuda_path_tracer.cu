@@ -2589,7 +2589,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
         GpuWavefrontSvgfAov svgf_aov) -> cudaError_t {
         const int pixel_count = static_cast<int>(pixels);
         const int queue_block_size = 256;
-        const int intersect_block_size = 64;
+        const int intersect_block_size = 256;
         const auto queue_grid_size = [queue_block_size](int count) {
             return (count + queue_block_size - 1) / queue_block_size;
         };
