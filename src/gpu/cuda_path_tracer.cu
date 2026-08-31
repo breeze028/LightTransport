@@ -2722,8 +2722,7 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                 model == BrdfModel::DiffuseTransmission;
             if (const auto* standard = dynamic_cast<const StandardSurfaceMaterial*>(material.get())) {
                 has_transmission = has_transmission ||
-                    standard->transmission_weight > 0.0f ||
-                    standard->transmission_input.texture != nullptr;
+                    standard->transmission_weight > 0.5f;
             }
         }
         const int max_path_steps = std::max(1, settings.max_bounces) +
@@ -2862,7 +2861,8 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
                         }
                         #undef LT_LAUNCH_RESTIR_INITIAL
                     }
-                    if (!restir_environment_visibility_fast) {
+                    if (!restir_environment_visibility_fast &&
+                        settings.cuda_restir_bias_correction == RestirBiasCorrection::RayTraced) {
                         {
                             const ScopedNvtxRange range("ReSTIR initial visibility rays");
                             cudaMemsetAsync(restir_visibility_count, 0, sizeof(int));

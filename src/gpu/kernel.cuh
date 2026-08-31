@@ -316,8 +316,7 @@ __device__ void finish_wavefront_path(PathT& path, Vec3* samples) {
 __device__ bool wavefront_material_may_continue_as_transmission(const GpuMaterial& material) {
     return material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
         material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission) ||
-        material.transmission > 0.5f ||
-        material.transmission_texture_index >= 0;
+        material.transmission > 0.5f;
 }
 
 #include "restir_di.cuh"

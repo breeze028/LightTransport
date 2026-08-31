@@ -664,8 +664,7 @@ __device__ bool material_may_pass_direct_shadow_gpu(const GpuMaterial& material)
     return material.alpha_mode != static_cast<int>(AlphaMode::Opaque) ||
         material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
         material.brdf_model == static_cast<int>(BrdfModel::DiffuseTransmission) ||
-        material.transmission > 0.5f ||
-        material.transmission_texture_index >= 0;
+        material.transmission > 0.5f;
 }
 
 template <bool UseCompactShadow, bool TwoLevel, GpuTraversalLayout Layout>
