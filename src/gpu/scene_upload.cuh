@@ -11,18 +11,16 @@ bool use_wavefront_bvh8_layout(const RenderScene& render_scene, const RenderSett
     if (!settings.cuda_wavefront || !use_two_level_accel(render_scene, settings.acceleration_structure)) {
         return false;
     }
-    constexpr size_t kMaxEstimatedBvh8Bytes = 64ull * 1024ull * 1024ull;
+    constexpr size_t kMaxEstimatedBvh8Bytes = 256ull * 1024ull * 1024ull;
     const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
     const size_t estimated_bytes = estimated_wide_nodes * sizeof(GpuTraversalBvh8Node);
     return estimated_bytes > 0 && estimated_bytes <= kMaxEstimatedBvh8Bytes;
 }
 
 bool use_wavefront_cwbvh_layout(const RenderScene& render_scene, const RenderSettings& settings) {
-    // CWBVH v1 is kept as an internal experiment, but is not the default
-    // wavefront layout yet. Current Sponza profiling shows it reduces register
-    // count but increases intersect frame time, so keep the production path on
-    // the full-float BVH8 baseline until the remaining CWBVH traversal pieces
-    // are implemented and pass the >=5% median / <=3% P95 acceptance gate.
+    // Prefer CWBVH for wavefront when the estimated upload size fits a
+    // conservative budget. Large production scenes otherwise fall back to the
+    // binary traversal path and spend substantially more time in shadow rays.
     constexpr bool kEnableExperimentalCwBvh = true;
     if (!kEnableExperimentalCwBvh) {
         (void)render_scene;
@@ -32,7 +30,7 @@ bool use_wavefront_cwbvh_layout(const RenderScene& render_scene, const RenderSet
     if (!settings.cuda_wavefront || !use_two_level_accel(render_scene, settings.acceleration_structure)) {
         return false;
     }
-    constexpr size_t kMaxEstimatedCwBvhBytes = 64ull * 1024ull * 1024ull;
+    constexpr size_t kMaxEstimatedCwBvhBytes = 256ull * 1024ull * 1024ull;
     const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
     const size_t estimated_bytes = estimated_wide_nodes * sizeof(GpuCwBvhNode) +
         render_scene.triangle_indices.size() * 3u * sizeof(float4);
