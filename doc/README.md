@@ -33,6 +33,7 @@
 | ReSTIR DI | [15-wavefront-restir-di.md](15-wavefront-restir-di.md) | `src/gpu/restir_di.cuh`、`src/gpu/cuda_path_tracer.cu` |
 | ReSTIR GI | [16-wavefront-restir-gi.md](16-wavefront-restir-gi.md) | `src/gpu/restir_gi.cuh`、`src/gpu/restir_di.cuh` |
 | ReSTIR PT | [17-wavefront-restir-pt.md](17-wavefront-restir-pt.md) | `src/gpu/restir_pt.cuh`、`src/gpu/restir_di.cuh` |
+| Wavefront/ReSTIR 性能迭代记录 | [18-wavefront-restir-performance-log.md](18-wavefront-restir-performance-log.md) | Sponza/Bistro benchmark、失败实验、当前瓶颈 |
 
 ## 快速定位
 
