@@ -1148,6 +1148,11 @@ __global__ void restir_trace_visibility_kernel(const GpuScene* scene_ptr, GpuWav
         visibility_results[pixel] = visible ? 1 : 0;
     } else {
         GpuWavefrontPathRef path = wavefront_path_ref(paths, visibility.path_index);
+        uint32_t visibility_rng = restir_rng_seed_gpu(path.rng,
+            0x4f1bbcd3u ^
+            static_cast<uint32_t>(pixel) ^
+            (static_cast<uint32_t>(visibility.sample_type) * 0x85ebca6bu) ^
+            (static_cast<uint32_t>(visibility.sample_index) * 0xc2b2ae35u));
         for (int step = 0; step < kWavefrontDirectLightTransparentShadowSteps; ++step) {
             GpuCompactHit hit{};
             hit.t = remaining;
@@ -1170,7 +1175,7 @@ __global__ void restir_trace_visibility_kernel(const GpuScene* scene_ptr, GpuWav
                 break;
             }
             const Vec2 uv = compact_hit_uv_gpu(scene, ray, hit);
-            if (!material_visible_gpu(scene, material, uv, path.rng) ||
+            if (!material_visible_gpu(scene, material, uv, visibility_rng) ||
                 material.brdf_model == static_cast<int>(BrdfModel::Dielectric) ||
                 material_transmission_gpu(scene, material, uv) > 0.5f) {
                 const Vec3 position = compact_hit_position_gpu(ray, hit);
@@ -1203,8 +1208,13 @@ __global__ void restir_trace_environment_visibility_kernel(const GpuScene* scene
 
     const GpuScene& scene = *scene_ptr;
     GpuWavefrontPathRef path = wavefront_path_ref(paths, visibility.path_index);
+    uint32_t visibility_rng = restir_rng_seed_gpu(path.rng,
+        0x9e8d57a5u ^
+        static_cast<uint32_t>(pixel) ^
+        (static_cast<uint32_t>(visibility.sample_type) * 0x85ebca6bu) ^
+        (static_cast<uint32_t>(visibility.sample_index) * 0xc2b2ae35u));
     const bool occluded = occluded_compact_gpu<TwoLevel, Layout, AlphaVisibility>(
-        scene, visibility.ray, path.rng);
+        scene, visibility.ray, visibility_rng);
     visibility_results[pixel] = occluded ? 0 : 1;
 }
 
