@@ -2,6 +2,40 @@ bool size_fits_int(size_t size) {
     return size <= static_cast<size_t>(std::numeric_limits<int>::max());
 }
 
+size_t estimate_wavefront_bvh8_bytes(const RenderScene& render_scene) {
+    const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
+    return estimated_wide_nodes * sizeof(GpuTraversalBvh8Node);
+}
+
+size_t estimate_wavefront_cwbvh_bytes(const RenderScene& render_scene) {
+    const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
+    return estimated_wide_nodes * sizeof(GpuCwBvhNode) +
+        render_scene.triangle_indices.size() * 3u * sizeof(float4);
+}
+
+size_t wavefront_wide_traversal_budget_bytes() {
+    constexpr size_t kFallbackBudgetBytes = 256ull * 1024ull * 1024ull;
+    constexpr size_t kHardCapBytes = 512ull * 1024ull * 1024ull;
+    static size_t cached_budget = 0;
+    if (cached_budget != 0) {
+        return cached_budget;
+    }
+    cached_budget = kFallbackBudgetBytes;
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && free_bytes > 0) {
+        const size_t vram_budget = free_bytes / 4u;
+        if (vram_budget > cached_budget) {
+            cached_budget = std::min(vram_budget, kHardCapBytes);
+        }
+    }
+    return cached_budget;
+}
+
+double bytes_to_mib(size_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
 bool use_two_level_accel(const RenderScene& render_scene, AccelerationStructure acceleration_structure) {
     (void)render_scene;
     return acceleration_structure == AccelerationStructure::TwoLevel;
@@ -11,10 +45,8 @@ bool use_wavefront_bvh8_layout(const RenderScene& render_scene, const RenderSett
     if (!settings.cuda_wavefront || !use_two_level_accel(render_scene, settings.acceleration_structure)) {
         return false;
     }
-    constexpr size_t kMaxEstimatedBvh8Bytes = 256ull * 1024ull * 1024ull;
-    const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
-    const size_t estimated_bytes = estimated_wide_nodes * sizeof(GpuTraversalBvh8Node);
-    return estimated_bytes > 0 && estimated_bytes <= kMaxEstimatedBvh8Bytes;
+    const size_t estimated_bytes = estimate_wavefront_bvh8_bytes(render_scene);
+    return estimated_bytes > 0 && estimated_bytes <= wavefront_wide_traversal_budget_bytes();
 }
 
 bool use_wavefront_cwbvh_layout(const RenderScene& render_scene, const RenderSettings& settings) {
@@ -30,11 +62,8 @@ bool use_wavefront_cwbvh_layout(const RenderScene& render_scene, const RenderSet
     if (!settings.cuda_wavefront || !use_two_level_accel(render_scene, settings.acceleration_structure)) {
         return false;
     }
-    constexpr size_t kMaxEstimatedCwBvhBytes = 256ull * 1024ull * 1024ull;
-    const size_t estimated_wide_nodes = (render_scene.bvh_nodes.size() + 1u) / 2u;
-    const size_t estimated_bytes = estimated_wide_nodes * sizeof(GpuCwBvhNode) +
-        render_scene.triangle_indices.size() * 3u * sizeof(float4);
-    return estimated_bytes > 0 && estimated_bytes <= kMaxEstimatedCwBvhBytes;
+    const size_t estimated_bytes = estimate_wavefront_cwbvh_bytes(render_scene);
+    return estimated_bytes > 0 && estimated_bytes <= wavefront_wide_traversal_budget_bytes();
 }
 
 bool material_is_opaque_shadow_blocker(const Material& material) {

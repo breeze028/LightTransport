@@ -462,3 +462,110 @@ Bistro 数据波动较大，后续需要更稳定的 benchmark 规则：
 2. 保持 ReSTIR candidate 数量，优先降低每个 candidate 的数据读取和寄存器压力。
 3. 给 direct visibility 做更细的场景能力专门化，但每一步都要看 register count。
 4. 如果 Bistro 目标是实时级，开始评估硬件 RT 后端；纯 CUDA software BVH 很可能无法靠微优化追到 Falcor。
+
+## 9. 2026-09-02 继续迭代记录
+
+### 9.1 CWBVH budget 和 layout 可观测性
+
+新增 host-side traversal 预算/估算 helper：
+
+- `estimate_wavefront_bvh8_bytes()`
+- `estimate_wavefront_cwbvh_bytes()`
+- `wavefront_wide_traversal_budget_bytes()`
+- `bytes_to_mib()`
+
+预算不再是单一硬编码 `256 MiB`：默认仍为 `256 MiB`，但会按首次查询时 CUDA free memory 的 `1/4` 放宽，最高 `512 MiB`。这样可以避免大场景只因为略微超过固定阈值就从 CWBVH 退回 Binary。
+
+full scene upload 后新增一次性 info log，记录：
+
+- 实际 traversal layout。
+- binary BVH 节点数。
+- BVH8/CWBVH 节点数。
+- CWBVH triangle payload 数量。
+- BVH8/CWBVH 估算 MiB、CWBVH 实际 MiB、当前 budget MiB。
+
+Bistro 当前观测：
+
+```text
+layout=CWBVH
+bvh_nodes=835415
+bvh8_nodes=126468
+cwbvh_nodes=199443
+cwbvh_tri_float4=3960963
+bvh8_estimated_mib=106.76
+cwbvh_estimated_mib=92.3081
+cwbvh_actual_mib=75.6558
+budget_mib=512
+```
+
+此外 render launch 侧不再只按估算决定 `use_wide_bvh/use_cwbvh`，还会检查 upload 后的 cached node/payload count，避免 CWBVH 构建失败但仍选择 CWBVH 模板路径。
+
+### 9.2 Profiling 更新
+
+Nsight Compute 在当前机器上无法采集硬件计数器：
+
+```text
+Profiling failed because a driver resource was unavailable.
+Failed to create counter availability image (error = 20)
+Failed to get counter availability image (error = ResourceUnavailable)
+```
+
+改用 Nsight Systems 做 kernel summary。
+
+Bistro ReSTIR DI，`1010x789`、`spp=1`、`max_bounces=2`、denoiser/AA off、4 frames：
+
+```text
+wavefront_direct_visibility_kernel    29.1%
+wavefront_intersect_kernel            28.5%
+restir_initial_candidates_kernel      18.3%
+restir_trace_visibility_kernel        11.8%
+```
+
+Bistro 普通 wavefront，同参数：
+
+```text
+wavefront_direct_visibility_kernel    48.8%
+wavefront_intersect_kernel            47.4%
+wavefront_direct_light_kernel          3.2%
+```
+
+结论没有改变：Bistro 的核心瓶颈仍是 software traversal 下的 intersect + shadow visibility。ReSTIR DI 的额外成本主要来自 initial candidates 和 final visibility trace，但它们叠在同一个 traversal 天花板上。
+
+### 9.3 本轮失败尝试：CWBVH fast occlusion shadow path
+
+尝试方向：
+
+- 给 `GpuScene` 增加全场 direct-shadow opaque-only 标志。
+- 给 CWBVH occlusion 增加 `max_t` 和 `target_triangle`，用于 finite light shadow ray。
+- 当场景不需要 alpha/transmission shadow pass 时，让 `direct_shadow_blocked_gpu()` 走距离限制的 occlusion traversal，而不是完整 closest-hit + material-aware traversal。
+
+结果：
+
+- Bistro 的 `opaque_shadow_only=0`，说明该场景存在 alpha/transparent shadow 可能性，fast path 被正确禁用。
+- 即使 runtime 未启用，该分支仍被编进 CWBVH direct-shadow 模板，导致 kernel 体积/寄存器压力恶化。
+- Bistro 普通 wavefront 从约 `445 ms` 波动到约 `2030 ms`。
+
+处理：
+
+- 已回退该 fast occlusion 实验。
+- 保留教训：这个方向不能直接塞进已有 direct visibility 模板。若继续做，应该拆成独立 kernel/template，或只为经确认的 opaque-only 场景编译/launch 更窄路径，避免污染 Bistro 这种混合材质场景。
+
+### 9.4 本轮有效 benchmark
+
+候选版本保留动态 budget、layout log、实际 cached traversal launch guard，回退 fast occlusion 后：
+
+```text
+Bistro wavefront:
+frames=10 warmup=4 measured=6
+mean=444.750 ms
+median=442.758 ms
+p95=452.370 ms
+
+Bistro ReSTIR DI:
+frames=8 warmup=3 measured=5
+mean=822.250 ms
+median=820.279 ms
+p95=846.285 ms
+```
+
+ReSTIR DI 本轮数值比早前 `~575 ms` 档更慢，但同一代码路径下普通 wavefront 稳定回到 `~445 ms`，说明需要后续继续用 Nsight Systems/固定 benchmark protocol 排除 GPU 时钟、后台负载和历史状态波动。

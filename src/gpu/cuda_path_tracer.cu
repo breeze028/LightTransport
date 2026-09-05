@@ -2365,6 +2365,31 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             render_cpu_fallback(scene, settings, framebuffer, "could not pack scene for CUDA");
             return;
         }
+        if (settings.cuda_wavefront && use_two_level_accel(cached_render_scene_, settings.acceleration_structure)) {
+            const size_t bvh8_estimated_bytes = estimate_wavefront_bvh8_bytes(cached_render_scene_);
+            const size_t cwbvh_estimated_bytes = estimate_wavefront_cwbvh_bytes(cached_render_scene_);
+            const size_t cwbvh_actual_bytes =
+                packed.traversal_cwbvh_nodes.size() * sizeof(GpuCwBvhNode) +
+                packed.cwbvh_triangles.size() * sizeof(float4) +
+                packed.cwbvh_triangle_indices.size() * sizeof(int);
+            const char* traversal_layout = packed.scene.cwbvh_node_count > 0 ? "CWBVH" :
+                packed.scene.bvh8_node_count > 0 ? "BVH8" : "Binary";
+            LT_LOG_INFO(
+                "CUDA wavefront traversal layout={} bvh_nodes={} bvh8_nodes={} cwbvh_nodes={} cwbvh_tri_float4={} "
+                "bvh8_estimated_mib={} cwbvh_estimated_mib={} cwbvh_actual_mib={} budget_mib={}",
+                traversal_layout,
+                cached_render_scene_.bvh_nodes.size(),
+                packed.traversal_bvh8_nodes.size(),
+                packed.traversal_cwbvh_nodes.size(),
+                packed.cwbvh_triangles.size(),
+                bytes_to_mib(bvh8_estimated_bytes),
+                bytes_to_mib(cwbvh_estimated_bytes),
+                bytes_to_mib(cwbvh_actual_bytes),
+                bytes_to_mib(wavefront_wide_traversal_budget_bytes()));
+            if (use_wavefront_cwbvh_layout(cached_render_scene_, settings) && packed.scene.cwbvh_node_count == 0) {
+                LT_LOG_WARN("CUDA wavefront CWBVH requested but build produced no nodes; falling back to BVH8/Binary traversal");
+            }
+        }
         const bool upload_textures = texture_objects_.size() != packed.textures.size() || has_dirty(settings.dirty, RenderDirty::Texture);
         if (upload_textures ? !upload_texture_objects(scene, packed, texture_arrays_, texture_objects_) : !apply_cached_texture_objects(packed, texture_objects_)) {
             reset();
@@ -2739,8 +2764,10 @@ void CudaPathTracer::render(const Scene& scene, const RenderSettings& settings, 
             (scene.environment.texture != nullptr || scene.environment.color.x > 0.0f ||
                 scene.environment.color.y > 0.0f || scene.environment.color.z > 0.0f);
         const bool use_two_level = use_two_level_accel(cached_render_scene_, settings.acceleration_structure);
-        const bool use_wide_bvh = use_wavefront_bvh8_layout(cached_render_scene_, settings);
-        const bool use_cwbvh = use_wavefront_cwbvh_layout(cached_render_scene_, settings);
+        const bool use_wide_bvh = use_wavefront_bvh8_layout(cached_render_scene_, settings) &&
+            cached_traversal_bvh8_nodes_ > 0;
+        const bool use_cwbvh = use_wavefront_cwbvh_layout(cached_render_scene_, settings) &&
+            cached_traversal_cwbvh_nodes_ > 0 && cached_cwbvh_triangles_ > 0;
         const bool restir_environment_visibility_fast =
             restir_enabled && use_cwbvh && !has_restir_local_lights && has_restir_environment &&
             !has_blend_visibility && !has_transmission;
